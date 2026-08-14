@@ -1,5 +1,14 @@
 # eve
 
+## 0.37.1
+
+### Patch Changes
+
+- 10a09a1: Make failed `eve init` runs recoverable: new targets are cleaned up, preexisting empty targets are restored, and existing projects receive clear dependency-install recovery guidance.
+- 63726db: Polish the connection authorization completion page with a Vercel-styled success state.
+- 5ba9749: Add a secure MCP channel that reuses eve route auth and lets clients start, inspect, update, authorize, and cancel principal-bound durable agent invocations over MCP 2026-07-28 with a stateless 2025 compatibility path.
+- 60e87ef: Keep active client turns connected while they are paused for authorization so responses resume automatically after the callback completes.
+
 ## 0.37.0
 
 ### Minor Changes
