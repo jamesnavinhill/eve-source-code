@@ -264,7 +264,7 @@ importers:
         version: 0.2.0(ai@6.0.191(zod@4.4.3))(chat@4.34.0(ai@6.0.191(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3))(react-native@0.86.0(@babel/core@7.29.0(supports-color@10.2.2))(@types/react@19.2.15)(bufferutil@4.1.0)(react@19.2.6)(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3)
       '@github-tools/eve-extension':
         specifier: ^0.1.0
-        version: 0.1.0(@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
+        version: 0.1.0(@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
       '@jetty/eve':
         specifier: ^0.3.0
         version: 0.3.0(eve@packages+eve)
@@ -288,7 +288,7 @@ importers:
         version: 0.1.0(ai@6.0.191(zod@4.4.3))(chat@4.34.0(ai@6.0.191(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3))(react@19.2.6)(supports-color@10.2.2)(zod@4.4.3)
       '@onkernel/eve-extension':
         specifier: ^0.1.3
-        version: 0.1.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
+        version: 0.1.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
       '@opentelemetry/api':
         specifier: 1.9.1
         version: 1.9.1
@@ -333,7 +333,7 @@ importers:
         version: 0.2.4(ai@6.0.191(zod@4.4.3))(chat@4.34.0(ai@6.0.191(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3)
       '@vercel/connect':
         specifier: 'catalog:'
-        version: 0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
+        version: 0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
       '@vercel/otel':
         specifier: 'catalog:'
         version: 2.1.3(@opentelemetry/api-logs@0.221.0)(@opentelemetry/api@1.9.1)(@opentelemetry/instrumentation@0.219.0(@opentelemetry/api@1.9.1)(supports-color@10.2.2))(@opentelemetry/resources@2.10.0(@opentelemetry/api@1.9.1))(@opentelemetry/sdk-logs@0.221.0(@opentelemetry/api@1.9.1))(@opentelemetry/sdk-metrics@2.10.0(@opentelemetry/api@1.9.1))(@opentelemetry/sdk-trace-base@2.6.1(@opentelemetry/api@1.9.1))
@@ -359,8 +359,8 @@ importers:
         specifier: workspace:*
         version: link:../../packages/eve
       postcss:
-        specifier: 8.5.15
-        version: 8.5.15
+        specifier: 8.5.23
+        version: 8.5.23
       shadcn:
         specifier: 4.16.0
         version: 4.16.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(typescript@6.0.3)
@@ -405,11 +405,11 @@ importers:
   apps/frameworks/next:
     dependencies:
       '@auth/core':
-        specifier: 0.41.2
-        version: 0.41.2
+        specifier: 0.41.3
+        version: 0.41.3
       '@vercel/connect':
         specifier: 'catalog:'
-        version: 0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@7.0.58(zod@4.4.3))(bufferutil@4.1.0)(supports-color@10.2.2)(zod@4.4.3))(ai@7.0.58(zod@4.4.3))(eve@packages+eve)
+        version: 0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@7.0.58(zod@4.4.3))(bufferutil@4.1.0)(supports-color@10.2.2)(zod@4.4.3))(ai@7.0.58(zod@4.4.3))(eve@packages+eve)
       ai:
         specifier: 'catalog:'
         version: 7.0.58(zod@4.4.3)
@@ -1092,8 +1092,8 @@ importers:
         specifier: 3.0.260610-beta
         version: 3.0.260610-beta(@upstash/redis@1.38.0)(@vercel/blob@2.4.0)(@vercel/functions@3.9.3(@aws-sdk/credential-provider-web-identity@3.972.49)(ws@8.21.3(bufferutil@4.1.0)))(aws4fetch@1.0.20)(chokidar@5.0.0)(dotenv@17.4.2)(drizzle-orm@0.45.2(@opentelemetry/api@1.9.1)(@types/pg@8.20.0)(@upstash/redis@1.38.0)(pg@8.20.0)(sql.js@1.14.1))(giget@3.3.0)(ioredis@5.11.1(supports-color@10.2.2))(jiti@2.7.0)(lru-cache@11.5.2)(rollup@4.62.2)(vite@8.1.5(@types/node@25.9.1)(esbuild@0.28.1)(jiti@2.7.0)(terser@5.49.0)(tsx@4.21.0)(yaml@2.9.0))
       undici:
-        specifier: 8.9.0
-        version: 8.9.0
+        specifier: 8.10.0
+        version: 8.10.0
     devDependencies:
       '@agentclientprotocol/sdk':
         specifier: 1.3.0
@@ -1570,12 +1570,12 @@ packages:
       zod:
         optional: true
 
-  '@auth/core@0.41.2':
-    resolution: {integrity: sha512-Hx5MNBxN2fJTbJKGUKAA0wca43D0Akl3TvufY54Gn8lop7F+34vU1zA1pn0vQfIoVuLIrpfc2nkyjwIaPJMW7w==}
+  '@auth/core@0.41.3':
+    resolution: {integrity: sha512-sJ3JMHHkXMD3aOjopv7mOBTO1Ocw4b0fAEXJBz6k7YHLpYQI6C40jCUPc5fNvUKxXRXNE1/sRISA15UrwWJBTw==}
     peerDependencies:
       '@simplewebauthn/browser': ^9.0.1
       '@simplewebauthn/server': ^9.0.2
-      nodemailer: ^7.0.7
+      nodemailer: ^7.0.7 || ^8.0.5
     peerDependenciesMeta:
       '@simplewebauthn/browser':
         optional: true
@@ -12038,6 +12038,7 @@ packages:
   nanoid@3.3.16:
     resolution: {integrity: sha512-bzlKTyNJ7+LdGIIwy8ijFpIqEQIvafahV7eYykJ8Cvh42EdJeODoJ6gUJXpQJvej1BddH8OqTXZNE/KfbWAu8Q==}
     engines: {node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1}
+    hasBin: true
 
   nanoid@5.1.6:
     resolution: {integrity: sha512-c7+7RQ+dMB5dPwwCp4ee1/iV/q2P6aK1mTZcfr1BTuVlyW9hJYiMPybJCcnBlQtuSmTIWNeazm/zqNoZSSElBg==}
@@ -12984,12 +12985,8 @@ packages:
     resolution: {integrity: sha512-pMMHxBOZKFU6HgAZ4eyGnwXF/EvPGGqUr0MnZ5+99485wwW41kW91A4LOGxSHhgugZmSChL5AlElNdwlNgcnLQ==}
     engines: {node: ^10 || ^12 || >=14}
 
-  postcss@8.5.15:
-    resolution: {integrity: sha512-FfR8sjd4em2T6fb3I2MwAJU7HWVMr9zba+enmQeeWFfCbm+UOC/0X4DS8XtpUTMwWMGbjKYP7xjfNekzyGmB3A==}
-    engines: {node: ^10 || ^12 || >=14}
-
-  postcss@8.5.20:
-    resolution: {integrity: sha512-lW616l85ucIQL+FocMmL7pQFPqBmwejrCMg+iPxyImlrANNJG9NHq/RkyCZopDhd8C3LA03PHRJDjkbGu8vvug==}
+  postcss@8.5.23:
+    resolution: {integrity: sha512-g50586zr4bZmwFiTlflMu8E0bDTb5I5gertgwAKmsdUlTQIhZtunzUlD1WSzwcVWPoAVpsrA6vlfCD7oXvRwgg==}
     engines: {node: ^10 || ^12 || >=14}
 
   postgres-array@2.0.0:
@@ -14464,8 +14461,8 @@ packages:
     resolution: {integrity: sha512-IDxfleLmmbSskfWSUATiN1nfn2rDuvnMOqb5CWR92iIfojA0Ud+ulOAAEQ57LPr9rWmsreUyf5lwyao+7GNNVw==}
     engines: {node: '>=20.18.1'}
 
-  undici@8.9.0:
-    resolution: {integrity: sha512-aWZpUj7XoGonMClx4gdDRfgBjqeA+F473aDmROQQbM9n6PRfK/u1q/a0X4wMTgcHfT8H6fpbt98PFuDUwFg2YA==}
+  undici@8.10.0:
+    resolution: {integrity: sha512-HvltHd7avK13QIw/oLe4qoOLyoVSoafqJ2jYOrtMRBkbYT31eiBQ8O0ehRKZiEZCMEyLFQNIADpgCWC5fALvYQ==}
     engines: {node: '>=22.19.0'}
 
   unenv@2.0.0-rc.24:
@@ -15701,7 +15698,7 @@ snapshots:
     optionalDependencies:
       zod: 4.4.3
 
-  '@auth/core@0.41.2':
+  '@auth/core@0.41.3':
     dependencies:
       '@panva/hkdf': 1.2.1
       jose: 6.2.3
@@ -16883,26 +16880,26 @@ snapshots:
       - react-native
       - supports-color
 
-  '@github-tools/eve-extension@0.1.0(@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)':
+  '@github-tools/eve-extension@0.1.0(@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)':
     dependencies:
-      '@github-tools/sdk': 1.8.2(@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)(zod@4.4.3)
+      '@github-tools/sdk': 1.8.2(@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)(zod@4.4.3)
       eve: link:packages/eve
       zod: 4.4.3
     optionalDependencies:
-      '@vercel/connect': 0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
+      '@vercel/connect': 0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
     transitivePeerDependencies:
       - '@ai-sdk/workflow'
       - '@workflow/ai'
       - ai
       - workflow
 
-  '@github-tools/sdk@1.8.2(@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)(zod@4.4.3)':
+  '@github-tools/sdk@1.8.2(@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)(zod@4.4.3)':
     dependencies:
       ai: 6.0.191(zod@4.4.3)
       octokit: 5.0.5
       zod: 4.4.3
     optionalDependencies:
-      '@vercel/connect': 0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
+      '@vercel/connect': 0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
       eve: link:packages/eve
 
   '@google/genai@1.52.0(@modelcontextprotocol/sdk@1.29.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.4.3))(bufferutil@4.1.0)(supports-color@10.2.2)':
@@ -17990,9 +17987,9 @@ snapshots:
       '@rollup/plugin-replace': 6.0.3(rollup@4.62.2)
       '@vitejs/plugin-vue': 6.0.8(vite@7.3.3(@types/node@25.9.1)(jiti@2.7.0)(lightningcss@1.32.0)(terser@5.49.0)(tsx@4.21.0)(yaml@2.9.0))(vue@3.5.35(typescript@6.0.3))
       '@vitejs/plugin-vue-jsx': 5.1.6(supports-color@10.2.2)(vite@7.3.3(@types/node@25.9.1)(jiti@2.7.0)(lightningcss@1.32.0)(terser@5.49.0)(tsx@4.21.0)(yaml@2.9.0))(vue@3.5.35(typescript@6.0.3))
-      autoprefixer: 10.5.3(postcss@8.5.15)
+      autoprefixer: 10.5.3(postcss@8.5.23)
       consola: 3.4.2
-      cssnano: 8.0.2(postcss@8.5.15)
+      cssnano: 8.0.2(postcss@8.5.23)
       defu: 6.1.7
       escape-string-regexp: 5.0.0
       exsolve: 1.1.0
@@ -18006,7 +18003,7 @@ snapshots:
       nypm: 0.6.8
       pathe: 2.0.3
       pkg-types: 2.3.1
-      postcss: 8.5.15
+      postcss: 8.5.23
       seroval: 1.5.5
       std-env: 4.2.0
       ufo: 1.6.4
@@ -18052,9 +18049,9 @@ snapshots:
       '@rollup/plugin-replace': 6.0.3(rollup@4.62.2)
       '@vitejs/plugin-vue': 6.0.8(vite@7.3.3(@types/node@25.9.1)(jiti@2.7.0)(lightningcss@1.32.0)(terser@5.49.0)(tsx@4.21.0)(yaml@2.9.0))(vue@3.5.35(typescript@6.0.3))
       '@vitejs/plugin-vue-jsx': 5.1.6(supports-color@10.2.2)(vite@7.3.3(@types/node@25.9.1)(jiti@2.7.0)(lightningcss@1.32.0)(terser@5.49.0)(tsx@4.21.0)(yaml@2.9.0))(vue@3.5.35(typescript@6.0.3))
-      autoprefixer: 10.5.3(postcss@8.5.15)
+      autoprefixer: 10.5.3(postcss@8.5.23)
       consola: 3.4.2
-      cssnano: 8.0.2(postcss@8.5.15)
+      cssnano: 8.0.2(postcss@8.5.23)
       defu: 6.1.7
       escape-string-regexp: 5.0.0
       exsolve: 1.1.0
@@ -18068,7 +18065,7 @@ snapshots:
       nypm: 0.6.8
       pathe: 2.0.3
       pkg-types: 2.3.1
-      postcss: 8.5.15
+      postcss: 8.5.23
       seroval: 1.5.5
       std-env: 4.2.0
       ufo: 1.6.4
@@ -18257,9 +18254,9 @@ snapshots:
       '@octokit/request-error': 7.1.0
       '@octokit/webhooks-methods': 6.0.0
 
-  '@onkernel/eve-extension@0.1.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)':
+  '@onkernel/eve-extension@0.1.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)':
     dependencies:
-      '@vercel/connect': 0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
+      '@vercel/connect': 0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)
       eve: link:packages/eve
       zod: 4.4.3
     transitivePeerDependencies:
@@ -21024,7 +21021,7 @@ snapshots:
       '@alloc/quick-lru': 5.2.0
       '@tailwindcss/node': 4.3.0
       '@tailwindcss/oxide': 4.3.0
-      postcss: 8.5.15
+      postcss: 8.5.23
       tailwindcss: 4.3.0
 
   '@tailwindcss/vite@4.3.0(vite@8.1.5(@types/node@25.9.1)(esbuild@0.28.1)(jiti@2.7.0)(terser@5.49.0)(tsx@4.21.0)(yaml@2.9.0))':
@@ -21739,22 +21736,22 @@ snapshots:
     dependencies:
       execa: 5.1.1
 
-  '@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)':
+  '@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3))(ai@6.0.191(zod@4.4.3))(eve@packages+eve)':
     dependencies:
       '@vercel/oidc': 3.8.1
     optionalDependencies:
       '@ai-sdk/mcp': 2.0.29(zod@4.4.3)
-      '@auth/core': 0.41.2
+      '@auth/core': 0.41.3
       '@chat-adapter/slack': 4.34.0(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3)
       ai: 6.0.191(zod@4.4.3)
       eve: link:packages/eve
 
-  '@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.2)(@chat-adapter/slack@4.34.0(ai@7.0.58(zod@4.4.3))(bufferutil@4.1.0)(supports-color@10.2.2)(zod@4.4.3))(ai@7.0.58(zod@4.4.3))(eve@packages+eve)':
+  '@vercel/connect@0.4.3(@ai-sdk/mcp@2.0.29(zod@4.4.3))(@auth/core@0.41.3)(@chat-adapter/slack@4.34.0(ai@7.0.58(zod@4.4.3))(bufferutil@4.1.0)(supports-color@10.2.2)(zod@4.4.3))(ai@7.0.58(zod@4.4.3))(eve@packages+eve)':
     dependencies:
       '@vercel/oidc': 3.8.1
     optionalDependencies:
       '@ai-sdk/mcp': 2.0.29(zod@4.4.3)
-      '@auth/core': 0.41.2
+      '@auth/core': 0.41.3
       '@chat-adapter/slack': 4.34.0(ai@7.0.58(zod@4.4.3))(bufferutil@4.1.0)(supports-color@10.2.2)(zod@4.4.3)
       ai: 7.0.58(zod@4.4.3)
       eve: link:packages/eve
@@ -22399,7 +22396,7 @@ snapshots:
       '@vue/shared': 3.5.35
       estree-walker: 2.0.2
       magic-string: 0.30.21
-      postcss: 8.5.15
+      postcss: 8.5.23
       source-map-js: 1.2.1
 
   '@vue/compiler-sfc@3.5.39':
@@ -22411,7 +22408,7 @@ snapshots:
       '@vue/shared': 3.5.39
       estree-walker: 2.0.2
       magic-string: 0.30.21
-      postcss: 8.5.15
+      postcss: 8.5.23
       source-map-js: 1.2.1
 
   '@vue/compiler-ssr@3.5.35':
@@ -22962,13 +22959,13 @@ snapshots:
     transitivePeerDependencies:
       - ws
 
-  autoprefixer@10.5.3(postcss@8.5.15):
+  autoprefixer@10.5.3(postcss@8.5.23):
     dependencies:
       browserslist: 4.28.6
       caniuse-lite: 1.0.30001805
       fraction.js: 5.3.4
       picocolors: 1.1.1
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
   available-typed-arrays@1.0.7:
@@ -23719,48 +23716,48 @@ snapshots:
 
   cssesc@3.0.0: {}
 
-  cssnano-preset-default@8.0.2(postcss@8.5.15):
+  cssnano-preset-default@8.0.2(postcss@8.5.23):
     dependencies:
       browserslist: 4.28.6
-      cssnano-utils: 6.0.1(postcss@8.5.15)
-      postcss: 8.5.15
-      postcss-calc: 10.1.1(postcss@8.5.15)
-      postcss-colormin: 8.0.1(postcss@8.5.15)
-      postcss-convert-values: 8.0.1(postcss@8.5.15)
-      postcss-discard-comments: 8.0.1(postcss@8.5.15)
-      postcss-discard-duplicates: 8.0.1(postcss@8.5.15)
-      postcss-discard-empty: 8.0.1(postcss@8.5.15)
-      postcss-discard-overridden: 8.0.1(postcss@8.5.15)
-      postcss-merge-longhand: 8.0.1(postcss@8.5.15)
-      postcss-merge-rules: 8.0.1(postcss@8.5.15)
-      postcss-minify-font-values: 8.0.1(postcss@8.5.15)
-      postcss-minify-gradients: 8.0.1(postcss@8.5.15)
-      postcss-minify-params: 8.0.1(postcss@8.5.15)
-      postcss-minify-selectors: 8.0.2(postcss@8.5.15)
-      postcss-normalize-charset: 8.0.1(postcss@8.5.15)
-      postcss-normalize-display-values: 8.0.1(postcss@8.5.15)
-      postcss-normalize-positions: 8.0.1(postcss@8.5.15)
-      postcss-normalize-repeat-style: 8.0.1(postcss@8.5.15)
-      postcss-normalize-string: 8.0.1(postcss@8.5.15)
-      postcss-normalize-timing-functions: 8.0.1(postcss@8.5.15)
-      postcss-normalize-unicode: 8.0.1(postcss@8.5.15)
-      postcss-normalize-url: 8.0.1(postcss@8.5.15)
-      postcss-normalize-whitespace: 8.0.1(postcss@8.5.15)
-      postcss-ordered-values: 8.0.1(postcss@8.5.15)
-      postcss-reduce-initial: 8.0.1(postcss@8.5.15)
-      postcss-reduce-transforms: 8.0.1(postcss@8.5.15)
-      postcss-svgo: 8.0.1(postcss@8.5.15)
-      postcss-unique-selectors: 8.0.1(postcss@8.5.15)
+      cssnano-utils: 6.0.1(postcss@8.5.23)
+      postcss: 8.5.23
+      postcss-calc: 10.1.1(postcss@8.5.23)
+      postcss-colormin: 8.0.1(postcss@8.5.23)
+      postcss-convert-values: 8.0.1(postcss@8.5.23)
+      postcss-discard-comments: 8.0.1(postcss@8.5.23)
+      postcss-discard-duplicates: 8.0.1(postcss@8.5.23)
+      postcss-discard-empty: 8.0.1(postcss@8.5.23)
+      postcss-discard-overridden: 8.0.1(postcss@8.5.23)
+      postcss-merge-longhand: 8.0.1(postcss@8.5.23)
+      postcss-merge-rules: 8.0.1(postcss@8.5.23)
+      postcss-minify-font-values: 8.0.1(postcss@8.5.23)
+      postcss-minify-gradients: 8.0.1(postcss@8.5.23)
+      postcss-minify-params: 8.0.1(postcss@8.5.23)
+      postcss-minify-selectors: 8.0.2(postcss@8.5.23)
+      postcss-normalize-charset: 8.0.1(postcss@8.5.23)
+      postcss-normalize-display-values: 8.0.1(postcss@8.5.23)
+      postcss-normalize-positions: 8.0.1(postcss@8.5.23)
+      postcss-normalize-repeat-style: 8.0.1(postcss@8.5.23)
+      postcss-normalize-string: 8.0.1(postcss@8.5.23)
+      postcss-normalize-timing-functions: 8.0.1(postcss@8.5.23)
+      postcss-normalize-unicode: 8.0.1(postcss@8.5.23)
+      postcss-normalize-url: 8.0.1(postcss@8.5.23)
+      postcss-normalize-whitespace: 8.0.1(postcss@8.5.23)
+      postcss-ordered-values: 8.0.1(postcss@8.5.23)
+      postcss-reduce-initial: 8.0.1(postcss@8.5.23)
+      postcss-reduce-transforms: 8.0.1(postcss@8.5.23)
+      postcss-svgo: 8.0.1(postcss@8.5.23)
+      postcss-unique-selectors: 8.0.1(postcss@8.5.23)
 
-  cssnano-utils@6.0.1(postcss@8.5.15):
+  cssnano-utils@6.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
 
-  cssnano@8.0.2(postcss@8.5.15):
+  cssnano@8.0.2(postcss@8.5.23):
     dependencies:
-      cssnano-preset-default: 8.0.2(postcss@8.5.15)
+      cssnano-preset-default: 8.0.2(postcss@8.5.23)
       lilconfig: 3.1.3
-      postcss: 8.5.15
+      postcss: 8.5.23
 
   csso@5.0.5:
     dependencies:
@@ -29195,144 +29192,144 @@ snapshots:
 
   postal-mime@2.7.3: {}
 
-  postcss-calc@10.1.1(postcss@8.5.15):
+  postcss-calc@10.1.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-selector-parser: 7.1.4
       postcss-value-parser: 4.2.0
 
-  postcss-colormin@8.0.1(postcss@8.5.15):
+  postcss-colormin@8.0.1(postcss@8.5.23):
     dependencies:
       '@colordx/core': 5.5.0
       browserslist: 4.28.6
       caniuse-api: 4.0.0
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-convert-values@8.0.1(postcss@8.5.15):
+  postcss-convert-values@8.0.1(postcss@8.5.23):
     dependencies:
       browserslist: 4.28.6
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-discard-comments@8.0.1(postcss@8.5.15):
+  postcss-discard-comments@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-selector-parser: 7.1.4
 
-  postcss-discard-duplicates@8.0.1(postcss@8.5.15):
+  postcss-discard-duplicates@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
 
-  postcss-discard-empty@8.0.1(postcss@8.5.15):
+  postcss-discard-empty@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
 
-  postcss-discard-overridden@8.0.1(postcss@8.5.15):
+  postcss-discard-overridden@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
 
-  postcss-merge-longhand@8.0.1(postcss@8.5.15):
+  postcss-merge-longhand@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
-      stylehacks: 8.0.1(postcss@8.5.15)
+      stylehacks: 8.0.1(postcss@8.5.23)
 
-  postcss-merge-rules@8.0.1(postcss@8.5.15):
+  postcss-merge-rules@8.0.1(postcss@8.5.23):
     dependencies:
       browserslist: 4.28.6
       caniuse-api: 4.0.0
-      cssnano-utils: 6.0.1(postcss@8.5.15)
-      postcss: 8.5.15
+      cssnano-utils: 6.0.1(postcss@8.5.23)
+      postcss: 8.5.23
       postcss-selector-parser: 7.1.4
 
-  postcss-minify-font-values@8.0.1(postcss@8.5.15):
+  postcss-minify-font-values@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-minify-gradients@8.0.1(postcss@8.5.15):
+  postcss-minify-gradients@8.0.1(postcss@8.5.23):
     dependencies:
       '@colordx/core': 5.5.0
-      cssnano-utils: 6.0.1(postcss@8.5.15)
-      postcss: 8.5.15
+      cssnano-utils: 6.0.1(postcss@8.5.23)
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-minify-params@8.0.1(postcss@8.5.15):
+  postcss-minify-params@8.0.1(postcss@8.5.23):
     dependencies:
       browserslist: 4.28.6
-      cssnano-utils: 6.0.1(postcss@8.5.15)
-      postcss: 8.5.15
+      cssnano-utils: 6.0.1(postcss@8.5.23)
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-minify-selectors@8.0.2(postcss@8.5.15):
+  postcss-minify-selectors@8.0.2(postcss@8.5.23):
     dependencies:
       browserslist: 4.28.6
       caniuse-api: 4.0.0
       cssesc: 3.0.0
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-selector-parser: 7.1.4
 
-  postcss-normalize-charset@8.0.1(postcss@8.5.15):
+  postcss-normalize-charset@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
 
-  postcss-normalize-display-values@8.0.1(postcss@8.5.15):
+  postcss-normalize-display-values@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-normalize-positions@8.0.1(postcss@8.5.15):
+  postcss-normalize-positions@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-normalize-repeat-style@8.0.1(postcss@8.5.15):
+  postcss-normalize-repeat-style@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-normalize-string@8.0.1(postcss@8.5.15):
+  postcss-normalize-string@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-normalize-timing-functions@8.0.1(postcss@8.5.15):
+  postcss-normalize-timing-functions@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-normalize-unicode@8.0.1(postcss@8.5.15):
+  postcss-normalize-unicode@8.0.1(postcss@8.5.23):
     dependencies:
       browserslist: 4.28.6
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-normalize-url@8.0.1(postcss@8.5.15):
+  postcss-normalize-url@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-normalize-whitespace@8.0.1(postcss@8.5.15):
+  postcss-normalize-whitespace@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-ordered-values@8.0.1(postcss@8.5.15):
+  postcss-ordered-values@8.0.1(postcss@8.5.23):
     dependencies:
-      cssnano-utils: 6.0.1(postcss@8.5.15)
-      postcss: 8.5.15
+      cssnano-utils: 6.0.1(postcss@8.5.23)
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
-  postcss-reduce-initial@8.0.1(postcss@8.5.15):
+  postcss-reduce-initial@8.0.1(postcss@8.5.23):
     dependencies:
       browserslist: 4.28.6
       caniuse-api: 4.0.0
-      postcss: 8.5.15
+      postcss: 8.5.23
 
-  postcss-reduce-transforms@8.0.1(postcss@8.5.15):
+  postcss-reduce-transforms@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
 
   postcss-selector-parser@7.1.4:
@@ -29340,15 +29337,15 @@ snapshots:
       cssesc: 3.0.0
       util-deprecate: 1.0.2
 
-  postcss-svgo@8.0.1(postcss@8.5.15):
+  postcss-svgo@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-value-parser: 4.2.0
       svgo: 4.0.2
 
-  postcss-unique-selectors@8.0.1(postcss@8.5.15):
+  postcss-unique-selectors@8.0.1(postcss@8.5.23):
     dependencies:
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-selector-parser: 7.1.4
 
   postcss-value-parser@4.2.0: {}
@@ -29359,13 +29356,7 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.1
 
-  postcss@8.5.15:
-    dependencies:
-      nanoid: 3.3.16
-      picocolors: 1.1.1
-      source-map-js: 1.2.1
-
-  postcss@8.5.20:
+  postcss@8.5.23:
     dependencies:
       nanoid: 3.3.16
       picocolors: 1.1.1
@@ -30402,7 +30393,7 @@ snapshots:
       kleur: 4.1.5
       open: 11.0.0
       ora: 8.2.0
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-selector-parser: 7.1.4
       prompts: 2.4.2
       recast: 0.23.12
@@ -30442,7 +30433,7 @@ snapshots:
       kleur: 4.1.5
       open: 11.0.0
       ora: 8.2.0
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-selector-parser: 7.1.4
       prompts: 2.4.2
       recast: 0.23.12
@@ -30450,7 +30441,7 @@ snapshots:
       tailwind-merge: 3.6.0
       ts-morph: 26.0.0
       tsconfig-paths: 4.2.0
-      undici: 7.28.0
+      undici: 7.29.0
       validate-npm-package-name: 7.0.2
       zod: 3.25.76
       zod-to-json-schema: 3.25.2(zod@3.25.76)
@@ -30907,10 +30898,10 @@ snapshots:
     optionalDependencies:
       '@babel/core': 7.29.0(supports-color@10.2.2)
 
-  stylehacks@8.0.1(postcss@8.5.15):
+  stylehacks@8.0.1(postcss@8.5.23):
     dependencies:
       browserslist: 4.28.6
-      postcss: 8.5.15
+      postcss: 8.5.23
       postcss-selector-parser: 7.1.4
 
   stylis@4.4.0: {}
@@ -31369,7 +31360,7 @@ snapshots:
 
   undici@7.29.0: {}
 
-  undici@8.9.0: {}
+  undici@8.10.0: {}
 
   unenv@2.0.0-rc.24:
     dependencies:
@@ -31876,7 +31867,7 @@ snapshots:
       esbuild: 0.27.7
       fdir: 6.5.0(picomatch@4.0.5)
       picomatch: 4.0.5
-      postcss: 8.5.15
+      postcss: 8.5.23
       rollup: 4.62.2
       tinyglobby: 0.2.17
     optionalDependencies:
@@ -31892,7 +31883,7 @@ snapshots:
     dependencies:
       lightningcss: 1.32.0
       picomatch: 4.0.5
-      postcss: 8.5.20
+      postcss: 8.5.23
       rolldown: 1.1.5
       tinyglobby: 0.2.17
     optionalDependencies:
