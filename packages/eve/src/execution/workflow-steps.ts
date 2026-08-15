@@ -9,6 +9,7 @@ import {
   prepareDynamicInstructionPreamble,
 } from "#context/dynamic-instruction-lifecycle.js";
 import { dispatchDynamicModelEvent } from "#context/dynamic-model-lifecycle.js";
+import { preserveSerializedSessionDynamicModelSelection } from "#context/serialized-dynamic-model-selection.js";
 import { dispatchDynamicSkillEvent } from "#context/dynamic-skill-lifecycle.js";
 import {
   dispatchDynamicSubagentEvent,
@@ -58,8 +59,6 @@ import { getPendingRuntimeActionBatch } from "#harness/runtime-actions.js";
 import type { HarnessSession, SettledTurn, StepInput, StepResult } from "#harness/types.js";
 import { getTurnUsageState, takeSessionUsageDelta, toUsage } from "#harness/turn-tag-state.js";
 import type { TokenUsage } from "#shared/token-usage.js";
-import type { JsonObject } from "#shared/json.js";
-import type { RunMode } from "#shared/run-mode.js";
 import { getRuntimeActionRequestKey } from "#runtime/actions/keys.js";
 import {
   createAuthorizationCompletedEvent,
@@ -76,6 +75,8 @@ import {
   PendingAuthorizationResultKey,
 } from "#harness/authorization.js";
 import { resolveWorkflowCallbackBaseUrl } from "#execution/workflow-callback-url.js";
+import { forwardTaskEventToSessionCallback } from "#execution/task-event-callback.js";
+import { resolveEffectiveOutputSchema } from "#execution/effective-output-schema.js";
 import {
   createDurableSessionState,
   type DurableSessionState,
@@ -83,6 +84,11 @@ import {
 } from "#execution/durable-session-store.js";
 import type { TurnStepInput } from "#execution/durable-session-migrations/turn-workflow.js";
 import { buildRuntimeIdentity, createExecutionNodeStep } from "#execution/node-step.js";
+import { appendTaskAgentAnnouncement } from "#execution/tasks/parent/agent-views.js";
+import {
+  isTaskOwnedSerializedContext,
+  TASK_UPDATE_SESSION_INSTRUCTION,
+} from "#execution/tasks/child/instructions.js";
 import { prepareWorkflowPreambleTrace } from "#execution/workflow-trace-context.js";
 import { resolveEffectiveAgentRuntime } from "#execution/effective-agent-config.js";
 import { recordSubagentUsageSpans } from "#execution/subagent-usage-span.js";
@@ -90,6 +96,7 @@ import { reconcileSessionContinuationToken } from "#execution/reconcile-session-
 import { hydrateDurableSession, refreshSessionFromTurnAgent } from "#execution/session.js";
 import { resolveRuntimeCompiledArtifactsVersionedCacheKey } from "#runtime/cache-key.js";
 import { createWorkflowRuntime } from "#execution/workflow-runtime.js";
+import { isTaskToolAvailable, TASK_UPDATE_TOOL_NAME } from "#runtime/framework-tools/tasks.js";
 
 const TASK_DONE_WITH_PENDING_INPUT_ERROR_MESSAGE =
   "Task mode cannot complete while input requests remain pending.";
@@ -137,6 +144,12 @@ export type DurableStepResult =
       readonly hasPendingAuthorization: boolean;
       readonly hasPendingInputBatch: boolean;
       readonly pendingRuntimeActionKeys?: readonly string[];
+      /**
+       * Selects the dispatch step for `pendingRuntimeActionKeys`:
+       * `dispatchTaskStep` when the agent runs `experimental.tasks`,
+       * `dispatchRuntimeActionsStep` otherwise (including when absent).
+       */
+      readonly tasksEnabled?: boolean;
       readonly sleepDurationMs?: number;
       readonly serializedContext: Record<string, unknown>;
       readonly sessionState: DurableSessionState;
@@ -164,7 +177,18 @@ export async function turnStep(rawInput: TurnStepInput): Promise<DurableStepResu
   const ctx = await deserializeContext(input.serializedContext);
   const adapter = ctx.require(ChannelKey);
   const bundle = ctx.require(BundleKey);
+  const tasksEnabled = bundle.resolvedAgent.config?.experimental?.tasks === true;
   const effectiveAgent = resolveEffectiveAgentRuntime(bundle, ctx);
+  const taskUpdatesEnabled =
+    isTaskOwnedSerializedContext(input.serializedContext) &&
+    isTaskToolAvailable({
+      disabledFrameworkTools: bundle.resolvedAgent.disabledFrameworkTools ?? [],
+      hasAuthoredTool: effectiveAgent.turnAgent.tools.some(
+        (tool) => tool.name === TASK_UPDATE_TOOL_NAME,
+      ),
+      tasksEnabled,
+      toolName: TASK_UPDATE_TOOL_NAME,
+    });
 
   // Populate the callback base URL so getHookUrl() works during tool
   // execution, preferring eve's active local origin over metadata fallback.
@@ -316,6 +340,7 @@ export async function turnStep(rawInput: TurnStepInput): Promise<DurableStepResu
       ...derivePendingState(rekeyed),
       serializedContext: nextSerializedContext,
       sessionState: nextState,
+      tasksEnabled,
     };
   }
 
@@ -324,7 +349,7 @@ export async function turnStep(rawInput: TurnStepInput): Promise<DurableStepResu
   const dynamicSkillResolvers = bundle.resolvedAgent.dynamicSkillResolvers ?? [];
   const dynamicSubagentResolvers = bundle.subagentRegistry.dynamicResolvers ?? [];
   const persistentSubagentSessions =
-    bundle.resolvedAgent.config?.experimental?.subagentPersistentSessions === true;
+    tasksEnabled || bundle.resolvedAgent.config?.experimental?.subagentPersistentSessions === true;
   const dynamicToolResolvers = bundle.resolvedAgent.dynamicToolResolvers ?? [];
   const effectiveNode = {
     ...bundle.graph.root,
@@ -381,7 +406,11 @@ export async function turnStep(rawInput: TurnStepInput): Promise<DurableStepResu
     event: UnstampedMessageStreamEvent,
     messages?: readonly import("ai").ModelMessage[],
   ): Promise<void> => {
-    const emitted = await emit(event);
+    // A remote task's parent owns its HITL. Forward blocking events over
+    // the task callback and keep them out of the child's local channel;
+    // otherwise two TUIs can present and answer the same request.
+    const forwardedToTaskParent = await forwardTaskEventToSessionCallback(ctx, event);
+    const emitted = forwardedToTaskParent ? stampMessageStreamEvent(event) : await emit(event);
     await dispatchStreamEventHooks({ ctx, registry: hookRegistry, event: emitted });
     if (emitted.type !== "step.started") {
       await dispatchDynamicModelEvent({
@@ -471,6 +500,7 @@ export async function turnStep(rawInput: TurnStepInput): Promise<DurableStepResu
           )?.candidateId;
           await handleEvent(
             createAuthorizationCompletedEvent({
+              attemptId: result.attemptId,
               authorization,
               candidateId,
               name: result.name,
@@ -494,8 +524,12 @@ export async function turnStep(rawInput: TurnStepInput): Promise<DurableStepResu
             thresholdPercent: effectiveAgent.thresholdPercent,
           },
           session: lifecycleSession,
+          systemPromptAdditions: taskUpdatesEnabled ? [TASK_UPDATE_SESSION_INSTRUCTION] : undefined,
           turnAgent: effectiveAgent.turnAgent,
         });
+        const modelSession = tasksEnabled
+          ? await appendTaskAgentAnnouncement(refreshedSession)
+          : refreshedSession;
 
         const step = createExecutionNodeStep({
           abortSignal: input.abortSignal,
@@ -512,7 +546,7 @@ export async function turnStep(rawInput: TurnStepInput): Promise<DurableStepResu
           node: effectiveNode,
           workflowMaxSubagents: refreshedSession.workflowMaxSubagents,
         });
-        return step(refreshedSession, stepInput);
+        return step(modelSession, stepInput);
       };
 
       return runHarnessStep(schemaSession, resolved);
@@ -523,14 +557,18 @@ export async function turnStep(rawInput: TurnStepInput): Promise<DurableStepResu
       throw error;
     }
     writer.releaseLock();
-    // Both carve-outs exist because the cancellation epilogue still publishes
-    // `turn.cancelled` downstream, and the open spans and provider state it
-    // needs to close were written by the step being discarded.
+    // Trace and instrumentation state are needed by the cancellation
+    // epilogue to close the operation the discarded step opened.
+    // The session model is also kept because `session.started` is not emitted
+    // again after this cancellation settles.
     const interrupted = serializeContext(ctx);
     return {
       action: "cancelled",
       serializedContext: preserveSerializedInstrumentationState(
-        preserveSerializedAgentTraceState(input.serializedContext, interrupted),
+        preserveSerializedAgentTraceState(
+          preserveSerializedSessionDynamicModelSelection(input.serializedContext, interrupted),
+          interrupted,
+        ),
         interrupted,
       ),
       sessionState: input.sessionState,
@@ -608,6 +646,7 @@ export async function turnStep(rawInput: TurnStepInput): Promise<DurableStepResu
           isError: stepResult.settledTurn.isError,
           usage: delta,
         },
+        tasksEnabled,
       };
     }
 
@@ -617,6 +656,7 @@ export async function turnStep(rawInput: TurnStepInput): Promise<DurableStepResu
       ...sleepTransition,
       serializedContext: nextSerializedContext,
       sessionState: nextState,
+      tasksEnabled,
     };
   }
 
@@ -657,35 +697,4 @@ function derivePendingState(session: HarnessSession): {
     };
   }
   return base;
-}
-
-/**
- * Resolves the single output schema in effect for this turn, decoupling schema
- * enforcement from {@link RunMode}: downstream the harness reads
- * `session.outputSchema` unconditionally and never re-derives it from mode.
- *
- * A run-scoped (client-supplied) schema on the turn's {@link StepInput} always
- * wins. With no run-scoped schema, a task run adopts the agent's declared
- * return schema — its function-output contract, which only applies when the
- * agent is invoked as a function (subagent / schedule / job), i.e. task mode.
- * A conversation run with no run-scoped schema enforces nothing. Continuation
- * steps (no new `StepInput`) preserve whatever is already in effect.
- */
-export function resolveEffectiveOutputSchema(input: {
-  readonly agentOutputSchema: JsonObject | undefined;
-  readonly input: StepInput | undefined;
-  readonly mode: RunMode;
-  readonly session: HarnessSession;
-}): HarnessSession {
-  const { agentOutputSchema, input: stepInput, mode, session } = input;
-
-  if (stepInput?.outputSchema !== undefined) {
-    return { ...session, outputSchema: stepInput.outputSchema };
-  }
-
-  if (mode === "task" && session.outputSchema === undefined && agentOutputSchema !== undefined) {
-    return { ...session, outputSchema: agentOutputSchema };
-  }
-
-  return session;
 }

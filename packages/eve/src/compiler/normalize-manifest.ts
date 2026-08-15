@@ -22,7 +22,10 @@ import { createCompiledRuntimeModelCatalogLoader } from "#compiler/model-catalog
 import { compileAgentConfig } from "#compiler/normalize-agent-config.js";
 import { compileChannelDefinition } from "#compiler/normalize-channel.js";
 import { compileConnectionDefinition } from "#compiler/normalize-connection.js";
-import { compileExtensionContributions } from "#compiler/normalize-extension.js";
+import {
+  composeAgentSubagentSources,
+  compileExtensionContributions,
+} from "#compiler/normalize-extension.js";
 import type { ManifestCompileContext } from "#compiler/normalize-helpers.js";
 import { compileHookEntry } from "#compiler/normalize-hook.js";
 import { compileSandboxDefinition } from "#compiler/normalize-sandbox.js";
@@ -48,8 +51,9 @@ export async function compileAgentManifest(
     compileAgentResources,
     context,
     externalDependencies: compiledNode.config.build?.externalDependencies ?? [],
+    parentAgentRoot: manifest.agentRoot,
     parentNodeId: ROOT_COMPILED_AGENT_NODE_ID,
-    subagents: manifest.subagents,
+    subagents: composeAgentSubagentSources(manifest),
   });
 
   return createCompiledAgentManifest({
@@ -67,7 +71,7 @@ async function compileAgentNodeManifest(
   options: {
     readonly agentConfigDefinition?: unknown;
     readonly externalDependencies?: readonly string[];
-    readonly allowWorkflowConfig?: boolean;
+    readonly allowRootOnlyConfig?: boolean;
   } = {},
 ): Promise<CompiledAgentNodeManifest> {
   const rawConfig = Object.hasOwn(options, "agentConfigDefinition")
@@ -75,9 +79,14 @@ async function compileAgentNodeManifest(
         definition: options.agentConfigDefinition,
       })
     : await compileAgentConfig(manifest, context);
-  if (options.allowWorkflowConfig === false && rawConfig.experimental?.workflow !== undefined) {
+  if (options.allowRootOnlyConfig === false && rawConfig.experimental?.workflow !== undefined) {
     throw new Error(
       `Workflow runtime configuration is only supported on the root agent config. Remove "experimental.workflow" from "${manifest.agentId}".`,
+    );
+  }
+  if (options.allowRootOnlyConfig === false && rawConfig.experimental?.tasks !== undefined) {
+    throw new Error(
+      `Background tasks are only supported on the root agent config. Remove "experimental.tasks" from "${manifest.agentId}".`,
     );
   }
   const externalDependencies = mergeExternalDependencies(
@@ -200,6 +209,7 @@ async function compileAgentResources(
       consumerAgentRoot: manifest.agentRoot,
       externalDependencies,
     });
+    compiledChannels.push(...contributions.channels);
     for (const tool of contributions.tools) {
       if (!toolNames.has(tool.name)) {
         toolNames.add(tool.name);
@@ -224,6 +234,7 @@ async function compileAgentResources(
         skills.push(skill);
       }
     }
+    schedules.push(...contributions.schedules);
     hooks.push(...contributions.hooks);
     dynamicSkills.push(...contributions.dynamicSkills);
     dynamicInstructions.push(...contributions.dynamicInstructions);

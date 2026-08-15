@@ -1,5 +1,61 @@
 # eve
 
+## 0.38.3
+
+### Patch Changes
+
+- 8b2a914: Authorize Slack HITL answers with `onInputResponse` before they resume a parked session. Omitting the hook preserves the existing submitting-user authorization behavior regardless of other Slack handlers.
+- c2b9bbf: Slack `onEvent` handlers can now pass `title` to `ctx.send()` to set the run title without changing the message sent to the model.
+
+## 0.38.2
+
+### Patch Changes
+
+- 250d67a: Bump `@workflow/*` packages to the latest 5.0.0 betas (`core` beta.42, `errors` beta.17, `world` beta.27, `world-local` beta.36, `world-vercel` beta.38, `world-postgres` beta.34). The development Workflow world now advertises spec version 6 (slot-numbered event ids), matching the updated local world.
+- f9f29d3: Surface AI Gateway model catalog request failures during compilation instead of reporting unavailable models as missing metadata. Models with eve-owned metadata continue to compile without the catalog.
+- 77de320: Let background task children send intermediate progress to their parent with `task_update`, using the existing local and remote child-to-parent transports. Remote task HITL is now presented only by the parent channel, finished agents continue through their original subagent tool with `agentId`, and the redundant `task_send` tool has been removed.
+- 88f6ca9: Configure MCP channel endpoints with `route`, default them to `/eve/v1/mcp`, and derive OAuth protected-resource metadata paths from the MCP resource identifier.
+- fe1ad3b: Search by item name when suggesting registry matches, so path typos such as `channels/slack` can still suggest `channel/slack`.
+
+## 0.38.1
+
+### Patch Changes
+
+- d23467d: Allow extensions to contribute namespaced subagents, including their tools, configuration access, nested subagents, and directory-mount overrides.
+- cb2fa2a: Configure MCP channel endpoints with `route`, default them to `/eve/v1/mcp`, and derive OAuth protected-resource metadata paths from the MCP resource identifier.
+
+## 0.38.0
+
+### Minor Changes
+
+- 48c1105: Replace `stop()` on frontend agent bindings with `cancel()`. Cancellation now targets the exact durable turn through `MessageResponse.cancel()` while the binding stays attached through settlement.
+
+### Patch Changes
+
+- 8904392: Extensions can now contribute channels. Mounted channel IDs receive the extension namespace while their authored route paths remain unchanged.
+- 4c3c475: Built-in inbound hooks can now return `title` to set the workflow run title without changing the message sent to the model.
+- a7d34e5: Make Nitro-backed builds more reliable by preserving per-import conditional exports, keeping authored and vendored OpenTelemetry tracers on one registered provider, and running development worker close hooks during an explicit shutdown handshake. Workflow artifacts are now emitted directly instead of repaired through post-build string rewrites.
+- bdd5a9b: Suggest close registry matches when `eve add` cannot find the requested item.
+- ccc604c: Show `eve add` help and registry search guidance when no item is provided.
+- abcd06d: Resolve project-scoped CLI commands from the nearest enclosing eve application when run from a nested directory.
+- 775c061: Extensions can contribute schedules. Mounted schedule IDs use the extension namespace while cron expressions and handler behavior remain unchanged.
+
+## 0.37.1
+
+### Patch Changes
+
+- 8bf1e5b: Render background subagent activity in one persistent dev TUI section across parent turns. Idle task wakes render while the prompt remains active, remote child streams use the authenticated parent proxy, and child boundaries finalize sections without later-turn cancellation closing unrelated background work.
+- 046981e: Add experimental background tasks for local and remote subagents. With `experimental.tasks` enabled, subagent calls return durable task receipts; parents can inspect, continue, or cancel work while lifecycle notifications and human-input requests arrive asynchronously. Remote child streams are exposed through an authenticated parent-origin proxy so clients never receive remote credentials.
+- d8cef1a: Scope create-once operations to the effective forwarded principal so two forwarded users behind the same trusted forwarder cannot adopt each other's session.
+- 5d12328: Preserve a session-scoped dynamic model selection when the first turn is cancelled so later turns can reuse it without requiring a `turn.started` resolver.
+- 10a09a1: Make failed `eve init` runs recoverable: new targets are cleaned up, preexisting empty targets are restored, and existing projects receive clear dependency-install recovery guidance.
+- 8bf1e5b: The dev TUI now presents and routes approval or question prompts raised by background tasks while the parent session is idle, instead of leaving the task blocked.
+- 046981e: Preserve remote task HITL response routes for loopback HTTP children and Vercel deployments configured with Protection Bypass for Automation. HTTPS remains required for every non-loopback remote child.
+- 63726db: Polish the connection authorization completion page with a Vercel-styled success state.
+- d8cef1a: Add authenticated create-once session requests through `operationId`. Concurrent or retried creates adopt the active session that first claimed the operation without dispatching duplicate input.
+- 5ba9749: Add a secure MCP channel that reuses eve route auth and lets clients start, inspect, update, authorize, and cancel principal-bound durable agent invocations over MCP 2026-07-28 with a stateless 2025 compatibility path.
+- 60e87ef: Keep active client turns connected while they are paused for authorization so responses resume automatically after the callback completes.
+
 ## 0.37.0
 
 ### Minor Changes

@@ -13,6 +13,7 @@ import { DEVELOPMENT_WORKFLOW_SECRET_ENV } from "#internal/workflow/development-
 import {
   attachAgentInfoRouteResponse,
   attachRouteChannelName,
+  attachRemoteAgentStreamHeadersResolver,
   attachRouteSessionCreator,
 } from "#internal/nitro/routes/channel-route-context.js";
 import type { NitroArtifactsConfig } from "#internal/nitro/routes/runtime-artifacts.js";
@@ -271,10 +272,17 @@ function buildRouteArgs(
         ...input,
         adapter,
         channelName,
+        continuationToken:
+          input.continuationToken === undefined
+            ? undefined
+            : `${channelName}:${input.continuationToken}`,
         delivery: createChannelDeliveryMetadata(deliverySource),
         requestId,
       }),
   );
+  if (bundle.resolveRemoteAgentStreamHeaders !== undefined) {
+    attachRemoteAgentStreamHeadersResolver(args, bundle.resolveRemoteAgentStreamHeaders);
+  }
 
   return {
     args,

@@ -147,6 +147,8 @@ import { attemptIdempotencyKey } from "#harness/instrumentation/lifecycle.js";
 import { resolveParentLineage } from "#harness/parent-lineage.js";
 import { prepareTurnTraceContext } from "#harness/prepare-trace-context.js";
 import { ChannelKey } from "#runtime/sessions/runtime-context-keys.js";
+import { TASK_UPDATE_TOOL_NAME } from "#runtime/framework-tools/tasks.js";
+import { readTaskIdFromInboxToken } from "#tasks/task-inbox-token.js";
 import {
   consumeDeferredStepInput,
   getApprovedTools,
@@ -558,11 +560,13 @@ function buildHarnessToolsWithDynamicSubagents(
 
 export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
   const baseEmit = config.handleEvent;
-  const otelSettings = getInstrumentationRuntime()?.otelSettings;
-  // The custom-context enrichment below still reads the authored config object
-  // directly. Its replacement on the provider surface is unresolved, so a
-  // provider directory contributes no custom context yet.
+  const instrumentationRuntime = getInstrumentationRuntime();
+  const otelSettings = instrumentationRuntime?.otelSettings;
+  // The legacy single-file layout reads its runtime-context resolver from the
+  // authored config object; the provider directory collects resolvers at install
+  // time onto the runtime. Both paths feed buildTelemetryRuntimeContext.
   const authoredConfig = getInstrumentationConfig();
+  const providerRuntimeContextResolvers = instrumentationRuntime?.runtimeContextResolvers;
   if (otelSettings !== undefined) {
     ensureOtelIntegration();
   }
@@ -622,8 +626,14 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
     let emissionState = getHarnessEmissionState(session.state);
     const store = contextStorage.getStore();
     const parent = store?.get(ParentSessionKey);
-    const hasDelegatedCaller = parent !== undefined || store?.get(SessionCallbackKey) !== undefined;
-    const parentLineage = resolveParentLineage(parent, store?.get(ChannelKey));
+    const channel = store?.get(ChannelKey);
+    const callback = store?.get(SessionCallbackKey);
+    const hasDelegatedCaller = parent !== undefined || callback !== undefined;
+    const taskOwned =
+      callback?.taskId !== undefined ||
+      readTaskIdFromInboxToken(String(channel?.state?.parentContinuationToken ?? "")) !== undefined;
+    const taskUpdatesEnabled = taskOwned && config.tools.has(TASK_UPDATE_TOOL_NAME);
+    const parentLineage = resolveParentLineage(parent, channel);
     const parentTraceContext = store?.get(ParentTraceContextKey);
     let activeAttemptScope: InstrumentationAttemptScope | undefined;
     const emit = createInstrumentationHandleEvent({
@@ -1126,12 +1136,12 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
     // assistant-final histories. See resolveAgentsAnnouncement for the role
     // rationale (assistant-final rejection, prompt-cache preservation).
     if (config.persistentSubagentSessions === true) {
-      const announcement = resolveAgentsAnnouncement({
-        messages,
-        store: getAgentHandleStore(session.state),
-      });
-      if (announcement !== undefined) {
-        messages.push({ content: announcement, role: "user" });
+      const store = getAgentHandleStore(session.state);
+      if (store?.handles.some((handle) => handle.phase === "addressed") !== true) {
+        const announcement = resolveAgentsAnnouncement({ messages, store });
+        if (announcement !== undefined) {
+          messages.push({ content: announcement, role: "user" });
+        }
       }
     }
 
@@ -1289,6 +1299,7 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
             instructions,
             messages: modelMessages,
           },
+          providerResolvers: providerRuntimeContextResolvers,
           session,
         }),
       };
@@ -1333,6 +1344,7 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
         : modelMessages;
       const harnessTools = buildHarnessToolsWithDynamicSubagents(config.tools, ctx);
       const advertisedHarnessTools = getAdvertisedTools({
+        delegatedCaller: taskUpdatesEnabled,
         session,
         tools: harnessTools,
       });
@@ -1349,6 +1361,7 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
 
       if (ctx !== undefined) {
         const dynamicTools = getAdvertisedTools({
+          delegatedCaller: taskUpdatesEnabled,
           session,
           tools: buildDynamicTools(ctx),
         });
@@ -1386,6 +1399,7 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
           : undefined;
 
       const advertisedModelTools = await getAdvertisedTools({
+        delegatedCaller: taskUpdatesEnabled,
         modelTools: flatTools,
         session,
         tools: advertisedHarnessTools,
@@ -1418,6 +1432,7 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
               attemptScope,
               instrumentationHooks,
               config.instrumentation?.runInContext,
+              telemetryRuntimeContext,
             );
 
       const hooks = buildStepHooks({
@@ -1864,6 +1879,7 @@ export function createToolLoopHarness(config: ToolLoopHarnessConfig): StepFn {
       config,
       emit,
       emissionState,
+      delegatedCaller: taskUpdatesEnabled,
       promptMessages: messages,
       result,
       runStep,
@@ -2382,6 +2398,7 @@ async function handleStepResult(input: {
   readonly config: ToolLoopHarnessConfig;
   readonly emit?: ToolLoopHarnessConfig["handleEvent"];
   readonly emissionState: ReturnType<typeof getHarnessEmissionState>;
+  readonly delegatedCaller: boolean;
   readonly promptMessages: readonly ModelMessage[];
   readonly result: HarnessStepResult;
   readonly runStep: StepFn;
@@ -2470,6 +2487,7 @@ async function handleStepResult(input: {
   });
   const inputRequests: InputRequest[] = [...approvalRequests, ...questionRequests];
   const advertisedRuntimeActionTools = getAdvertisedTools({
+    delegatedCaller: input.delegatedCaller,
     session: baseSession,
     tools: input.runtimeActionTools,
   });
@@ -2625,6 +2643,7 @@ async function handleStepResult(input: {
       )) {
         await emit(
           createAuthorizationCompletedEvent({
+            attemptId: superseded.attemptId,
             authorization: superseded.challenge,
             name: superseded.name,
             outcome: "failed",
@@ -2638,6 +2657,7 @@ async function handleStepResult(input: {
       for (const ch of challenges) {
         await emit(
           createAuthorizationRequiredEvent({
+            attemptId: ch.attemptId,
             authorization: ch.challenge,
             name: ch.name,
             description: ch.challenge.instructions ?? `Authorization required for ${ch.name}`,
