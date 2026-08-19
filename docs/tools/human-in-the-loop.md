@@ -91,7 +91,7 @@ The built-in `ask_question` tool lets the model pause and ask the user, rather t
 - `options`: an optional list of choices to offer. Channels render these as buttons or a select menu.
 - `allowFreeform`: whether the user may answer with free text instead of picking an option.
 
-`ask_question` is part of the [default harness](/docs/concepts/default-harness), so it is available without you defining anything. It produces the same `input.requested` pause as an approval, and resumes the same way.
+`ask_question` is part of the [default tool set](/docs/concepts/built-in-tools), so it is available without you defining anything. It produces the same `input.requested` pause as an approval, and resumes the same way.
 
 ## How pause and resume works
 
@@ -111,7 +111,7 @@ The run picks back up exactly where it parked. Because the pause is durable, not
 
 When a background subagent requests input, eve emits the same `input.requested` event on its parent session. Answering through that parent session routes the response directly to the blocked child without invoking the parent model.
 
-For approval requests, unrelated follow-up text does not deny the tool call. eve keeps the approval pending and holds that text until the approval is answered, then replays it as the next message in the session.
+For approval requests, unrelated follow-up text does not deny the tool call. eve keeps the approval pending and records that pending state in model-visible session history. Follow-up turns may answer with text, but cannot call tools until the approval is resolved. Once it is answered, normal tool use resumes and eve settles the original tool call exactly once.
 
 See [Sessions, runs & streaming](/docs/concepts/sessions-runs-and-streaming) for the full event and resume contract that this builds on.
 
@@ -124,7 +124,7 @@ From your own frontend, scan all messages for pending requests and answer throug
 ## What to read next
 
 - [Tools](/docs/tools): define the typed actions an approval gates
-- [Default harness](/docs/concepts/default-harness): the built-in tools, including `ask_question`
+- [Built-in tools](/docs/concepts/built-in-tools): the default tools, including `ask_question`
 - [Sessions, runs & streaming](/docs/concepts/sessions-runs-and-streaming): the event and resume contract behind the pause
 - [Building a frontend](/docs/guides/frontend/overview): render and answer requests from your own UI
 - [Multi-tenant approvals](/docs/patterns/multi-tenant-approvals): resolve per-tenant approval policy for authored and connection tools

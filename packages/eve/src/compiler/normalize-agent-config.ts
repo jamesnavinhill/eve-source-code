@@ -6,6 +6,7 @@ import { normalizeAgentDefinition } from "#internal/authored-definition/core.js"
 import { serializeOutputSchema } from "#shared/tool-schema.js";
 import { formatLanguageModelGatewayId } from "#internal/runtime-model.js";
 import { classifyModelRouting } from "#internal/classify-model-routing.js";
+import { isChatGptModelRouting } from "#shared/chatgpt-model.js";
 import { DEFAULT_AGENT_MODEL_ID } from "#shared/default-agent-model.js";
 import { toErrorMessage } from "#shared/errors.js";
 import { parseJsonObject, type JsonObject } from "#shared/json.js";
@@ -272,6 +273,14 @@ async function normalizeAuthoredModelReference(input: {
   };
 
   if (input.contextWindowTokens === undefined) {
+    // Codex models have no Gateway catalog entry, so use eve's known context limit.
+    if (isChatGptModelRouting(sourceBackedModel.routing)) {
+      return {
+        ...sourceBackedModel,
+        contextWindowTokens: 200_000,
+      };
+    }
+
     try {
       const providerResult = await input.modelCatalog.getByProviderModelId(
         languageModel.provider,

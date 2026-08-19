@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 import type { PackageManagerKind } from "../../package-manager.js";
 import { pinnedNodeEngineMajor } from "../../node-engine.js";
 import type { AgentReasoningDefinition } from "../../../shared/agent-definition.js";
+import { parseChatGptModelSelection } from "../../../shared/chatgpt-model.js";
 import { SUPPORTED_AUTHORED_MODULE_FILE_EXTENSIONS } from "../update/module-files.js";
 import { pathExists, writeTextFile } from "../files.js";
 import { blockingCreateInPlaceEntries } from "../create-in-place.js";
@@ -100,13 +101,24 @@ export function agentTemplateFiles(
   reasoning?: AgentReasoningDefinition,
 ): Record<string, string> {
   return {
-    "agent/agent.ts": BASE_AGENT_TEMPLATE.replaceAll("__EVE_INIT_MODEL__", model).replaceAll(
-      "__EVE_INIT_REASONING__",
-      reasoningTemplateLine(reasoning),
-    ),
+    "agent/agent.ts": renderAgentTemplate(model, reasoning),
     "agent/channels/eve.ts": WEB_APP_TEMPLATE_FILES["agent/channels/eve.ts"],
     "agent/instructions.md": AGENT_INSTRUCTIONS_TEMPLATE,
   };
+}
+
+function renderAgentTemplate(
+  model: string,
+  reasoning: AgentReasoningDefinition | undefined,
+): string {
+  const chatGptModelId = parseChatGptModelSelection(model);
+  if (chatGptModelId !== undefined) {
+    return `import { defineAgent } from "eve";\nimport { chatgpt } from "eve/models/openai";\n\nexport default defineAgent({\n  model: chatgpt(${JSON.stringify(chatGptModelId)}),\n${reasoningTemplateLine(reasoning)}});\n`;
+  }
+  return BASE_AGENT_TEMPLATE.replaceAll("__EVE_INIT_MODEL__", model).replaceAll(
+    "__EVE_INIT_REASONING__",
+    reasoningTemplateLine(reasoning),
+  );
 }
 
 function reasoningTemplateLine(reasoning: AgentReasoningDefinition | undefined): string {
@@ -116,6 +128,9 @@ function reasoningTemplateLine(reasoning: AgentReasoningDefinition | undefined):
 }
 
 function renderTemplate(content: string, ctx: TemplateContext): string {
+  if (content === BASE_AGENT_TEMPLATE && parseChatGptModelSelection(ctx.model) !== undefined) {
+    return renderAgentTemplate(ctx.model, ctx.reasoning);
+  }
   return content
     .replaceAll("__EVE_INIT_APP_NAME__", ctx.appName)
     .replaceAll("__EVE_INIT_MODEL__", ctx.model)
@@ -278,11 +293,70 @@ dist
 `,
   "AGENTS.md": `# eve Agent App
 
-This project uses the eve framework. Before writing code, read the relevant guide
-from the installed eve package docs. In most installs, those docs are at
-\`node_modules/eve/docs/\`. In workspaces or local package installs, resolve the
-installed \`eve\` package location first and read its \`docs/\` directory. If
-package docs are unavailable, use https://eve.dev/docs as a fallback.
+This project uses the eve framework. For a content-only change to the root agent's
+identity, purpose, tone, or response guidelines, edit its existing authored
+instructions. Fresh projects use \`agent/instructions.md\`; a project may instead
+use \`agent/instructions.ts\` or files under \`agent/instructions/\`. You do not
+need to read the framework docs for a content-only instructions change.
+
+Before adding or changing eve framework features, classify the requested
+capability. A self-contained typed tool can use the routine recipe below without
+further discovery. For other changes, open the relevant guide directly from the
+installed eve package docs:
+
+- tools beyond the routine recipe: \`node_modules/eve/docs/tools/overview.mdx\`
+- tool approvals: \`node_modules/eve/docs/tools/human-in-the-loop.md\`
+- connections: \`node_modules/eve/docs/connections/overview.mdx\`
+- channels: \`node_modules/eve/docs/channels/overview.mdx\`
+- skills: \`node_modules/eve/docs/skills.mdx\`
+- subagents: \`node_modules/eve/docs/subagents/index.mdx\`
+- schedules: \`node_modules/eve/docs/schedules.mdx\`
+- authentication: \`node_modules/eve/docs/guides/auth-and-route-protection.md\`
+- deployment: \`node_modules/eve/docs/guides/deployment/overview.md\`
+
+Use a bounded authoring loop:
+
+1. Read this file and the relevant guide's opening example and contract.
+2. Inspect only existing files you will modify or need to imitate.
+3. Stop discovery once the file location, imports, and definition shape are
+   clear. Implement the smallest complete behavior the user requested.
+4. Run one narrow verification. Expand investigation only when it fails or the
+   request needs project-specific integration details.
+
+Do not create a plan or todo list for a contained one-file change. Do not
+recursively glob \`node_modules\`, enumerate the entire docs tree, or read
+unrelated scaffold files when the direct path is known. Package-manager links
+can hide files from recursive glob tools even though direct reads work.
+
+In workspaces or local package installs where \`node_modules/eve\` is absent,
+resolve it with \`realpath node_modules/eve\` or the package manager, then open
+the same path below its \`docs/\` directory. If package docs are unavailable,
+use https://eve.dev/docs as a fallback.
+
+## Routine typed tools
+
+For a self-contained typed action, the standard shape is enough; do not inspect
+unrelated agent config or invent a third-party integration the user did not ask
+for:
+
+\`\`\`ts
+// agent/tools/<tool_name>.ts — the filename supplies the tool name.
+import { defineTool } from "eve/tools";
+import { z } from "zod";
+
+export default defineTool({
+  description: "Describe when the model should call this tool.",
+  inputSchema: z.object({ value: z.string() }),
+  async execute({ value }) {
+    return { value };
+  },
+});
+\`\`\`
+
+Omitting \`approval\` allows calls without human approval, equivalent to
+\`approval: never()\`. Read the tools guide when the implementation needs
+approval, authentication, sandbox access, streaming output, or custom model
+output.
 
 ## Adding integrations
 
@@ -316,12 +390,18 @@ eve add channel/photon-imessage --non-interactive \\
   --answer 'photon-project-name="eve · my-agent"'
 \`\`\`
 
-Add \`--yes\` to accept recommended setup values and reduce setup round trips;
-explicit \`--answer\` values take precedence. Use the reported \`--skip-install\`
-continuation after installation.
+Never pass secrets in \`--answer\`; use the documented environment variable or
+secret store. Add \`--yes\` to accept recommended setup values and reduce setup
+round trips; explicit \`--answer\` values take precedence. Use the reported
+\`--skip-install\` continuation after installation.
+
 A Vercel Connect setup may report \`eve link\` as a prerequisite; run it and
-retry the continuation. Never pass secrets in \`--answer\`; use the documented
-environment variable or secret store.
+retry the continuation. For a named Vercel project in CI or an agent run, use
+\`eve link --non-interactive --project <name-or-id> [--team <team-id-or-slug>]\`.
+To deploy non-interactively, use
+\`eve deploy --non-interactive --yes [--project <name-or-id>] [--team <team-id-or-slug>]\`.
+Use these eve commands instead of calling \`vercel\` directly; eve owns the
+link, environment pull, and deploy lifecycle.
 
 An \`external_action\` event with \`blocking: true\` means the command is still
 running while it waits for the user. Surface its URL and code, keep the process
