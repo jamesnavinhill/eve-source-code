@@ -142,7 +142,7 @@ vi.mock("../runtime/sessions/compiled-agent-cache.js", () => ({
 }));
 
 vi.mock("#compiled/@workflow/core/runtime.js", () => ({
-  getHookByToken: vi.fn(async () => ({ runId: "child-run" })),
+  getHookByToken: vi.fn(async (token: string) => currentSessionHook(token)),
   getRun: (...args: unknown[]) => getRunMock(...args),
   resumeHook: (...args: unknown[]) => resumeHookMock(...args),
   start: (...args: unknown[]) => startMock(...args),
@@ -263,7 +263,7 @@ describe("routeProxiedDeliverStep", () => {
     });
 
     expect(result).toMatchObject({ kind: "continue", remainder: undefined });
-    expect(resumeHookMock).toHaveBeenCalledWith("child-token", {
+    expect(resumeHookMock).toHaveBeenCalledWith(currentSessionHook("child-token"), {
       auth,
       caller: undefined,
       kind: "deliver",
@@ -272,6 +272,7 @@ describe("routeProxiedDeliverStep", () => {
       },
       payloads: [{ inputResponses: [{ optionId: "approve", requestId: "request-1" }] }],
       requestId: undefined,
+      version: 1,
     });
   });
 
@@ -332,7 +333,7 @@ describe("routeProxiedDeliverStep", () => {
     });
 
     expect(resumeHookMock).toHaveBeenCalledWith(
-      "child-token-a",
+      currentSessionHook("child-token-a"),
       expect.objectContaining({
         ...delivery,
         deliveryMetadata: [expect.objectContaining({ deliveryId: "delivery-0", payloadIndex: 0 })],
@@ -340,7 +341,7 @@ describe("routeProxiedDeliverStep", () => {
       }),
     );
     expect(resumeHookMock).toHaveBeenCalledWith(
-      "child-token-b",
+      currentSessionHook("child-token-b"),
       expect.objectContaining({
         auth,
         caller,
@@ -485,6 +486,14 @@ describe("routeProxiedDeliverStep", () => {
     expect(sendTaskInboundPayload).toHaveBeenCalledTimes(2);
   });
 });
+
+function currentSessionHook(token: string) {
+  return {
+    metadata: { sessionInboxWireVersion: 1 },
+    runId: "child-run",
+    token,
+  };
+}
 
 describe("recordTaskInputRequestStep", () => {
   const hookPayload: SubagentInputRequestHookPayload = {
@@ -2294,13 +2303,25 @@ describe("turnStep", () => {
 
   it("refreshes session-scoped dynamic tools from the current deployment", async () => {
     vi.stubEnv("VERCEL_DEPLOYMENT_ID", "dpl_new");
-    const handler = vi.fn(() => ({
-      current_tool: defineTool({
-        description: "Current deployment tool",
-        inputSchema: { type: "object" },
-        execute: async () => ({ ok: true }),
-      }),
-    }));
+    const lifecycleOrder: string[] = [];
+    const originalClearVirtualContext = ContextContainer.prototype.clearVirtualContext;
+    vi.spyOn(ContextContainer.prototype, "clearVirtualContext").mockImplementation(
+      function (this: ContextContainer) {
+        lifecycleOrder.push("clear");
+        originalClearVirtualContext.call(this);
+      },
+    );
+    const handler = vi.fn(() => {
+      lifecycleOrder.push("refresh");
+      return {
+        current_tool: defineTool({
+          description: "Current deployment tool",
+          inputSchema: { type: "object" },
+          approval: () => "not-applicable" as const,
+          execute: async () => ({ ok: true }),
+        }),
+      };
+    });
     const dynamicToolResolver = {
       eventNames: ["session.started"],
       events: { "session.started": handler },
@@ -2334,10 +2355,13 @@ describe("turnStep", () => {
     } as never;
     vi.mocked(getCompiledRuntimeAgentBundle).mockResolvedValue(compiledBundle);
     vi.mocked(createExecutionNodeStep).mockImplementation(() => {
-      return async (session): Promise<StepResult> => ({
-        next: { done: true, output: "ok" },
-        session,
-      });
+      return async (session): Promise<StepResult> => {
+        lifecycleOrder.push("execute");
+        return {
+          next: { done: true, output: "ok" },
+          session,
+        };
+      };
     });
 
     const session = createStubSession({
@@ -2390,6 +2414,7 @@ describe("turnStep", () => {
     });
 
     expect(handler).toHaveBeenCalledOnce();
+    expect(lifecycleOrder).toEqual(["refresh", "clear", "execute"]);
     expect(result.serializedContext[SessionDynamicToolRuntimeRevisionKey.name]).toBe(
       "deployment:dpl_new",
     );
