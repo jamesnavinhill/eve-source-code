@@ -9,6 +9,7 @@ import type { ChannelFrom, ChannelSource } from "#channel/channel-operations.js"
 import { isHttpRouteDefinition } from "#channel/routes.js";
 import { ContextContainer, contextStorage } from "#context/container.js";
 import { SessionKey } from "#context/keys.js";
+import { sessionInboxWire } from "#execution/wire/session-inbox-encoder.js";
 import {
   mockChannelContext,
   type ObservedChannelDelivery,
@@ -32,12 +33,34 @@ import {
   constrainAuthorizationRequired,
   slackChannel,
   type SlackAuthorizationEventContext,
+  type SlackInboundEventContext,
   type SlackInputResponseContext,
   type SlackInputResponseSubmission,
+  type SlackInteractionContext,
   type SlackChannelState,
   type SlackEventContext,
 } from "#public/channels/slack/slackChannel.js";
 import type { SessionContext } from "#public/definitions/callback-context.js";
+import { type InputResponse, parseInputResponses } from "#runtime/input/types.js";
+
+function slackRespondTypeChecks(
+  interaction: SlackInteractionContext,
+  event: SlackInboundEventContext,
+): void {
+  const widened: readonly InputResponse[] = [{ optionId: "approve", requestId: "approval-1" }];
+  const validated = parseInputResponses(widened);
+
+  // @ts-expect-error Slack thread wrappers reject input-response shapes that erased extra keys.
+  void interaction.respond(widened);
+  void interaction.respond(validated);
+
+  const options = { auth: null, target: { channelId: "C1", threadTs: "T1" } } as const;
+  // @ts-expect-error generic Slack event wrappers enforce the same schema proof.
+  void event.respond(widened, options);
+  void event.respond(validated, options);
+}
+
+void slackRespondTypeChecks;
 
 function getAdapter(channel: unknown): ChannelAdapter<any> {
   if (!isCompiledChannel(channel)) {
@@ -2556,6 +2579,16 @@ describe("slackChannel() HITL interaction pipeline", () => {
       state: {
         approvalResponderUsers: { "slack:T01:U_APPROVER": "U_APPROVER" },
       },
+    });
+    expect(
+      sessionInboxWire.encode(
+        { kind: "send", payload: { inputResponses: input.inputResponses } },
+        { version: 1 },
+      ),
+    ).toMatchObject({
+      kind: "deliver",
+      payloads: [{ inputResponses: [{ optionId: "approve", requestId: "approval_abc123" }] }],
+      version: 1,
     });
   });
 

@@ -1,5 +1,41 @@
 # eve
 
+## 0.42.0
+
+### Minor Changes
+
+- a43e14f: Prevent channel HITL responses from carrying channel-local metadata into strict session-inbox payloads. Channel and session `respond()` calls now accept exact response literals or values proven by `parseInputResponses()`, rejecting imprecise `InputResponse[]` values that could have erased extra keys.
+
+### Patch Changes
+
+- f2169fa: Remove the `task_sleep` framework tool. Task-mode parents now rely on lifecycle notifications instead of model-paced waits.
+
+## 0.41.0
+
+### Minor Changes
+
+- 0569638: Add a first-class Linq iMessage and SMS channel with managed Vercel Connect and portable credential setup paths. Connect setup can provision a new Linq account and line or connect an existing account with its partner API token.
+
+### Patch Changes
+
+- bdf5f63: Improve the generated web chat experience with immediate thinking feedback, a disabled composer while responses stream, clearer cancellation controls, and visible turn failures.
+- c47350f: Rebuild untransformed session-scoped dynamic tool executors and approval policies on durable continuations so dependency-created tools remain available after replay.
+- c47350f: Update Teams tool-approval cards only after approval settlement, with the outcome and the Teams responder who acted.
+- 9e19fa4: Keep active client streams attached across authorization parking boundaries so connection callbacks resume browser chats automatically.
+
+## 0.40.0
+
+### Minor Changes
+
+- 2838bb3: Remove `task_peek` from experimental background tasks and include completed results and failures directly in task notifications. Conditionally delivered task wakes can remain silent when that result was already covered by an earlier response.
+
+### Patch Changes
+
+- e843b4d: Registry browsing now uses titles returned by the catalog, avoiding a separate request for every displayed item.
+- 899e079: Keep `eve info --json` output valid JSON by omitting the CLI banner.
+- cda9539: Redact brokered credential transforms when sandbox network policies are written to bootstrap logs.
+- 87c61a1: Update eve's bundled Workflow SDK packages to the latest 5.0.0 beta releases, picking up a replay-determinism fix for branch wake order under concurrent replays.
+
 ## 0.39.3
 
 ### Patch Changes

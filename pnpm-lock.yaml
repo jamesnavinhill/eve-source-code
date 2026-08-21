@@ -289,9 +289,6 @@ importers:
       '@larksuite/vercel-chat-adapter':
         specifier: 0.1.2
         version: 0.1.2(ai@6.0.191(zod@4.4.3))(bufferutil@4.1.0)(chat@4.34.0(ai@6.0.191(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3))(debug@4.4.3(supports-color@10.2.2))(supports-color@10.2.2)(zod@4.4.3)
-      '@linqapp/chat-sdk-adapter':
-        specifier: 0.1.0
-        version: 0.1.0(chat@4.34.0(ai@6.0.191(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3))
       '@liveblocks/chat-sdk-adapter':
         specifier: 3.23.0
         version: 3.23.0(@types/json-schema@7.0.15)(chat@4.34.0(ai@6.0.191(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3))
@@ -1199,6 +1196,9 @@ importers:
       '@eve/catalog':
         specifier: workspace:*
         version: link:../eve-catalog
+      '@linqapp/chat-sdk-adapter':
+        specifier: ^0.3.0
+        version: 0.3.0(chat@4.34.0(ai@7.0.58(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3))
       '@modelcontextprotocol/server':
         specifier: 2.0.0
         version: 2.0.0
@@ -1338,8 +1338,8 @@ importers:
         specifier: 7.8.4
         version: 7.8.4
       shadcn:
-        specifier: 4.16.1
-        version: 4.16.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(typescript@7.0.2)
+        specifier: 4.18.0
+        version: 4.18.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(typescript@7.0.2)
       svelte:
         specifier: ^5.0.0
         version: 5.56.1(@typescript-eslint/types@8.59.4)
@@ -3223,13 +3223,13 @@ packages:
   '@larksuiteoapi/node-sdk@1.63.1':
     resolution: {integrity: sha512-bVC2QVkITZ1i6kLP7hI7DXtp61ic9shP/F+bp/2qZ0ISSvrcHp2euu1xt6C29jPJVNieRgvdsBPuapOlybviVw==}
 
-  '@linqapp/chat-sdk-adapter@0.1.0':
-    resolution: {integrity: sha512-/4OSAxcJWYqwoqsG73b1ElUhETOOsL/ufXUanGLgg3t2xGkpu412dUWqUboVffFS1zdDqciSnvXSXpIAWnGpiw==}
+  '@linqapp/chat-sdk-adapter@0.3.0':
+    resolution: {integrity: sha512-mOh3y3G+xL6y8yztmB58CC6juxu3JAThSdLzV07+4Cjy+zHk9auDjSlbs+QyxSQC1ZW0Hu2Y60I5Y5J04Dr/BA==}
     peerDependencies:
       chat: ^4.28.1
 
-  '@linqapp/sdk@0.22.1':
-    resolution: {integrity: sha512-JCzOKegSIwHTDdizS6dUgHJ+90iVh9TO8+bLMg5+UE2qWl+r848/Wdy0M+2V8dwoVPUbb+vtG4sDN4ultpzqVQ==}
+  '@linqapp/sdk@0.40.0':
+    resolution: {integrity: sha512-t5Kilu+MPQQucAXy9bG3jlLvDHnlR36banKC74TbpJ9ZOrPa8nHyUHPk9/Y4eAVzaM+TzlxV8dZrkit4kuhWWw==}
 
   '@liveblocks/chat-sdk-adapter@3.23.0':
     resolution: {integrity: sha512-tQo6AElxPKkI7g5XuiFLHa+EcT48S3TxPXykGUMf4IdIDt7YqVPCcFPDaI9oyN3AMyrZcavoz7+lTZZZznGC4w==}
@@ -13817,8 +13817,8 @@ packages:
     resolution: {integrity: sha512-kPr4RrQmbbZeAjwBYeBSpFvAHV8rkTlNPUluIxkRriq5TpevfFelVO5xvcF6oguHPVn0R6wPuVer4HudfcLy/A==}
     engines: {node: '>=20.18.1'}
 
-  shadcn@4.16.1:
-    resolution: {integrity: sha512-XLFzfNNIUPlUlyheFEzj0H4Vnhi9nI0nl3Nfgg8HYXW1FkUVhVT1X+mgmOUW8aWL5SeG0A+yJIV5fm3Hr9MVkQ==}
+  shadcn@4.18.0:
+    resolution: {integrity: sha512-tUFZgkYmfVNQVm3xX7lhSzOvDsp+O14ac5dwgXIr5mIsr79ISueb/Mu+ZtWMz0DH6v77u4eYyvbQ9TTMpSn3aw==}
     engines: {node: '>=20.18.1'}
 
   sharp@0.34.5:
@@ -17429,12 +17429,15 @@ snapshots:
       - debug
       - utf-8-validate
 
-  '@linqapp/chat-sdk-adapter@0.1.0(chat@4.34.0(ai@6.0.191(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3))':
+  '@linqapp/chat-sdk-adapter@0.3.0(chat@4.34.0(ai@7.0.58(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3))':
     dependencies:
-      '@linqapp/sdk': 0.22.1
-      chat: 4.34.0(ai@6.0.191(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3)
+      '@linqapp/sdk': 0.40.0
+      chat: 4.34.0(ai@7.0.58(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3)
+      standardwebhooks: 1.0.0
 
-  '@linqapp/sdk@0.22.1': {}
+  '@linqapp/sdk@0.40.0':
+    dependencies:
+      standardwebhooks: 1.0.0
 
   '@liveblocks/chat-sdk-adapter@3.23.0(@types/json-schema@7.0.15)(chat@4.34.0(ai@6.0.191(zod@4.4.3))(supports-color@10.2.2)(zod@4.4.3))':
     dependencies:
@@ -30686,7 +30689,7 @@ snapshots:
       - supports-color
       - typescript
 
-  shadcn@4.16.1(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(typescript@7.0.2):
+  shadcn@4.18.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(typescript@7.0.2):
     dependencies:
       '@babel/core': 7.29.0(supports-color@10.2.2)
       '@babel/parser': 7.29.7
@@ -30712,11 +30715,12 @@ snapshots:
       postcss-selector-parser: 7.1.4
       prompts: 2.4.2
       recast: 0.23.12
+      socks: 2.8.9
       stringify-object: 5.0.0
       tailwind-merge: 3.6.0
       ts-morph: 26.0.0
       tsconfig-paths: 4.2.0
-      undici: 7.28.0
+      undici: 7.29.0
       validate-npm-package-name: 7.0.2
       zod: 3.25.76
       zod-to-json-schema: 3.25.2(zod@3.25.76)
