@@ -8,7 +8,7 @@ import type {
 } from "#channel/types.js";
 import { coalesceDeliverPayloads } from "#execution/deliver-payloads.js";
 import { SessionInboxWireError } from "#execution/wire/session-inbox-contract.js";
-import { inputRequestSchema, inputResponseSchema } from "#runtime/input/types.js";
+import { inputRequestSchema, inputResponseSchema } from "#shared/input.js";
 import { formatValidationError } from "#runtime/validation.js";
 import { jsonObjectSchema, jsonValueSchema } from "#shared/json-schemas.js";
 import { tokenUsageSchema } from "#shared/token-usage.js";
@@ -83,16 +83,26 @@ const subagentAuthorizationEventHookPayloadSchema = z
     subagentName: z.string(),
   })
   .strict();
-const taskMetadataSchema = z
-  .object({
-    agentId: z.string(),
-    kind: z.literal("subagent"),
-    mode: z.enum(["local", "remote"]),
-    name: z.string(),
-  })
-  .strict();
+const taskMetadataSchema = z.union([
+  z
+    .object({
+      agentId: z.string(),
+      kind: z.literal("subagent"),
+      mode: z.enum(["local", "remote"]),
+      name: z.string(),
+    })
+    .strict(),
+  z.object({ kind: z.string(), name: z.string() }).strict(),
+]);
 const taskExecutorSchema = z
   .object({
+    binding: z
+      .object({
+        data: z.record(z.string(), jsonValueSchema),
+        kind: z.string(),
+      })
+      .strict()
+      .optional(),
     childSessionId: z.string().optional(),
     childTurnId: z.string().optional(),
     lifecycle: z.enum(["parked", "terminal"]).optional(),

@@ -2,7 +2,7 @@ import { mkdtemp, readdir, rename, rm } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
-import pc from "picocolors";
+import pc from "#compiled/picocolors/index.js";
 
 import { isCodingAgentLaunch } from "#cli/agent-detection.js";
 import { EVE_WORDMARK } from "#cli/banner.js";
@@ -133,13 +133,6 @@ function formatWorkspaceRootMutationWarning(mutation: WorkspaceRootMutation): st
       ? ""
       : ` (${formatNodeEngineOverrideWarning(mutation.nodeEngineOverride)})`;
   return `Updated workspace root ${target} at ${mutation.path}${suffix}`;
-}
-
-function initDevArguments(packageManager: PackageManagerKind): string[] {
-  const args = [...eveDevArguments(packageManager)];
-  // The immediately preceding install already accepted the project's dependency
-  // graph with this one-run bypass, so the handoff must use the same policy.
-  return packageManager === "pnpm" ? ["--config.minimum-release-age=0", ...args] : args;
 }
 
 /**
@@ -482,9 +475,6 @@ async function runInitSteps(input: {
       project.packageManager,
       project.projectPath,
       {
-        // The scaffold pins versions younger than typical release-age cooldown
-        // windows; gating them would fail every fresh bootstrap.
-        bypassMinimumReleaseAge: true,
         progressDetails: process.stdout.isTTY === true && !debug,
         onOutput: (line) => {
           if (line.text.trim() !== "") {
@@ -621,7 +611,7 @@ export async function runInitCommand(
     }
   }
 
-  const baseDevArguments = initDevArguments(result.packageManager);
+  const baseDevArguments = [...eveDevArguments(result.packageManager)];
   const agentDevCommand = [result.packageManager, ...baseDevArguments].join(" ");
   const agentHandoff = initAgentDevHandoff({
     projectPath: result.projectPath,

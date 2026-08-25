@@ -11,13 +11,13 @@ import {
   createEveSessionStreamRoutePath,
   createEveSubagentStreamRoutePath,
 } from "#protocol/routes.js";
-import type { ConnectionAuthorizationChallenge } from "#public/connections/errors.js";
+import type { ConnectionAuthorizationChallenge } from "#connections/errors.js";
 import type {
   RuntimeActionRequest,
   RuntimeActionResult,
   RuntimeToolResultActionResult,
-} from "#runtime/actions/types.js";
-import type { InputRequest, InputResponse } from "#runtime/input/types.js";
+} from "#shared/action-types.js";
+import type { InputRequest, InputResponse } from "#shared/input.js";
 import { toChannelLocalContinuationToken } from "#shared/continuation-token.js";
 import type { JsonObject, JsonValue } from "#shared/json.js";
 

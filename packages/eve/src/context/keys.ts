@@ -18,8 +18,10 @@ import type {
   SessionTurn,
 } from "#channel/types.js";
 import { ContextKey } from "#context/key.js";
+import { SESSION_CALLBACK_CONTEXT_KEY_NAME } from "#context/key-names.js";
 import type { InstrumentationChannelDeliveryRef } from "#harness/instrumentation/lifecycle.js";
-import type { DurableDynamicToolCallbacks } from "#shared/durable-dynamic-tool-callbacks.js";
+import type { HandleEventFn } from "#harness/types.js";
+import type { DurableDynamicToolCallbacks } from "#tools/durable-callbacks.js";
 import type { DynamicSubagentAgentConfig } from "#runtime/subagents/dynamic-agent-config.js";
 import type { DynamicRemoteAgentConfig } from "#runtime/subagents/dynamic-remote-agent-config.js";
 import type { SandboxAccess } from "#sandbox/state.js";
@@ -70,8 +72,12 @@ export const SessionIdKey = new ContextKey<string>("eve.sessionId");
 export const ContinuationTokenKey = new ContextKey<string>("eve.continuationToken");
 export const ChannelRequestIdKey = new ContextKey<string>("eve.channelRequestId");
 export const ChannelDeliveryKey = new ContextKey<ChannelDeliveryMetadata>("eve.channelDelivery");
-/** Whether the active turn began from a task-addressed durable delivery. */
-export const TurnTaskDeliveryKey = new ContextKey<boolean>("eve.turnTaskDelivery");
+/** Task-reporting phase for the active root turn. */
+export const TurnTaskDeliveryKey = new ContextKey<"none" | "initiating" | "pending" | "settled">(
+  "eve.turnTaskDelivery",
+);
+/** Framework-authored task state supplied to the model without altering user-message history. */
+export const TurnTaskStateKey = new ContextKey<string>("eve.turnTaskState");
 export interface ActiveChannelDelivery {
   readonly agentName?: string;
   readonly delivery: InstrumentationChannelDeliveryRef;
@@ -90,6 +96,14 @@ export const ModeKey = new ContextKey<RunMode>("eve.mode");
 export const ParentSessionKey = new ContextKey<SessionParent>("eve.parentSession");
 /** Separate from {@link ParentSessionKey} so it stays out of what extensions read. */
 export const ParentTraceContextKey = new ContextKey<SessionTraceContext>("eve.parentTraceContext");
+
+export interface SessionTraceSeed {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly traceFlags: number;
+}
+export const SessionTraceSeedKey = new ContextKey<SessionTraceSeed>("eve.sessionTraceSeed");
+
 export const SubagentDepthKey = new ContextKey<number>("eve.subagentDepth");
 
 /**
@@ -102,7 +116,9 @@ export const CapabilitiesKey = new ContextKey<SessionCapabilities>("eve.capabili
 /**
  * Optional framework-owned caller callback captured when the session is created.
  */
-export const SessionCallbackKey = new ContextKey<SessionCallback>("eve.sessionCallback");
+export const SessionCallbackKey = new ContextKey<SessionCallback>(
+  SESSION_CALLBACK_CONTEXT_KEY_NAME,
+);
 
 // ---------------------------------------------------------------------------
 // Derived keys — reconstructed by providers each step, never serialized.
@@ -110,6 +126,7 @@ export const SessionCallbackKey = new ContextKey<SessionCallback>("eve.sessionCa
 
 export const SessionKey = new ContextKey<Session>("eve.session");
 export const SandboxKey = new ContextKey<SandboxAccess>("eve.sandbox");
+export const HandleEventKey = new ContextKey<HandleEventFn>("eve.internal.handleEvent");
 
 // ---------------------------------------------------------------------------
 // Dynamic model keys
@@ -190,6 +207,9 @@ export const TurnDynamicToolMetadataKey = new ContextKey<readonly DurableDynamic
 export const StepDynamicToolMetadataKey = new ContextKey<readonly DurableDynamicToolMetadata[]>(
   "eve.stepDynamicToolMetadata",
 );
+
+/** Whether this turn executes subagent definitions as durable background tools. */
+export const TasksEnabledKey = new ContextKey<boolean>("eve.tasksEnabled");
 
 export type DurableDynamicSubagentSelection =
   | {
