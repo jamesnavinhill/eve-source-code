@@ -1,5 +1,8 @@
 import { createActionsRequestedEvent } from "#protocol/message.js";
-import type { RuntimeToolCallActionRequest } from "#shared/action-types.js";
+import {
+  collectActionPresentation,
+  type RuntimeActionRequestProjection,
+} from "#harness/action-presentation.js";
 import type { HarnessEmitFn } from "#harness/types.js";
 
 interface ActionEventCoordinates {
@@ -8,18 +11,24 @@ interface ActionEventCoordinates {
   readonly turnId: string;
 }
 
+interface EmittedProviderAction {
+  readonly request: RuntimeActionRequestProjection;
+  readonly toolName: string;
+}
+
 interface ProviderStreamActionBatch {
   cancel(): Promise<void>;
   flush(): Promise<void>;
-  observe(action: RuntimeToolCallActionRequest): void;
+  observe(action: RuntimeActionRequestProjection, toolName: string): void;
 }
 
 /** Batches provider-managed calls that arrive in one streamed model response. */
 export function createProviderStreamActionBatch(input: {
   readonly emitFn: HarnessEmitFn;
+  readonly onActionsEmitted?: (actions: readonly EmittedProviderAction[]) => void;
   readonly state: ActionEventCoordinates;
 }): ProviderStreamActionBatch {
-  const pendingActions = new Map<string, RuntimeToolCallActionRequest>();
+  const pendingActions = new Map<string, EmittedProviderAction>();
   let actionFlush: Promise<void> = Promise.resolve();
   let actionFlushError: unknown;
   let actionFlushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -34,15 +43,18 @@ export function createProviderStreamActionBatch(input: {
     if (pendingActions.size === 0) return;
 
     const actions = [...pendingActions.values()];
+    const projections = actions.map(({ request }) => request);
     pendingActions.clear();
     await input.emitFn(
       createActionsRequestedEvent({
-        actions,
+        actions: projections.map(({ action }) => action),
+        presentation: collectActionPresentation(projections),
         sequence: input.state.sequence,
         stepIndex: input.state.stepIndex,
         turnId: input.state.turnId,
       }),
     );
+    input.onActionsEmitted?.(actions);
   };
 
   const scheduleFlush = (): void => {
@@ -84,9 +96,9 @@ export function createProviderStreamActionBatch(input: {
       releaseFlushTimer();
       await actionFlush;
     },
-    observe(action) {
+    observe(action, toolName) {
       if (cancelled) return;
-      pendingActions.set(action.callId, action);
+      pendingActions.set(action.action.callId, { request: action, toolName });
       scheduleFlush();
     },
     async flush() {

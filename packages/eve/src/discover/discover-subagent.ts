@@ -23,6 +23,7 @@ import {
 } from "#discover/grammar.js";
 import { DISCOVER_HOOKS_DIRECTORY_INVALID } from "#discover/grammar.js";
 import { discoverLibSources } from "#discover/lib.js";
+import { discoverMemorySources } from "#discover/memory.js";
 import {
   type CreateAgentSourceManifestInput,
   createAgentSourceManifest,
@@ -46,7 +47,7 @@ export const DISCOVER_LOCAL_SUBAGENT_SCHEDULES_INVALID =
   "discover/local-subagent-schedules-invalid";
 export const DISCOVER_REQUIRED_SUBAGENT_CONFIG_MODULE_MISSING =
   "discover/required-subagent-config-module-missing";
-export const DISCOVER_SUBAGENTS_DIRECTORY_INVALID = "discover/subagents-directory-invalid";
+const DISCOVER_SUBAGENTS_DIRECTORY_INVALID = "discover/subagents-directory-invalid";
 
 /**
  * Input for discovering subagent entries beneath one authored source root.
@@ -231,6 +232,13 @@ async function discoverLocalSubagentPackage(input: {
   });
   diagnostics.push(...connectionsResult.diagnostics);
 
+  const memoryResult = await discoverMemorySources({
+    rootEntries,
+    rootPath: input.subagentRoot,
+    source: input.source,
+  });
+  diagnostics.push(...memoryResult.diagnostics);
+
   const sandboxResult = await discoverSandboxSource({
     rootEntries,
     rootPath: input.subagentRoot,
@@ -305,6 +313,7 @@ async function discoverLocalSubagentPackage(input: {
     extensions: extensionsResult.mounts.map((mount) => mount.mountRef),
     resolvedExtensions: resolvedExtensions.mounts,
     hooks: hooksResult.sources,
+    memories: memoryResult.memories,
     lib: libResult.lib,
     instructions: instructionsResult.instructions,
     sandbox: sandboxResult.sandbox,

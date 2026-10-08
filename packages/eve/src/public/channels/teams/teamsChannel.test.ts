@@ -12,6 +12,7 @@ import {
 } from "#internal/testing/mocks/mock-channel-operations.js";
 import type { UnstampedMessageStreamEvent } from "#protocol/message.js";
 import { teamsChannel, type TeamsChannelState } from "#public/channels/teams/index.js";
+import { mockAgentRouteArgs } from "#internal/testing/mocks/mock-route-args.js";
 
 function adapter(channel: unknown) {
   return asCompiled<TeamsChannelState>(channel).adapter;
@@ -88,6 +89,7 @@ async function firePost(
       method: "POST",
     }),
     {
+      ...mockAgentRouteArgs(),
       from(continuationToken) {
         return baseFrom(continuationToken);
       },
@@ -131,9 +133,15 @@ describe("teamsChannel", () => {
     if (!teamsAdapter.state) throw new Error("Expected Teams state.");
     teamsAdapter.state.conversationType = conversationType;
 
-    expect(teamsAdapter.instrumentation?.metadata?.(teamsAdapter.state)).toMatchObject({
-      audience,
-    });
+    expect(
+      teamsAdapter.instrumentation?.audience?.({
+        auth: null,
+        caller: { type: "anonymous" },
+        channel: { kind: "channel:teams" },
+        environment: "production",
+        state: teamsAdapter.state,
+      }),
+    ).toBe(audience);
   });
 
   it("dispatches verified personal messages with Teams state", async () => {
@@ -169,6 +177,24 @@ describe("teamsChannel", () => {
       title: "Teams run",
     });
     expect(send.mock.calls[0]![1].context[0]).toContain("<teams_context>");
+    expect(send.mock.calls[0]![1].context[0]).toContain("bot_id: BOT");
+    expect(send.mock.calls[0]![1].context[0]).toContain("is_mentioned: true");
+  });
+
+  it("marks an accepted personal message without a mention as not mentioned", async () => {
+    const channel = teamsChannel({
+      credentials: { webhookVerifier: () => true },
+      onMessage: () => ({ auth: null }),
+    });
+    const raw = messageActivity({ conversationType: "personal" });
+    raw.entities = [];
+    raw.text = "Could you investigate?";
+
+    const { send } = await firePost(channel, raw);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]![1].context[0]).toContain("bot_id: BOT");
+    expect(send.mock.calls[0]![1].context[0]).toContain("is_mentioned: false");
   });
 
   it("default dispatch ignores unmentioned group messages", async () => {
@@ -325,7 +351,7 @@ describe("teamsChannel", () => {
       ctx,
     );
 
-    expect(ctx.state.pendingApprovalCards).toEqual({});
+    expect(ctx.state.pendingPromptCards).toEqual({});
 
     const { send } = await firePost(channel, {
       ...baseActivity({ conversationType: "channel" }),
@@ -359,7 +385,7 @@ describe("teamsChannel", () => {
       { inputResponses: delivery.inputResponses, state: delivery.state },
       ctx,
     );
-    expect(ctx.state.pendingApprovalCards).toEqual({
+    expect(ctx.state.pendingPromptCards).toEqual({
       approval_1: { activityId: "approval-card", prompt: "Approve deployment?" },
     });
 
@@ -382,8 +408,8 @@ describe("teamsChannel", () => {
           "/v3/conversations/19%3Aconversation%40thread.tacv2/activities/approval-card",
         ) && (init as RequestInit).method === "PUT",
     );
-    expect(updateCall).toBeDefined();
-    const updateBody = JSON.parse(String((updateCall?.[1] as RequestInit).body)) as {
+    if (!updateCall) throw new Error("Expected the approval card update request.");
+    const updateBody = JSON.parse(String((updateCall[1] as RequestInit).body)) as {
       channelData?: unknown;
       conversation?: unknown;
       from?: unknown;
@@ -493,6 +519,39 @@ describe("teamsChannel", () => {
       state: { replyToActivityId: "THREAD_ROOT" },
     });
     expect(initialToken).toBe("TENANT:CONV:THREAD_ROOT");
+  });
+
+  it("keeps approval bookkeeping when a sent message carries its channel state", async () => {
+    const channel = teamsChannel({ credentials: { tokenProvider: () => "token" } });
+    const send = vi.fn(async () => ({ id: "SESSION" }));
+    await channel.receive!(
+      {
+        target: {
+          conversationId: "CONV",
+          conversationType: "channel",
+          replyToActivityId: "THREAD_ROOT",
+          serviceUrl: "https://service.example/teams",
+          tenantId: "TENANT",
+        },
+        auth: null,
+        message: "Begin",
+      },
+      mockChannelContext<TeamsChannelState>(send as never),
+    );
+    const delivery = (
+      send.mock.calls[0] as unknown[]
+    )[1] as ObservedChannelDelivery<TeamsChannelState>;
+    const teamsAdapter = adapter(channel);
+    const ctx = buildAdapterContext(teamsAdapter, stubAccessor());
+    const card = { activityId: "approval-card", prompt: "Approve deployment?" };
+    const responder = { id: "USER", name: "Ada" };
+    ctx.state.pendingPromptCards = { approval_1: card };
+    ctx.state.approvalResponderAccounts = { "teams:TENANT:USER": responder };
+
+    await teamsAdapter.deliver!({ message: "Begin", state: delivery.state }, ctx);
+
+    expect(ctx.state.pendingPromptCards).toEqual({ approval_1: card });
+    expect(ctx.state.approvalResponderAccounts).toEqual({ "teams:TENANT:USER": responder });
   });
 
   it("receive starts proactive sessions and anchors initial channel messages", async () => {

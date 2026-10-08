@@ -43,7 +43,9 @@ const expectedSlugs = connectionEntries()
   .filter((entry) => entry.surfaces.registry)
   .map((entry) => entry.slug);
 const actualSlugs = items.map((item) => item.name.slice("connection/".length));
+const NON_CONNECT_SLUGS = new Set(["browser-use", "dataforseo"]);
 const CONNECT_SERVICES: Readonly<Record<string, string>> = {
+  agentcard: "mcp.agentcard.sh/mcp",
   vercel: "vercel",
   linear: "mcp.linear.app",
   notion: "mcp.notion.com",
@@ -51,6 +53,18 @@ const CONNECT_SERVICES: Readonly<Record<string, string>> = {
   honeycomb: "mcp.honeycomb.io",
   context: "mcp.context.dev",
   natural: "mcp.natural.com",
+};
+const CONNECT_CREATION_TYPES: Readonly<Record<string, string>> = {
+  agentcard: "agentcard",
+};
+const CONNECT_METHODS: Readonly<Record<string, "mcp" | "oauth">> = {
+  agentcard: "mcp",
+  sanity: "mcp",
+  vercel: "mcp",
+};
+const CONNECT_PRINCIPAL_TYPES: Readonly<Record<string, "app" | "user">> = {
+  neon: "app",
+  tinybird: "app",
 };
 
 if (JSON.stringify(actualSlugs) !== JSON.stringify(expectedSlugs)) {
@@ -60,6 +74,9 @@ if (JSON.stringify(actualSlugs) !== JSON.stringify(expectedSlugs)) {
 }
 
 for (const item of items) {
+  const slug = item.name.slice("connection/".length);
+  if (NON_CONNECT_SLUGS.has(slug)) continue;
+
   const declaredSetup = item.meta?.eve?.setup;
   const setups =
     declaredSetup === undefined
@@ -81,19 +98,38 @@ for (const item of items) {
     );
   }
 
-  const slug = item.name.slice("connection/".length);
-  if (slug !== "browser-use") {
-    const expectedSetup = {
-      command: "eve",
-      package: "eve",
-      bin: "eve",
-      args: ["integration", "connect", slug, CONNECT_SERVICES[slug] ?? slug, slug],
-    };
-    if (JSON.stringify(setups) !== JSON.stringify([expectedSetup])) {
-      throw new Error(
-        `Registry item "${item.name}" must configure its Vercel Connect connector through eve.`,
-      );
-    }
+  const creationType = CONNECT_CREATION_TYPES[slug];
+  const connectionMethod = CONNECT_METHODS[slug];
+  const principalType = CONNECT_PRINCIPAL_TYPES[slug];
+  const expectedSetup =
+    slug === "shopify"
+      ? {
+          command: "eve",
+          package: "eve",
+          bin: "eve",
+          args: ["integration", "setup", "shopify"],
+        }
+      : {
+          command: "eve",
+          package: "eve",
+          bin: "eve",
+          args: [
+            "integration",
+            "connect",
+            slug,
+            CONNECT_SERVICES[slug] ?? slug,
+            slug,
+            ...(creationType === undefined ? [] : ["--creation-type", creationType]),
+            ...(connectionMethod === undefined ? [] : ["--connection-method", connectionMethod]),
+            ...(principalType === undefined ? [] : ["--principal-type", principalType]),
+          ],
+        };
+  if (JSON.stringify(setups) !== JSON.stringify([expectedSetup])) {
+    throw new Error(
+      slug === "shopify"
+        ? 'Registry item "connection/shopify" must run eve integration setup shopify.'
+        : `Registry item "${item.name}" must configure its Vercel Connect connector through eve.`,
+    );
   }
 
   const expectedPath = `registry/connections/${slug}.ts`;
@@ -106,13 +142,22 @@ for (const item of items) {
   }
   await access(join(docsRoot, expectedPath));
 
-  if (slug === "browser-use") {
-    if (item.dependencies !== undefined || !("BROWSER_USE_API_KEY" in (item.envVars ?? {}))) {
-      throw new Error(
-        'Registry item "connection/browser-use" must declare its API key without Vercel Connect.',
-      );
+  switch (slug) {
+    case "shopify": {
+      if (item.dependencies !== undefined) {
+        throw new Error('Registry item "connection/shopify" must not declare dependencies.');
+      }
+      if (item.envVars !== undefined) {
+        throw new Error(
+          'Registry item "connection/shopify" must leave environment configuration to its guided setup.',
+        );
+      }
+      break;
     }
-  } else if (!item.dependencies?.includes("@vercel/connect")) {
-    throw new Error(`Registry item "${item.name}" must depend on @vercel/connect.`);
+    default: {
+      if (!item.dependencies?.includes("@vercel/connect")) {
+        throw new Error(`Registry item "${item.name}" must depend on @vercel/connect.`);
+      }
+    }
   }
 }

@@ -1,6 +1,11 @@
 import { type ApplicationInspection, inspectApplication } from "#services/inspect-application.js";
-import type { CompiledInstructionsDefinition } from "#compiler/manifest.js";
-import { type CliRow, createCliTheme, renderCliBanner, renderCliSection } from "#cli/ui/output.js";
+import type {
+  CompiledInstructionsDefinition,
+  CompiledSubagentNode,
+  CompiledToolDefinition,
+} from "#compiler/manifest.js";
+import type { JsonObject } from "#shared/json.js";
+import { type CliRow, createCliTheme, renderCliSection } from "#cli/ui/output.js";
 
 interface CliInfoLogger {
   log(message: string): void;
@@ -23,6 +28,16 @@ export interface ApplicationInfoJson {
   instructions: string | null;
   skills: string[];
   tools: string[];
+  /** Each static tool's input schema as eve sends it to a model, keyed by tool name. */
+  toolInputSchemas: {
+    /** The root agent's tools, including tools from mounted extensions. */
+    root: Record<string, JsonObject>;
+    /**
+     * Each declared subagent's own tools, keyed by the subagent's path of names
+     * from the root agent, such as `researcher` or `researcher/reviewer`.
+     */
+    subagents: Record<string, Record<string, JsonObject>>;
+  };
   subagents: string[];
   schedules: string[];
   channels: { name: string; kind: string | null; method: string | null; urlPath: string | null }[];
@@ -67,6 +82,10 @@ export function buildApplicationInfoJson(inspection: ApplicationInspection): App
         : formatInstructions(compiledState.manifest.instructions),
     skills: (compiledState?.manifest.skills ?? []).map((skill) => skill.name),
     tools: (compiledState?.manifest.tools ?? []).map((tool) => tool.name),
+    toolInputSchemas: {
+      root: modelInputSchemas(compiledState?.manifest.tools ?? []),
+      subagents: subagentModelInputSchemas(compiledState?.manifest.subagents ?? []),
+    },
     subagents: (compiledState?.manifest.subagents ?? []).map((subagent) => subagent.name),
     schedules: (compiledState?.manifest.schedules ?? []).map((schedule) => schedule.name),
     channels: (compiledState?.manifest.channelRoutes.effective ?? []).map((channel) => ({
@@ -90,6 +109,29 @@ export function buildApplicationInfoJson(inspection: ApplicationInspection): App
         }
       : null,
   };
+}
+
+/** Provider-managed tools, such as `web_search`, have no eve input schema and are omitted. */
+function modelInputSchemas(tools: readonly CompiledToolDefinition[]): Record<string, JsonObject> {
+  return Object.fromEntries(
+    tools.flatMap((tool) =>
+      tool.modelInputSchema === undefined ? [] : [[tool.name, tool.modelInputSchema]],
+    ),
+  );
+}
+
+/** Subagent names are unique only among siblings, so each entry is keyed by its path from the root. */
+function subagentModelInputSchemas(
+  subagents: readonly CompiledSubagentNode[],
+): Record<string, Record<string, JsonObject>> {
+  const subagentsByNodeId = new Map(subagents.map((subagent) => [subagent.nodeId, subagent]));
+  const pathOf = (subagent: CompiledSubagentNode): string => {
+    const parent = subagentsByNodeId.get(subagent.parentNodeId);
+    return parent === undefined ? subagent.name : `${pathOf(parent)}/${subagent.name}`;
+  };
+  return Object.fromEntries(
+    subagents.map((subagent) => [pathOf(subagent), modelInputSchemas(subagent.agent.tools)]),
+  );
 }
 
 function pluralize(count: number, noun: string): string {
@@ -126,6 +168,11 @@ export async function printApplicationInfo(
     return;
   }
 
+  logger.log(renderApplicationInfo(inspection));
+}
+
+/** Renders the human-readable `eve info` report for CLI and TUI surfaces. */
+export function renderApplicationInfo(inspection: ApplicationInspection): string {
   const compiledState = inspection.compiledState;
   const info = inspection.application;
   const theme = createCliTheme();
@@ -240,60 +287,53 @@ export async function printApplicationInfo(
     });
   }
 
-  logger.log(
-    [
-      renderCliBanner(theme, {
-        subtitle: "Resolved application paths and the active message contract.",
-        title: "eve Info",
-      }),
-      "",
-      renderCliSection(theme, {
-        rows: applicationRows,
-        title: "Application",
-      }),
-      "",
-      renderCliSection(theme, {
-        rows: artifactRows,
-        title: "Artifacts",
-      }),
-      ...(compiledState === null
-        ? []
-        : [
-            "",
-            renderCliSection(theme, {
-              rows: instructionsRows,
-              title: "Instructions",
-            }),
-          ]),
-      "",
-      renderCliSection(theme, {
-        rows: [
-          {
-            label: "Workflow ID",
-            value: info.workflowId,
-          },
-          {
-            label: "Source Dir",
-            value: info.workflowSourceDir,
-          },
-          {
-            label: "Create",
-            tone: "info",
-            value: `POST ${inspection.messaging.createSessionRoutePath}`,
-          },
-          {
-            label: "Messages",
-            tone: "info",
-            value: `POST ${inspection.messaging.sessionMessagesRoutePattern}`,
-          },
-          {
-            label: "Stream",
-            tone: "info",
-            value: `GET ${inspection.messaging.streamRoutePattern}`,
-          },
-        ],
-        title: "Messaging",
-      }),
-    ].join("\n"),
-  );
+  return [
+    renderCliSection(theme, {
+      rows: applicationRows,
+      title: "Application",
+    }),
+    "",
+    renderCliSection(theme, {
+      rows: artifactRows,
+      title: "Artifacts",
+    }),
+    ...(compiledState === null
+      ? []
+      : [
+          "",
+          renderCliSection(theme, {
+            rows: instructionsRows,
+            title: "Instructions",
+          }),
+        ]),
+    "",
+    renderCliSection(theme, {
+      rows: [
+        {
+          label: "Workflow ID",
+          value: info.workflowId,
+        },
+        {
+          label: "Source Dir",
+          value: info.workflowSourceDir,
+        },
+        {
+          label: "Create",
+          tone: "info",
+          value: `POST ${inspection.messaging.createSessionRoutePath}`,
+        },
+        {
+          label: "Messages",
+          tone: "info",
+          value: `POST ${inspection.messaging.sessionMessagesRoutePattern}`,
+        },
+        {
+          label: "Stream",
+          tone: "info",
+          value: `GET ${inspection.messaging.streamRoutePattern}`,
+        },
+      ],
+      title: "Messaging",
+    }),
+  ].join("\n");
 }

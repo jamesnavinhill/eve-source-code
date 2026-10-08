@@ -1,125 +1,219 @@
 # @eve/self-modification
 
-## 5.0.4
+## 0.0.13
 
 ### Patch Changes
 
-- 7941ad9: Include authored TypeScript entrypoints in the published package so installed self-modification scaffolds compile without workspace source, and clean generated scaffold output before each build.
-- 05a53cd: The self-modification subagent can now search the eve registry. A new
-  `selfmod__search_registry` tool reports the channels, MCP connections,
-  extensions, and observability integrations a project can add — each with its
-  item address, whether the authored tree already holds it, and the eve version it
-  requires — so the subagent recommends `eve add channel/slack` instead of
-  hand-writing an integration the registry already ships. Search is read-only and
-  installs nothing. Results include pagination metadata so every match can be
-  retrieved, and bundle searches include their component names and metadata.
-- Updated dependencies [dbfa01c]
-- Updated dependencies [5a029d9]
-- Updated dependencies [2bbb775]
-- Updated dependencies [2a34f75]
-- Updated dependencies [1b1f2dd]
-- Updated dependencies [8f2bf7a]
-- Updated dependencies [bca1304]
-- Updated dependencies [50488a1]
-- Updated dependencies [94a0952]
-- Updated dependencies [4464e4d]
-  - eve@0.44.4
+- c3952cf: Allow the compatibility package to forward imports to any eve release at or above 0.54.0.
 
-## 5.0.3
+## 0.0.12
 
 ### Patch Changes
 
-- Updated dependencies [ebf94fa]
-  - eve@0.44.3
+- Updated dependencies [f60c64b]
+- Updated dependencies [84c9604]
+- Updated dependencies [dea8cd8]
+- Updated dependencies [47bd3d7]
+- Updated dependencies [6d0485b]
+- Updated dependencies [9381078]
+- Updated dependencies [879d4e5]
+  - eve@0.54.0
 
-## 5.0.2
-
-### Patch Changes
-
-- Updated dependencies [e79dd2f]
-  - eve@0.44.2
-
-## 5.0.1
-
-### Patch Changes
-
-- Updated dependencies [7c99773]
-- Updated dependencies [02403b9]
-- Updated dependencies [84ddb09]
-- Updated dependencies [85b2dc8]
-- Updated dependencies [a4fd288]
-- Updated dependencies [923921c]
-- Updated dependencies [673def2]
-  - eve@0.44.1
-
-## 5.0.0
+## 0.0.11
 
 ### Patch Changes
 
-- Updated dependencies [47e8b64]
-- Updated dependencies [beba1a2]
-- Updated dependencies [830dd40]
-- Updated dependencies [4da95bb]
-- Updated dependencies [4ed62a7]
-- Updated dependencies [e43d9cb]
-  - eve@0.44.0
+- Updated dependencies [0f8caf4]
+- Updated dependencies [7090a95]
+- Updated dependencies [67ee820]
+- Updated dependencies [8c1430c]
+- Updated dependencies [2b2ad19]
+- Updated dependencies [86e13ff]
+  - eve@0.53.0
 
-## 4.0.0
-
-### Patch Changes
-
-- Updated dependencies [1c2684a]
-- Updated dependencies [1390675]
-- Updated dependencies [f3f4f4a]
-- Updated dependencies [7de783e]
-- Updated dependencies [3ec0e5b]
-- Updated dependencies [b57c965]
-- Updated dependencies [3811d81]
-- Updated dependencies [be9be27]
-- Updated dependencies [1390675]
-- Updated dependencies [99de091]
-- Updated dependencies [f3f4f4a]
-- Updated dependencies [3811d81]
-  - eve@0.43.0
-
-## 3.0.0
+## 0.0.10
 
 ### Patch Changes
 
-- Updated dependencies [f2169fa]
-- Updated dependencies [a43e14f]
-  - eve@0.42.0
+- Updated dependencies [97090d6]
+- Updated dependencies [b3e4b73]
+- Updated dependencies [248d1b1]
+- Updated dependencies [3dd8300]
+- Updated dependencies [e82b889]
+- Updated dependencies [6e35923]
+- Updated dependencies [2c2c552]
+- Updated dependencies [a37938d]
+- Updated dependencies [7db230f]
+- Updated dependencies [abc130e]
+- Updated dependencies [62f076c]
+- Updated dependencies [31666f8]
+- Updated dependencies [62f076c]
+- Updated dependencies [b736b40]
+- Updated dependencies [16c7f24]
+  - eve@0.52.0
 
-## 2.0.0
+## 0.0.9
 
 ### Patch Changes
 
-- Updated dependencies [0569638]
-- Updated dependencies [bdf5f63]
-- Updated dependencies [c47350f]
-- Updated dependencies [c47350f]
-- Updated dependencies [9e19fa4]
-  - eve@0.41.0
+- 8da8d37: Publish a compatibility package that forwards existing `@eve/self-modification` imports to the implementation bundled with eve.
+- Updated dependencies [38fd8d9]
+- Updated dependencies [9d0df26]
+- Updated dependencies [98f45ea]
+- Updated dependencies [3b73073]
+- Updated dependencies [4ee6715]
+- Updated dependencies [9091777]
+- Updated dependencies [73aec25]
+- Updated dependencies [98f45ea]
+- Updated dependencies [30a6325]
+- Updated dependencies [1909295]
+- Updated dependencies [0ca3ef7]
+- Updated dependencies [d594b94]
+- Updated dependencies [a6e72c4]
+- Updated dependencies [0e2e10d]
+- Updated dependencies [30a6325]
+- Updated dependencies [9de667a]
+- Updated dependencies [e83e50e]
+- Updated dependencies [00cc672]
+  - eve@0.51.1
 
-## 1.0.0
+## 0.0.8
 
 ### Patch Changes
 
-- Updated dependencies [e843b4d]
-- Updated dependencies [899e079]
-- Updated dependencies [cda9539]
-- Updated dependencies [2838bb3]
-- Updated dependencies [87c61a1]
-  - eve@0.40.0
+- Updated dependencies [fc123f4]
+- Updated dependencies [b03290a]
+- Updated dependencies [6e630b4]
+- Updated dependencies [ecf0b6a]
+- Updated dependencies [4c45d2f]
+- Updated dependencies [bad0813]
+- Updated dependencies [f9b760a]
+- Updated dependencies [aae2631]
+- Updated dependencies [3cccd71]
+- Updated dependencies [29b9056]
+  - eve@0.51.0
+
+## 0.0.7
+
+### Patch Changes
+
+- Updated dependencies [5b90f3d]
+- Updated dependencies [884cba8]
+- Updated dependencies [2b52714]
+- Updated dependencies [70c8a2e]
+- Updated dependencies [ffcd817]
+  - eve@0.50.0
+
+## 0.0.6
+
+### Patch Changes
+
+- Updated dependencies [68d44b5]
+- Updated dependencies [b20c2aa]
+- Updated dependencies [0172af9]
+- Updated dependencies [fbc89e5]
+- Updated dependencies [3f20c80]
+- Updated dependencies [1ee8fa9]
+- Updated dependencies [a40ebb0]
+  - eve@0.49.0
+
+## 0.0.5
+
+### Patch Changes
+
+- Updated dependencies [62546ab]
+- Updated dependencies [f43525a]
+- Updated dependencies [b7321c9]
+- Updated dependencies [3e2abe5]
+- Updated dependencies [453d194]
+- Updated dependencies [1d78323]
+- Updated dependencies [e219a6a]
+- Updated dependencies [d1b3439]
+- Updated dependencies [9ed9d29]
+- Updated dependencies [1d74287]
+- Updated dependencies [859151e]
+- Updated dependencies [3c16df6]
+  - eve@0.48.0
+
+## 0.0.4
+
+### Patch Changes
+
+- b7ac284: The self-modification subagent can now install items from the configured eve
+  registry. A new `selfmod__registry_add` tool runs `eve add <address>
+--non-interactive --skip-setup` in the application root under `eve dev`,
+  pausing the authored-source watcher for the whole install and reporting the
+  item's declared environment variables that are still unset. Failed dependency
+  installs restore tracked project files and return a sanitized, structured reason
+  instead of implying the project was untouched. Items that declare a setup flow
+  or multiple components are never partially installed: the local dev TUI now
+  opens their existing setup panel automatically, while headless development
+  reports the command that finishes them, so no setup question is answered by the
+  model.
+- Updated dependencies [b0799b3]
+- Updated dependencies [b9eb1b2]
+- Updated dependencies [0a1ad48]
+- Updated dependencies [aafcb34]
+- Updated dependencies [f2c96a1]
+- Updated dependencies [7a7da6d]
+- Updated dependencies [6a8340f]
+- Updated dependencies [ee5e4c7]
+- Updated dependencies [c72dc2e]
+- Updated dependencies [6a8340f]
+- Updated dependencies [1982202]
+- Updated dependencies [b7ac284]
+- Updated dependencies [7a415bf]
+- Updated dependencies [bc2a1f6]
+  - eve@0.47.7
+
+## 0.0.3
+
+### Patch Changes
+
+- Updated dependencies [a3b23c0]
+- Updated dependencies [52e89ef]
+- Updated dependencies [56514d9]
+- Updated dependencies [41c8286]
+- Updated dependencies [bdb3973]
+- Updated dependencies [fccbf2b]
+  - eve@0.47.0
+
+## 0.0.2
+
+### Patch Changes
+
+- Updated dependencies [47b3e48]
+- Updated dependencies [9c0a138]
+- Updated dependencies [7acb4ec]
+- Updated dependencies [1d79217]
+  - eve@0.46.0
 
 ## 0.0.1
 
 ### Patch Changes
 
-- 9a7964b: Add a configurable, development-only `@eve/self-modification` source-editing subagent that mounts authored agent source read-write, exposes its instructions through an extension, and uses structured file tools to inspect and safely update source.
-- Updated dependencies [c2bfee1]
-- Updated dependencies [9a7964b]
-- Updated dependencies [542c380]
-- Updated dependencies [75bd9c8]
-- Updated dependencies [6fc904d]
-  - eve@0.39.3
+- 91700b0: Keep self-modification on the pre-1.0 version line by versioning its eve runtime dependency like other separately published eve packages.
+- b595a70: When a self-modification registry search finds an exact item in a local `eve dev` session, the subagent now directs you to install it with `/add <address>` instead of attempting the installation itself.
+- Updated dependencies [4a18994]
+- Updated dependencies [d2995e1]
+- Updated dependencies [dfe0d18]
+- Updated dependencies [b3cf8ee]
+- Updated dependencies [6252784]
+- Updated dependencies [659774f]
+- Updated dependencies [fc52796]
+- Updated dependencies [2be67fa]
+- Updated dependencies [7ed4fb1]
+- Updated dependencies [0bc8432]
+- Updated dependencies [3274eee]
+- Updated dependencies [ae83a08]
+- Updated dependencies [f439e3d]
+- Updated dependencies [80571ee]
+- Updated dependencies [7c5a69e]
+- Updated dependencies [f38eaf1]
+- Updated dependencies [cfa90d6]
+- Updated dependencies [d79de0b]
+- Updated dependencies [687c371]
+- Updated dependencies [8e5d9b2]
+- Updated dependencies [7eae011]
+- Updated dependencies [c6f9c85]
+  - eve@0.45.0

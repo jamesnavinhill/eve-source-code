@@ -360,6 +360,172 @@ describe("resolveSlackInboundMrkdwn", () => {
     expect(result).toBe("nested body");
   });
 
+  it("extracts shared Slack messages from message unfurl attachments", () => {
+    const result = resolveSlackInboundMrkdwn(":crosspost:", {
+      attachments: [
+        {
+          from_url: "https://example.slack.com/archives/C_SOURCE/p1700000000000100",
+          is_msg_unfurl: true,
+          message_blocks: [
+            {
+              channel: "C_SOURCE",
+              message: {
+                blocks: [
+                  {
+                    type: "rich_text",
+                    elements: [
+                      {
+                        type: "rich_text_section",
+                        elements: [
+                          {
+                            type: "text",
+                            text: "I can't find deployment protection or agent runs in the new sidebar.",
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              },
+              team: "T_SOURCE",
+              ts: "1700000000.000100",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result).toBe(
+      ":crosspost:\nI can't find deployment protection or agent runs in the new sidebar.",
+    );
+  });
+
+  it("falls back to shared Slack message text when its blocks are absent", () => {
+    const result = resolveSlackInboundMrkdwn("", {
+      attachments: [
+        {
+          is_msg_unfurl: true,
+          message_blocks: [{ message: { text: "Forwarded feedback" } }],
+        },
+      ],
+    });
+
+    expect(result).toBe("Forwarded feedback");
+  });
+
+  it.each([
+    ["bare link", "<https://x/a>"],
+    ["short question and link", "what do you make of this? <https://x/a>"],
+    [
+      "sentence and link",
+      "Can you look at this alert and tell me whether it is the adapter again? <https://x/a>",
+    ],
+  ])("keeps an inbound link preview with a %s", (_name, text) => {
+    const result = resolveSlackInboundMrkdwn(text, {
+      attachments: [
+        { title: "Grafana Alerts", text: "[FIRING:12] parse errors, severity critical" },
+      ],
+    });
+
+    expect(result).toBe(`${text}\nGrafana Alerts\n[FIRING:12] parse errors, severity critical`);
+  });
+
+  it.each([
+    ["short", "[FIRING:12] parse errors"],
+    ["long", "[FIRING:12] parse errors, severity critical; check the adapter logs"],
+  ])("keeps a %s preview without repeating a URL-only rich-text link", (_name, preview) => {
+    const text = "Can you check <https://x/a>?";
+    const result = resolveSlackInboundMrkdwn(text, {
+      blocks: [
+        {
+          type: "rich_text",
+          elements: [
+            {
+              type: "rich_text_section",
+              elements: [
+                { type: "text", text: "Can you check " },
+                { type: "link", url: "https://x/a" },
+                { type: "text", text: "?" },
+              ],
+            },
+          ],
+        },
+      ],
+      attachments: [{ title: "Grafana Alerts", text: preview }],
+    });
+
+    expect(result).toBe(`${text}\nGrafana Alerts\n${preview}`);
+  });
+
+  it("keeps nonredundant block content and an attachment alongside top-level text", () => {
+    const result = resolveSlackInboundMrkdwn("Alert", {
+      blocks: [{ type: "section", text: { type: "mrkdwn", text: "Check the dashboard" } }],
+      attachments: [{ text: "Latency is high" }],
+    });
+
+    expect(result).toBe("Alert\nCheck the dashboard\nLatency is high");
+  });
+
+  it("does not repeat top-level blocks when a preview is longer than the comment", () => {
+    const text = "Check <https://x/a>";
+    const result = resolveSlackInboundMrkdwn(text, {
+      blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
+      attachments: [
+        {
+          title: "Grafana Alerts",
+          text: "[FIRING:12] parse errors, severity critical; check the adapter logs",
+        },
+      ],
+    });
+
+    expect(result).toBe(
+      `${text}\nGrafana Alerts\n[FIRING:12] parse errors, severity critical; check the adapter logs`,
+    );
+  });
+
+  it("keeps a top-level comment alongside a shorter shared Slack message", () => {
+    const result = resolveSlackInboundMrkdwn(
+      "This seems related to the navigation feedback we discussed yesterday.",
+      {
+        attachments: [
+          {
+            is_msg_unfurl: true,
+            message_blocks: [{ message: { text: "Agent runs are missing." } }],
+          },
+        ],
+      },
+    );
+
+    expect(result).toBe(
+      "This seems related to the navigation feedback we discussed yesterday.\nAgent runs are missing.",
+    );
+  });
+
+  it.each(["is_share", "is_msg_unfurl", "is_reply_unfurl"])(
+    "keeps short shared-message content alongside a longer human comment for %s attachments",
+    (sharedMessageFlag) => {
+      const result = resolveSlackInboundMrkdwn("<@U123> :eyes:", {
+        attachments: [
+          {
+            [sharedMessageFlag]: true,
+            text: "Ship it",
+            from_url: "https://example.slack.com/archives/C123/p1234567890000100",
+          },
+        ],
+      });
+
+      expect(result).toBe("<@U123> :eyes:\nShip it");
+    },
+  );
+
+  it("does not repeat shared-message content already present in the human comment", () => {
+    const result = resolveSlackInboundMrkdwn("Please review: Ship it", {
+      attachments: [{ is_share: true, text: "Ship it" }],
+    });
+
+    expect(result).toBe("Please review: Ship it");
+  });
+
   it("keeps top-level text when rich_text blocks mirror it", () => {
     const result = resolveSlackInboundMrkdwn("Status update", {
       blocks: [

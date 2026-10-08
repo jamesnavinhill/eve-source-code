@@ -102,6 +102,7 @@ async function canBuildWorkspaceCli({ exists, packageRoot, postBuildScriptPaths 
       packageRoot,
     }),
     resolve(packageRoot, "src"),
+    vendorCompiledScriptPath({ packageRoot }),
     ...postBuildScriptPaths,
   ]) {
     if (!(await exists(requiredPath))) {
@@ -274,6 +275,9 @@ export async function ensureBuiltCli(overrides = {}, dependencies = {}) {
     );
   }
 
+  await executeCommand(process.execPath, [vendorCompiledScriptPath(options)], {
+    cwd: options.packageRoot,
+  });
   await executeCommand(
     process.execPath,
     [resolveTscCliPath({ tscCliPath: options.tscCliPath }), "-p", "tsconfig.json"],
@@ -317,6 +321,17 @@ export async function runEveCli(argv = process.argv.slice(2), overrides = {}, de
   await cliModule.runCli(argv);
 }
 
+/**
+ * Resolves once every write already queued on the stream has been handed to the OS.
+ */
+async function flushWritable(stream) {
+  if (stream.destroyed || stream.writableEnded) {
+    return;
+  }
+
+  await new Promise((resolveFlush) => stream.write("", () => resolveFlush()));
+}
+
 async function isDirectExecution() {
   if (!process.argv[1]) {
     return false;
@@ -350,6 +365,10 @@ if (await isDirectExecution()) {
     }
     process.exitCode = 1;
   } finally {
+    // Pipes and sockets can accept writes asynchronously, and `process.exit`
+    // drops anything still queued, truncating large output such as
+    // `eve info --json` read by a parent Node process.
+    await Promise.all([flushWritable(process.stdout), flushWritable(process.stderr)]);
     // The CLI bootstraps build/dev toolchains that can leave native service
     // handles alive after the command has completed. Once the top-level
     // command resolves, terminate the bin process explicitly so commands like

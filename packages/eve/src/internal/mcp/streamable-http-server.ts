@@ -1,19 +1,50 @@
+import { context as otelContext } from "#compiled/@opentelemetry/api/index.js";
 import {
   createMcpHandler,
   McpServer,
+  type CacheHint,
+  type McpJsonObject,
+  type McpServerOptions,
   type McpToolAnnotations,
+  type StandardSchemaIssue,
   type StandardSchemaWithJSON,
 } from "#compiled/@modelcontextprotocol/server/index.js";
 
 import type { SessionAuthContext } from "#channel/types.js";
+import { createLogger, logError } from "#internal/logging.js";
+import { withMcpRequestTraceContext } from "#internal/mcp/request-trace-context.js";
+
+const log = createLogger("mcp.server");
 
 export const MCP_PROTOCOL_VERSION = "2026-07-28";
-export const MCP_LEGACY_PROTOCOL_VERSION = "2025-11-25";
-const MCP_COMPATIBILITY_INSPECTION_MAX_BYTES = 4 * 1024 * 1024;
+/**
+ * Upper bound for any MCP POST body. Tool arguments are small JSON; the
+ * largest legitimate payload is an `outputSchema`, itself capped at 64 KiB.
+ */
+export const MCP_REQUEST_BODY_MAX_BYTES = 1024 * 1024;
 
-export interface McpToolDefinition<
-  TInputSchema extends StandardSchemaWithJSON = StandardSchemaWithJSON,
-> {
+/**
+ * Cache hint for the tool lists, skill lists, and skill reads eve serves.
+ * They are fixed per deployment, but clients cache per URL, and a production
+ * alias serves a new deployment under the same URL, so the TTL is how long a
+ * client may see the old lists after a deploy. `private`: route auth
+ * admitted this caller, and a shared cache cannot rerun it for the next one.
+ */
+export const MCP_LIST_CACHE_HINT = {
+  cacheScope: "private",
+  ttlMs: 5 * 60 * 1000,
+} as const satisfies CacheHint;
+
+/** The cacheable SDK-built results eve answers with {@link MCP_LIST_CACHE_HINT}. */
+const CACHE_HINTED_METHODS = [
+  "resources/list",
+  "resources/read",
+  "resources/templates/list",
+  "server/discover",
+  "tools/list",
+] as const;
+
+interface McpToolDefinition<TInputSchema extends StandardSchemaWithJSON = StandardSchemaWithJSON> {
   readonly name: string;
   readonly description?: string;
   readonly annotations?: McpToolAnnotations;
@@ -21,21 +52,87 @@ export interface McpToolDefinition<
   readonly outputSchema?: StandardSchemaWithJSON;
 }
 
-export interface McpCallToolResult<
-  TStructured extends Readonly<Record<string, unknown>> = Readonly<Record<string, unknown>>,
-> {
+/**
+ * `TStructured` is any JSON value: 2026 clients accept non-object structured
+ * content, and the SDK wraps it as `{ result }` for 2025 clients.
+ */
+export interface McpCallToolResult<TStructured = Readonly<Record<string, unknown>>> {
   readonly content: readonly McpContent[];
   readonly isError?: boolean;
-  readonly structuredContent?: TStructured;
+  readonly structuredContent?: TStructured | McpToolOperationErrorEnvelope;
+}
+
+export interface McpToolOperationErrorEnvelope {
+  readonly error: McpToolOperationErrorData;
 }
 
 export type McpContent =
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "resource_link"; readonly name: string; readonly uri: string };
 
+/**
+ * Stable, client-actionable reason a tool call was rejected before it could
+ * return a result. `invalid_input` and `conflict` mean the caller should
+ * change or re-read something; `not_found` means stop; `internal` means the
+ * server failed and `errorId` correlates with its logs.
+ */
+type McpToolOperationErrorCode =
+  | "invalid_input"
+  | "not_found"
+  | "conflict"
+  | "denied"
+  | "approval_required"
+  | "authorization_required"
+  | "internal";
+
+interface McpToolOperationErrorData {
+  readonly code: McpToolOperationErrorCode;
+  readonly errorId?: string;
+  readonly message: string;
+  readonly retryable: boolean;
+}
+
+/** Thrown by tool handlers to produce a structured `isError` result. */
+export class McpToolOperationError extends Error {
+  readonly code: McpToolOperationErrorCode;
+
+  constructor(code: McpToolOperationErrorCode, message: string) {
+    super(message);
+    this.name = "McpToolOperationError";
+    this.code = code;
+  }
+}
+
+/** Only `conflict` is retryable: the caller re-reads state and tries again. */
+const RETRYABLE_CODES: ReadonlySet<McpToolOperationErrorCode> = new Set(["conflict"]);
+
+/** What a tool handler sees of one `tools/call`. */
+export interface McpToolCallContext {
+  readonly auth: SessionAuthContext | null;
+  /**
+   * The capabilities a 2026-07-28 request declared in its envelope. 2025-era
+   * requests declare none per request, so they get `undefined`.
+   */
+  readonly clientCapabilities: unknown;
+  /** The request's `_meta`, without the reserved `io.modelcontextprotocol/*` keys. */
+  readonly meta: Readonly<Record<string, unknown>> | undefined;
+  readonly signal: AbortSignal;
+}
+
 export interface McpServerTool {
   readonly name: string;
   register(server: McpServer, auth: SessionAuthContext | null): void;
+}
+
+/**
+ * A set of MCP handlers beside the tools, such as skills. Every request
+ * builds a fresh server, so `register` runs once per request, after
+ * `capabilities` are merged one level deep into the server's own.
+ * Declaring a capability obliges `register` to set its handlers.
+ */
+export interface McpServerFeature {
+  readonly capabilities: McpJsonObject;
+  register(server: McpServer): void;
 }
 
 type InferSchemaOutput<TSchema> =
@@ -44,12 +141,12 @@ type InferSchemaOutput<TSchema> =
 /** Keeps a schema and its inferred handler input coupled while erasing heterogeneous storage. */
 export function defineMcpTool<
   const TInputSchema extends StandardSchemaWithJSON<unknown, unknown>,
-  TStructured extends Readonly<Record<string, unknown>> = Readonly<Record<string, unknown>>,
+  TStructured = Readonly<Record<string, unknown>>,
 >(input: {
   readonly definition: McpToolDefinition<TInputSchema>;
   call(
     value: InferSchemaOutput<TInputSchema>,
-    context: { readonly auth: SessionAuthContext | null; readonly signal: AbortSignal },
+    context: McpToolCallContext,
   ): Promise<McpCallToolResult<TStructured>>;
 }): McpServerTool {
   return {
@@ -64,27 +161,66 @@ export function defineMcpTool<
           ...(input.definition.description === undefined
             ? {}
             : { description: input.definition.description }),
-          inputSchema: input.definition.inputSchema,
+          inputSchema: advertiseOnly(input.definition.inputSchema),
           ...(input.definition.outputSchema === undefined
             ? {}
             : { outputSchema: input.definition.outputSchema }),
         },
-        async (value, context) =>
-          await callTool(
-            input.call,
-            value as InferSchemaOutput<TInputSchema>,
-            context.mcpReq.signal,
+        async (value, context) => {
+          const checked = await input.definition.inputSchema["~standard"].validate(value);
+          if (checked.issues !== undefined) {
+            return toolError({
+              code: "invalid_input",
+              message: `Invalid arguments for tool ${input.definition.name}: ${checked.issues.map(formatIssue).join(", ")}`,
+              retryable: false,
+            });
+          }
+          return await callTool(input.call, checked.value as InferSchemaOutput<TInputSchema>, {
             auth,
-          ),
+            clientCapabilities: declaredClientCapabilities(context.mcpReq.envelope),
+            meta: context.mcpReq._meta,
+            signal: context.mcpReq.signal,
+          });
+        },
       );
     },
   };
 }
 
-export interface McpStreamableHttpServerOptions {
+/**
+ * The SDK both advertises and enforces a tool's input schema, but answers a
+ * rejected call with bare text. This copy keeps the advertised JSON Schema and
+ * accepts any arguments, so `defineMcpTool` checks them against the real
+ * schema and returns an `invalid_input` error like every other rejection.
+ */
+function advertiseOnly(schema: StandardSchemaWithJSON): StandardSchemaWithJSON {
+  const standard = schema["~standard"];
+  return {
+    "~standard": {
+      jsonSchema: standard.jsonSchema,
+      validate: (value) => ({ value }),
+      vendor: standard.vendor,
+      version: standard.version,
+    },
+  };
+}
+
+function formatIssue(issue: StandardSchemaIssue): string {
+  if (issue.path === undefined || issue.path.length === 0) return issue.message;
+  const path = issue.path
+    .map((segment) => String(typeof segment === "object" ? segment.key : segment))
+    .join(".");
+  return `${path}: ${issue.message}`;
+}
+
+interface McpStreamableHttpServerOptions {
   readonly name: string;
   readonly version: string;
-  readonly tools: readonly McpServerTool[];
+  /** Server-level usage guidance returned from `initialize` and `server/discover`. */
+  readonly instructions?: string;
+  /** When set, the server declares `tools`, even for an empty list. */
+  readonly tools?: readonly McpServerTool[];
+  readonly features?: readonly McpServerFeature[];
   authenticate(request: Request): Promise<SessionAuthContext | null | Response>;
 }
 
@@ -97,29 +233,40 @@ export interface McpStreamableHttpServerOptions {
 export function createMcpStreamableHttpServer(
   options: McpStreamableHttpServerOptions,
 ): (request: Request) => Promise<Response> {
-  const tools = new Map(options.tools.map((tool) => [tool.name, tool]));
-  if (tools.size !== options.tools.length) throw new Error("MCP tool names must be unique.");
+  const tools = new Map((options.tools ?? []).map((tool) => [tool.name, tool]));
+  if (tools.size !== (options.tools?.length ?? 0)) {
+    throw new Error("MCP tool names must be unique.");
+  }
 
   return async (request) => {
     const auth = await options.authenticate(request);
     if (auth instanceof Response) return auth;
 
-    const preflight = await preflightModernRequest(request);
-    if (preflight.response !== undefined) return preflight.response;
-
     const handler = createMcpHandler(() => createServer(options, tools, auth), {
       legacy: "stateless",
     });
-    return await handler.fetch(
-      request,
-      preflight.parsedBody === undefined ? undefined : { parsedBody: preflight.parsedBody },
+    if (request.method.toUpperCase() !== "POST") return await handler.fetch(request);
+
+    // Every POST body is read here, bounded, before the SDK sees it. The
+    // parsed value is handed to the SDK so the body is never read twice.
+    const inspected = await inspectRequestBody(request);
+    if (inspected.tooLarge) return requestBodyTooLargeResponse();
+    if (inspected.invalidJson) return invalidJsonResponse();
+    const parsedBody = inspected.value;
+    if (parsedBody === undefined) return await handler.fetch(request);
+
+    const preflightFailure = await preflightModernRequest(request, parsedBody);
+    if (preflightFailure !== undefined) return preflightFailure;
+
+    // The client's trace context rides in `_meta`, not headers, so it is
+    // adopted here, before the SDK dispatches into a tool. A valid
+    // `_meta.traceparent` replaces any parent extracted from the HTTP
+    // headers; anything else keeps it. `_meta.baggage` is never read.
+    return await otelContext.with(
+      withMcpRequestTraceContext(otelContext.active(), parsedBody),
+      () => handler.fetch(request, { parsedBody }),
     );
   };
-}
-
-interface ModernRequestPreflight {
-  readonly parsedBody?: unknown;
-  readonly response?: Response;
 }
 
 /**
@@ -128,30 +275,15 @@ interface ModernRequestPreflight {
  * missing-header case here until the upstream handler does:
  * modelcontextprotocol/typescript-sdk#2589.
  */
-async function preflightModernRequest(request: Request): Promise<ModernRequestPreflight> {
-  if (request.method.toUpperCase() !== "POST" || request.headers.has("mcp-protocol-version")) {
-    return {};
-  }
-
-  const inspected = await inspectRequestBody(request);
-  if (inspected.tooLarge) return { response: requestBodyTooLargeResponse() };
-  if (inspected.invalidJson) return { response: invalidJsonResponse() };
-  const parsedBody = inspected.value;
-  if (parsedBody === undefined) return {};
-
-  if (!claimsCurrentProtocolVersion(parsedBody)) {
-    return { parsedBody };
-  }
+async function preflightModernRequest(
+  request: Request,
+  parsedBody: unknown,
+): Promise<Response | undefined> {
+  if (request.headers.has("mcp-protocol-version")) return undefined;
+  if (!claimsCurrentProtocolVersion(parsedBody)) return undefined;
 
   const earlierFailure = await probeEarlierValidationFailure(request, parsedBody);
-  if (earlierFailure !== undefined) {
-    return { parsedBody, response: earlierFailure };
-  }
-
-  return {
-    parsedBody,
-    response: headerMismatchResponse(parsedBody),
-  };
+  return earlierFailure ?? headerMismatchResponse(parsedBody);
 }
 
 async function inspectRequestBody(request: Request): Promise<{
@@ -162,6 +294,13 @@ async function inspectRequestBody(request: Request): Promise<{
   const body = request.body;
   if (body === null) return { tooLarge: false };
 
+  // Trust a declared length only to fail fast; the streamed count is the guard.
+  const declaredLength = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MCP_REQUEST_BODY_MAX_BYTES) {
+    await body.cancel().catch(() => {});
+    return { tooLarge: true };
+  }
+
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -170,7 +309,7 @@ async function inspectRequestBody(request: Request): Promise<{
       const chunk = await reader.read();
       if (chunk.done) break;
       size += chunk.value.byteLength;
-      if (size > MCP_COMPATIBILITY_INSPECTION_MAX_BYTES) {
+      if (size > MCP_REQUEST_BODY_MAX_BYTES) {
         await reader.cancel();
         return { tooLarge: true };
       }
@@ -298,41 +437,80 @@ function readJsonRpcRequestId(body: unknown): string | number | null {
 }
 
 function createServer(
-  options: Pick<McpStreamableHttpServerOptions, "name" | "version">,
+  options: Pick<
+    McpStreamableHttpServerOptions,
+    "features" | "instructions" | "name" | "tools" | "version"
+  >,
   tools: ReadonlyMap<string, McpServerTool>,
   auth: SessionAuthContext | null,
 ): McpServer {
-  const server = new McpServer(
-    { name: options.name, version: options.version },
-    { capabilities: { tools: { listChanged: false } } },
-  );
+  const capabilities: Record<string, McpJsonObject> =
+    options.tools === undefined ? {} : { tools: { listChanged: false } };
+  for (const feature of options.features ?? []) {
+    for (const [key, value] of Object.entries(feature.capabilities)) {
+      capabilities[key] = { ...capabilities[key], ...(value as McpJsonObject) };
+    }
+  }
+  const serverOptions: { -readonly [K in keyof McpServerOptions]: McpServerOptions[K] } = {
+    cacheHints: Object.fromEntries(
+      CACHE_HINTED_METHODS.map((method) => [method, MCP_LIST_CACHE_HINT]),
+    ),
+    capabilities,
+  };
+  if (options.instructions !== undefined) serverOptions.instructions = options.instructions;
+  const server = new McpServer({ name: options.name, version: options.version }, serverOptions);
 
   for (const tool of tools.values()) tool.register(server, auth);
+  for (const feature of options.features ?? []) feature.register(server);
 
   return server;
 }
 
-async function callTool<TInput, TStructured extends Readonly<Record<string, unknown>>>(
-  call: (
-    input: TInput,
-    context: { readonly auth: SessionAuthContext | null; readonly signal: AbortSignal },
-  ) => Promise<McpCallToolResult<TStructured>>,
+/** The envelope's client capabilities, when the request is 2026-07-28's. */
+function declaredClientCapabilities(
+  envelope: Readonly<Record<string, unknown>> | undefined,
+): unknown {
+  if (envelope?.["io.modelcontextprotocol/protocolVersion"] !== MCP_PROTOCOL_VERSION) {
+    return undefined;
+  }
+  return envelope["io.modelcontextprotocol/clientCapabilities"];
+}
+
+async function callTool<TInput, TStructured>(
+  call: (input: TInput, context: McpToolCallContext) => Promise<McpCallToolResult<TStructured>>,
   input: TInput,
-  signal: AbortSignal,
-  auth: SessionAuthContext | null,
+  context: McpToolCallContext,
 ): Promise<McpCallToolResult<TStructured>> {
   try {
-    return await call(input, { auth, signal });
+    return await call(input, context);
   } catch (error) {
-    return toolError(error instanceof Error ? error.message : "Tool call failed.");
+    if (error instanceof McpToolOperationError) {
+      return toolError({
+        code: error.code,
+        message: error.message,
+        retryable: RETRYABLE_CODES.has(error.code),
+      });
+    }
+    // Unexpected failures never forward their message: it may carry provider
+    // responses, hostnames, or workflow payloads. The errorId is the handle.
+    const errorId = logError(log, "MCP tool call failed", error);
+    return toolError({
+      code: "internal",
+      errorId,
+      message: "The server could not complete this tool call.",
+      retryable: false,
+    });
   }
 }
 
-function toolError<TStructured extends Readonly<Record<string, unknown>>>(
-  message: string,
-): McpCallToolResult<TStructured> {
+function toolError<TStructured>(error: McpToolOperationErrorData): McpCallToolResult<TStructured> {
+  const text =
+    error.errorId === undefined ? error.message : `${error.message} (errorId: ${error.errorId})`;
+  // The SDK skips outputSchema validation when isError is set, so this shape
+  // does not need to appear in each tool's declared output schema.
   return {
-    content: [{ type: "text", text: message }],
+    content: [{ type: "text", text }],
     isError: true,
+    structuredContent: { error },
   };
 }

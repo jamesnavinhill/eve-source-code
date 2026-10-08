@@ -1,10 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
+import type { Message as ExternalMessage, Thread as ExternalThread } from "chat";
 
 import { buildAdapterContext } from "#channel/adapter-context.js";
 import { callAdapterEventHandler, type ChannelAdapter } from "#channel/adapter.js";
 import { isCompiledChannel, type CompiledChannel } from "#channel/compiled-channel.js";
 import { isHttpRouteDefinition } from "#channel/routes.js";
 import { ContextContainer, contextStorage } from "#context/container.js";
+import { enterSessionProjection, recordPublishedEvent } from "#harness/session-machine/current.js";
 import { SessionKey } from "#context/keys.js";
 import { mockChannelContext } from "#internal/testing/mocks/mock-channel-operations.js";
 import type { UnstampedMessageStreamEvent } from "#protocol/message.js";
@@ -18,7 +20,9 @@ import type { RouteHandlerArgs } from "#public/definitions/channel.js";
 import type {
   Adapter,
   AdapterPostableMessage,
+  Attachment,
   ChatInstance,
+  EphemeralMessage,
   FetchResult,
   FormattedContent,
   MessageMetadata,
@@ -29,6 +33,12 @@ import type {
   WebhookOptions,
 } from "#compiled/chat/index.js";
 import { Message, parseMarkdown } from "#compiled/chat/index.js";
+import { mockAgentRouteArgs } from "#internal/testing/mocks/mock-route-args.js";
+
+it("shares Chat SDK type identity with external adapters and handlers", () => {
+  expectTypeOf<Message>().toEqualTypeOf<ExternalMessage>();
+  expectTypeOf<Thread>().toEqualTypeOf<ExternalThread>();
+});
 
 const THREAD_ID = "test:C01:1700000000.000001";
 const CHANNEL_ID = "test:C01";
@@ -56,7 +66,10 @@ function withState(adapter: ChannelAdapter<any>, state: ChatSdkChannelState): Ch
 }
 
 function stubAccessor() {
-  return { get: () => undefined, set: () => {} } as any;
+  const accessor = { get: () => undefined, set: () => {} } as any;
+  // A step enters its projection before it publishes.
+  enterSessionProjection(accessor, undefined);
+  return accessor;
 }
 
 const stubAlsContext = (() => {
@@ -75,6 +88,12 @@ function callEvent(
   ctx: any,
 ): Promise<UnstampedMessageStreamEvent> {
   return contextStorage.run(stubAlsContext, () => callAdapterEventHandler(adapter, event, ctx));
+}
+
+/** Delivers `event` as a session publishes it: the handler runs, then the session records it. */
+async function publishEvent(adapter: ChannelAdapter, event: UnstampedMessageStreamEvent, ctx: any) {
+  await callEvent(adapter, event, ctx);
+  recordPublishedEvent(ctx.ctx, event);
 }
 
 function makeEvent<T extends UnstampedMessageStreamEvent["type"]>(
@@ -111,6 +130,7 @@ async function firePost(
       method: "POST",
     }),
     {
+      ...mockAgentRouteArgs(),
       from(continuationToken) {
         return {
           ...channelContext.from(continuationToken),
@@ -136,12 +156,20 @@ async function firePost(
   return { cancel, response, send, waitUntil };
 }
 
+function bridgeSendTypeChecks(bridge: ReturnType<typeof chatSdkChannel>, thread: Thread): void {
+  // @ts-expect-error bridge.send takes a message; answer input with bridge.respond.
+  void bridge.send({ inputResponses: [{ optionId: "approve", requestId: "r1" }] }, { thread });
+  void bridge.send("hello", { context: ["extra"], outputSchema: { type: "object" }, thread });
+}
+
+void bridgeSendTypeChecks;
+
 describe("chatSdkChannel", () => {
   it.each([
     [{ isDM: true, channelVisibility: "unknown" }, "private"],
     [{ isDM: false, channelVisibility: "workspace" }, "public"],
     [{ isDM: false, channelVisibility: "private" }, "private"],
-  ] as const)("projects the $audience audience", (thread, audience) => {
+  ] as const)("classifies the $audience audience", (thread, audience) => {
     const bridge = chatSdkChannel({
       adapters: { test: testAdapter() },
       state: memoryState(),
@@ -157,7 +185,15 @@ describe("chatSdkChannel", () => {
       ...thread,
     };
 
-    expect(adapter.instrumentation?.metadata?.(adapter.state)).toMatchObject({ audience });
+    expect(
+      adapter.instrumentation?.audience?.({
+        auth: null,
+        caller: { type: "anonymous" },
+        channel: { kind: "channel:chat-sdk" },
+        environment: "production",
+        state: adapter.state,
+      }),
+    ).toBe(audience);
   });
 
   it("mounts GET and POST webhook routes per Chat SDK adapter", () => {
@@ -181,6 +217,8 @@ describe("chatSdkChannel", () => {
     const bridge = chatSdkChannel({
       adapters: { test: testAdapter() },
       state: memoryState(),
+      // Tests that initialize Chat SDK keep its warnings but not its info-level startup lines.
+      logger: "warn",
       userName: "bot",
     });
     const compiled = asCompiled<ChatSdkChannelState>(bridge.channel);
@@ -194,6 +232,7 @@ describe("chatSdkChannel", () => {
     const response = await get.handler(
       new Request("https://example.com/eve/v1/test?crc_token=abc123", { method: "GET" }),
       {
+        ...mockAgentRouteArgs(),
         ...mockChannelContext(vi.fn()),
         attachSession: vi.fn() as any,
         params: {},
@@ -213,11 +252,16 @@ describe("chatSdkChannel", () => {
       adapters: { test: adapter },
       concurrency: "concurrent",
       state: memoryState(),
+      logger: "warn",
       userName: "bot",
     });
 
     bridge.bot.onNewMention(async (thread: Thread, message: Message) => {
-      await bridge.send(message.text, { auth: AUTH, thread, title: "mention" });
+      await bridge.send(message.text, {
+        auth: AUTH,
+        thread,
+        title: "mention",
+      });
     });
 
     const { cancel, response, send } = await firePost(bridge.channel, "/eve/v1/test", {
@@ -248,6 +292,7 @@ describe("chatSdkChannel", () => {
       adapters: { test: testAdapter() },
       concurrency: "concurrent",
       state: memoryState(),
+      logger: "warn",
       userName: "bot",
     });
 
@@ -278,19 +323,17 @@ describe("chatSdkChannel", () => {
     });
   });
 
-  it("does not cancel for a steering response without a message", async () => {
+  it("answers pending input through bridge.respond without cancelling", async () => {
     const bridge = chatSdkChannel({
       adapters: { test: testAdapter() },
       concurrency: "concurrent",
       state: memoryState(),
+      logger: "warn",
       userName: "bot",
     });
 
     bridge.bot.onNewMention(async (thread: Thread) => {
-      await bridge.send(
-        { inputResponses: [{ optionId: "approve", requestId: "request-1" }] },
-        { thread, turnPolicy: "steer" },
-      );
+      await bridge.respond([{ optionId: "approve", requestId: "request-1" }], { thread });
     });
 
     const { cancel, response, send } = await firePost(bridge.channel, "/eve/v1/test", {
@@ -483,6 +526,117 @@ describe("chatSdkChannel", () => {
     ]);
   });
 
+  describe("a sign-in outside a direct message", () => {
+    const signIn = makeEvent("authorization.required", {
+      authorization: { url: "https://connect.example.com/a/sca_1", userCode: "ABC-123" },
+      name: "notion",
+      principalId: AUTH.principalId,
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn-1",
+    });
+    const PRIVATE_STATUS =
+      "Authorization required for Notion. I sent you the sign-in details privately.";
+    const DM_NOTICE =
+      "Authorization required for Notion. Continue in a direct message with this agent.";
+    const alice = author();
+    const bob = { ...author(), fullName: "Bob", userId: "user-2", userName: "bob" };
+
+    /** Delivers a message from `from`, sent as `caller`, then raises the sign-in. */
+    async function signInAfter(
+      adapter: TestAdapter & Adapter,
+      messages: ReadonlyArray<{
+        readonly caller: typeof AUTH | null;
+        readonly from?: Message["author"];
+      }>,
+    ) {
+      const bridge = chatSdkChannel({
+        adapters: { test: adapter },
+        state: memoryState(),
+        userName: "bot",
+      });
+      const state: ChatSdkChannelState = { thread: serializedThread() };
+      const channelAdapter = withState(getAdapter(bridge.channel), state);
+      const ctx = buildAdapterContext(channelAdapter, stubAccessor());
+      for (const { caller, from } of messages) {
+        const currentMessage = from === undefined ? undefined : message("hi", from).toJSON();
+        await channelAdapter.deliver!(
+          { message: "hi", state: { thread: { ...serializedThread(), currentMessage } } },
+          { ...ctx, session: { auth: { current: caller, initiator: caller } } } as never,
+        );
+      }
+      await callEvent(channelAdapter, signIn, ctx);
+      return adapter.posted.map(({ message: posted }) => posted);
+    }
+
+    it.each([
+      {
+        name: "shows the challenge only to the person signing in",
+        postEphemeral: async () => ({
+          id: "e1",
+          threadId: THREAD_ID,
+          usedFallback: false,
+          raw: {},
+        }),
+        status: PRIVATE_STATUS,
+      },
+      {
+        name: "points at a DM when the adapter can't deliver privately",
+        postEphemeral: async () => null,
+        status: DM_NOTICE,
+      },
+      {
+        name: "points at a DM when the private delivery fails",
+        postEphemeral: async () => {
+          throw new Error("ephemeral failed");
+        },
+        status: DM_NOTICE,
+      },
+    ])("$name", async ({ postEphemeral, status }) => {
+      const adapter = testAdapter();
+      const ephemerals: Array<{ message: AdapterPostableMessage; userId: string }> = [];
+      adapter.postEphemeral = async (_threadId, userId, posted) => {
+        ephemerals.push({ message: posted, userId });
+        return postEphemeral();
+      };
+
+      const posted = await signInAfter(adapter, [{ caller: AUTH, from: alice }]);
+
+      expect(posted).toEqual([{ markdown: status }]);
+      expect(ephemerals).toEqual([
+        {
+          message: {
+            markdown:
+              "Authorization required for Notion.\n\nCode: ABC-123\n\nhttps://connect.example.com/a/sca_1",
+          },
+          userId: alice.userId,
+        },
+      ]);
+    });
+
+    it.each([
+      { name: "an anonymous sender", messages: [{ caller: null, from: alice }] },
+      { name: "a bot author", messages: [{ caller: AUTH, from: { ...alice, isBot: true } }] },
+      { name: "a send without its message", messages: [{ caller: AUTH }] },
+      {
+        name: "a principal two people send as",
+        messages: [
+          { caller: AUTH, from: alice },
+          { caller: AUTH, from: bob },
+        ],
+      },
+    ])("sends the challenge to no one after $name", async ({ messages }) => {
+      const adapter = testAdapter();
+      const ephemeral = vi.fn();
+      adapter.postEphemeral = ephemeral;
+
+      const posted = await signInAfter(adapter, messages);
+
+      expect(posted).toEqual([{ markdown: DM_NOTICE }]);
+      expect(ephemeral).not.toHaveBeenCalled();
+    });
+  });
+
   it("does not throw when the adapter's startTyping is not implemented", async () => {
     const adapter = testAdapter();
     adapter.startTypingError = new NotImplementedError("startTyping");
@@ -518,7 +672,6 @@ describe("chatSdkChannel", () => {
       channelAdapter,
       makeEvent("message.appended", {
         messageDelta: "Hel",
-        messageSoFar: "Hel",
         sequence: 1,
         stepIndex: 0,
         turnId: "turn-1",
@@ -532,7 +685,6 @@ describe("chatSdkChannel", () => {
       channelAdapter,
       makeEvent("message.appended", {
         messageDelta: "lo",
-        messageSoFar: "Hello",
         sequence: 2,
         stepIndex: 0,
         turnId: "turn-1",
@@ -542,6 +694,50 @@ describe("chatSdkChannel", () => {
     expect(adapter.edited).toEqual([
       { message: { markdown: "Hello" }, messageId: "posted-1", threadId: THREAD_ID },
     ]);
+  });
+
+  it("finalizes a retried stream from the canonical completed message", async () => {
+    const adapter = testAdapter();
+    const bridge = chatSdkChannel({
+      adapters: { test: adapter },
+      state: memoryState(),
+      streamingEditIntervalMs: 0,
+      userName: "bot",
+    });
+    const state: ChatSdkChannelState = { thread: serializedThread() };
+    const channelAdapter = withState(getAdapter(bridge.channel), state);
+    const ctx = buildAdapterContext(channelAdapter, stubAccessor());
+
+    for (const messageDelta of ["abandoned", "replacement"]) {
+      await callEvent(
+        channelAdapter,
+        makeEvent("message.appended", {
+          messageDelta,
+          sequence: 1,
+          stepIndex: 0,
+          turnId: "turn-1",
+        }),
+        ctx,
+      );
+    }
+    await callEvent(
+      channelAdapter,
+      makeEvent("message.completed", {
+        finishReason: "stop",
+        message: "replacement",
+        sequence: 1,
+        stepIndex: 0,
+        turnId: "turn-1",
+      }),
+      ctx,
+    );
+
+    expect(adapter.edited.at(-1)).toEqual({
+      message: { markdown: "replacement" },
+      messageId: "posted-1",
+      threadId: THREAD_ID,
+    });
+    expect(state.anchorMessageId).toBeNull();
   });
 
   it("falls back to a fresh post when streaming edits are not implemented", async () => {
@@ -648,12 +844,13 @@ describe("chatSdkChannel", () => {
     expect(state.pendingToolCallMessage).toBe("Let me check that.");
   });
 
-  it("renders input requests as Chat SDK cards and resumes on button actions", async () => {
+  it("renders input requests as Chat SDK cards with buttons and a text fallback naming each reply", async () => {
     const adapter = testAdapter();
     const bridge = chatSdkChannel({
       adapters: { test: adapter },
       concurrency: "concurrent",
       state: memoryState(),
+      logger: "warn",
       userName: "bot",
     });
     const channelAdapter = withState(getAdapter(bridge.channel), {
@@ -683,48 +880,112 @@ describe("chatSdkChannel", () => {
       ctx,
     );
 
-    const card = adapter.posted[0]?.message as AdapterPostableMessage;
-    expect(card).toMatchObject({
-      children: [
-        { content: "Deploy?", type: "text" },
-        {
-          children: [
-            {
-              id: "eve_input:request-1:approve",
-              label: "Approve",
-              style: "primary",
-              type: "button",
-              value: "approve",
-            },
-            {
-              id: "eve_input:request-1:cancel",
-              label: "Cancel",
-              style: "danger",
-              type: "button",
-              value: "cancel",
-            },
-          ],
-          type: "actions",
-        },
-      ],
-      type: "card",
-    });
-
-    const { send } = await firePost(bridge.channel, "/eve/v1/test", {
-      actionId: "eve_input:request-1:approve",
-      kind: "action",
-      value: "approve",
-    });
-
-    expect(send).toHaveBeenCalledWith(THREAD_ID, {
-      auth: null,
-      inputResponses: [{ optionId: "approve", requestId: "request-1" }],
-      state: {
-        thread: expect.objectContaining({
-          adapterName: "test",
-          id: THREAD_ID,
-        }),
+    const posted = adapter.posted[0]?.message as AdapterPostableMessage;
+    expect(posted).toMatchObject({
+      card: {
+        children: [
+          { content: "Deploy?", type: "text" },
+          {
+            children: [
+              {
+                id: "eve_input:request-1:approve",
+                label: "Approve",
+                style: "primary",
+                type: "button",
+                value: "approve",
+              },
+              {
+                id: "eve_input:request-1:cancel",
+                label: "Cancel",
+                style: "danger",
+                type: "button",
+                value: "cancel",
+              },
+            ],
+            type: "actions",
+          },
+        ],
+        type: "card",
       },
+      fallbackText: "Deploy?\n\n1. Approve\n2. Cancel\n\nReply with a number to choose.",
+    });
+  });
+
+  it("asks for a typed reply when an input request accepts a freeform answer", async () => {
+    const adapter = testAdapter();
+    const bridge = chatSdkChannel({
+      adapters: { test: adapter },
+      concurrency: "concurrent",
+      state: memoryState(),
+      logger: "warn",
+      userName: "bot",
+    });
+    const channelAdapter = withState(getAdapter(bridge.channel), {
+      thread: serializedThread(),
+    });
+    const accessor = stubAccessor();
+    const ctx = buildAdapterContext(channelAdapter, accessor);
+    // The channel reads the session's record of what it published.
+    enterSessionProjection(accessor, undefined);
+
+    await publishEvent(
+      channelAdapter,
+      makeEvent("input.requested", {
+        requests: [
+          {
+            action: { callId: "call-1", name: "ask", type: "tool-call" },
+            display: "text",
+            prompt: "Which region?",
+            requestId: "request-1",
+          },
+          {
+            action: { callId: "call-2", name: "ask", type: "tool-call" },
+            allowFreeform: true,
+            display: "select",
+            options: [{ id: "iad1", label: "Washington" }],
+            prompt: "Which zone?",
+            requestId: "request-2",
+          },
+        ],
+        sequence: 1,
+        stepIndex: 0,
+        turnId: "turn-1",
+      }),
+      ctx,
+    );
+
+    expect(adapter.posted.map(({ message }) => message)).toMatchObject([
+      {
+        card: {
+          children: [
+            { content: "Which region?", type: "text" },
+            { content: "Reply with your answer.", type: "text" },
+          ],
+        },
+        fallbackText: "Which region?\n\nReply with your answer.",
+      },
+    ]);
+
+    // A reply can only answer the request it sees, so the next one waits its turn.
+    await publishEvent(
+      channelAdapter,
+      makeEvent("input.resolved", {
+        resolutions: [{ kind: "question", outcome: "answered", requestId: "request-1" }],
+        sequence: 1,
+        stepIndex: 0,
+        turnId: "turn-1",
+      }),
+      ctx,
+    );
+    expect(adapter.posted.at(-1)?.message).toMatchObject({
+      card: {
+        children: [
+          { content: "Which zone?", type: "text" },
+          { type: "actions" },
+          { content: "Or reply with your own answer.", type: "text" },
+        ],
+      },
+      fallbackText: "Which zone?\n\n1. Washington\n\nReply with a number, or with your own answer.",
     });
   });
 });
@@ -799,6 +1060,97 @@ describe("messageToUserContent", () => {
   });
 });
 
+describe("attachments the adapter downloads", () => {
+  function withDownload(fetchData: () => Promise<Buffer>, size?: number): Message {
+    return new Message({
+      attachments: [
+        {
+          fetchData,
+          fetchMetadata: { fileId: "F1" },
+          mimeType: "image/png",
+          name: "diagram.png",
+          size,
+          type: "image",
+          url: "https://files.test/F1",
+        },
+      ],
+      author: author(),
+      formatted: parseMarkdown(""),
+      id: "message-5",
+      isMention: true,
+      metadata: metadata(),
+      raw: {},
+      text: "",
+      threadId: THREAD_ID,
+    });
+  }
+
+  /** The channel's `fetchFile` for the one file part `messageToUserContent` made. */
+  async function fetchDeferred(adapter: TestAdapter & Adapter, inbound: Message) {
+    const bridge = chatSdkChannel({
+      adapters: { test: adapter },
+      state: memoryState(),
+      userName: "bot",
+    });
+    const [part] = messageToUserContent(inbound) as Exclude<
+      ReturnType<typeof messageToUserContent>,
+      string
+    >;
+    // Only the URL crosses the queue; the message's own fetchData doesn't.
+    const href = ((part as { data: URL }).data as URL).href;
+    return await getAdapter(bridge.channel).fetchFile!(href);
+  }
+
+  it("defers the download to the step and rebuilds it with the adapter's rehydrateAttachment", async () => {
+    const adapter = testAdapter();
+    adapter.rehydrateAttachment = (attachment) => ({
+      ...attachment,
+      fetchData: async () => Buffer.from(`bytes of ${String(attachment.fetchMetadata?.fileId)}`),
+    });
+    const fetchData = vi.fn(async () => Buffer.from("eager"));
+
+    const resolved = await fetchDeferred(adapter, withDownload(fetchData));
+
+    expect(fetchData).not.toHaveBeenCalled();
+    expect(resolved).toEqual({ bytes: Buffer.from("bytes of F1"), mediaType: "image/png" });
+  });
+
+  it("fails a download over the upload limit", async () => {
+    const adapter = testAdapter();
+    adapter.rehydrateAttachment = (attachment) => ({
+      ...attachment,
+      fetchData: async () => Buffer.alloc(25 * 1024 * 1024 + 1),
+    });
+
+    await expect(
+      fetchDeferred(
+        adapter,
+        withDownload(async () => Buffer.alloc(0)),
+      ),
+    ).rejects.toThrow("it is over the 25 MB upload limit.");
+  });
+
+  it("notes a file the adapter reports as over the limit without deferring it", () => {
+    expect(
+      messageToUserContent(withDownload(async () => Buffer.alloc(0), 25 * 1024 * 1024 + 1)),
+    ).toEqual([
+      {
+        text: "Attachment diagram.png was not retrieved: it is over the upload limit.",
+        type: "text",
+      },
+    ]);
+  });
+
+  it("fails the download when the adapter can't rebuild it after the webhook", async () => {
+    await expect(
+      fetchDeferred(
+        testAdapter(),
+        withDownload(async () => Buffer.alloc(0)),
+      ),
+    ).rejects.toThrow("the test adapter can't download it after the webhook returns.");
+  });
+});
+
 describe("isNotImplemented", () => {
   it("matches errors by name and by code", () => {
     expect(isNotImplemented(new NotImplementedError("startTyping"))).toBe(true);
@@ -836,6 +1188,13 @@ class TestAdapter {
   typingStatuses: Array<string | undefined> = [];
   startTypingError: Error | null = null;
   editError: Error | null = null;
+  rehydrateAttachment?: (attachment: Attachment) => Attachment;
+  /** Native ephemerals, when a test gives the adapter them. */
+  postEphemeral?: (
+    threadId: string,
+    userId: string,
+    message: AdapterPostableMessage,
+  ) => Promise<EphemeralMessage | null>;
 
   async initialize(chat: ChatInstance): Promise<void> {
     this.chat = chat;
@@ -953,10 +1312,10 @@ class TestAdapter {
   }
 }
 
-function message(text: string): Message {
+function message(text: string, from: Message["author"] = author()): Message {
   return new Message({
     attachments: [],
-    author: author(),
+    author: from,
     formatted: parseMarkdown(text),
     id: "message-1",
     isMention: true,

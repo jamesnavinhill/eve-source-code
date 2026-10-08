@@ -3,9 +3,11 @@ import type { CompiledModuleMap } from "#compiler/module-map.js";
 import { expectObjectRecord } from "#internal/authored-module.js";
 import type { ConnectionToolCallDefinition } from "#public/definitions/connections/tool-call.js";
 import {
-  registerDefinitionSource,
-  stampDefinitionKey,
-} from "#internal/authored-definition/source-identity.js";
+  normalizeMcpClientConnectionDefinition,
+  normalizeOpenApiConnectionDefinition,
+} from "#internal/authored-definition/connection.js";
+import { readStampedConnectionProtocol } from "#public/definitions/connections/protocol.js";
+import { registerDefinitionSource } from "#internal/authored-definition/source-identity.js";
 import { toErrorMessage } from "#shared/errors.js";
 import type {
   ConnectionAuthResolver,
@@ -15,6 +17,8 @@ import type {
 import { normalizeAuthorizationSpec } from "#shared/validate-authorization.js";
 import { loadResolvedModuleExport, ResolveAgentError } from "#runtime/resolve-helpers.js";
 import type { ResolvedConnectionDefinition } from "#runtime/types.js";
+import type { ModuleSourceRef } from "#shared/source-ref.js";
+import { createConnectionInstanceId } from "#runtime/connections/instance-identity.js";
 
 /**
  * Resolves one compiled connection entry into a runtime-owned definition
@@ -44,20 +48,15 @@ export async function resolveConnectionDefinition(
       `Expected the connection export "${definition.exportName ?? "default"}" from "${definition.logicalPath}" to return an object.`,
     );
 
-    const sourceEntry = {
-      kind: "connection",
-      logicalPath: definition.logicalPath,
-      name: definition.connectionName,
-    } as const;
-
-    const sourceKey = `connection-source:${definition.sourceId}`;
-    stampDefinitionKey(resolvedRecord, sourceKey);
-    registerDefinitionSource(sourceKey, sourceEntry);
     // Use the compiled `url` (the MCP endpoint or OpenAPI base URL) as
-    // the secondary key so it matches the authoring-time key stamped by
+    // the fallback key so it matches the authoring-time key stamped by
     // the `define*` factory for both protocols. The live record only
     // carries `url` for MCP connections.
-    registerDefinitionSource(`connection:${definition.url}`, sourceEntry);
+    registerDefinitionSource(
+      resolvedRecord,
+      { kind: "connection", logicalPath: definition.logicalPath, name: definition.connectionName },
+      `connection:${definition.url}`,
+    );
 
     const hasAuth = resolvedRecord.auth !== undefined;
     const hasHeaders = resolvedRecord.headers !== undefined;
@@ -73,8 +72,11 @@ export async function resolveConnectionDefinition(
       description: string;
       exportName: typeof definition.exportName;
       headers?: Readonly<HeadersDefinition>;
+      instanceId: string;
       logicalPath: string;
       protocol: ResolvedConnectionDefinition["protocol"];
+      protocolVersionDiscovery?: boolean;
+      forwardPrincipal?: boolean;
       sourceId: string;
       sourceKind: "module";
       spec?: ResolvedConnectionDefinition["spec"];
@@ -86,6 +88,14 @@ export async function resolveConnectionDefinition(
       description: definition.description,
       exportName: definition.exportName,
       logicalPath: definition.logicalPath,
+      instanceId: createConnectionInstanceId({
+        connectionName: definition.connectionName,
+        instanceKey:
+          typeof resolvedRecord.instanceKey === "string" ? resolvedRecord.instanceKey : undefined,
+        protocol: definition.protocol,
+        sourceId: definition.sourceId,
+        url: definition.url,
+      }),
       protocol: definition.protocol,
       sourceId: definition.sourceId,
       sourceKind: "module",
@@ -108,6 +118,20 @@ export async function resolveConnectionDefinition(
           });
         }
       }
+    }
+
+    if (definition.protocol === "mcp" && resolvedRecord.protocolVersionDiscovery !== undefined) {
+      if (typeof resolvedRecord.protocolVersionDiscovery !== "boolean") {
+        throw new Error('"protocolVersionDiscovery" must be a boolean.');
+      }
+      result.protocolVersionDiscovery = resolvedRecord.protocolVersionDiscovery;
+    }
+
+    if (definition.protocol === "mcp" && resolvedRecord.forwardPrincipal !== undefined) {
+      if (typeof resolvedRecord.forwardPrincipal !== "boolean") {
+        throw new Error('"forwardPrincipal" must be a boolean.');
+      }
+      result.forwardPrincipal = resolvedRecord.forwardPrincipal;
     }
 
     if (hasHeaders) {
@@ -143,4 +167,94 @@ export async function resolveConnectionDefinition(
       },
     );
   }
+}
+
+/** Resolves one branded connection returned by a dynamic connection handler. */
+export function resolveDynamicConnectionValue(
+  value: unknown,
+  source: Readonly<ModuleSourceRef & { readonly connectionName: string }>,
+): ResolvedConnectionDefinition {
+  const protocol = readStampedConnectionProtocol(value);
+  const message =
+    `Dynamic connection "${source.connectionName}" from "${source.logicalPath}" must be created by ` +
+    "defineMcpClientConnection() or defineOpenAPIConnection().";
+  if (protocol === undefined) {
+    throw new Error(message);
+  }
+
+  registerDefinitionSource(value as object, {
+    kind: "connection",
+    logicalPath: source.logicalPath,
+    name: source.connectionName,
+  });
+
+  if (protocol === "openapi") {
+    const normalized = normalizeOpenApiConnectionDefinition(value, message);
+    assertAuthenticatedDynamicInstanceKey(normalized.auth, normalized.instanceKey, message);
+    return omitUndefined({
+      approval: normalized.approval,
+      authorization: normalized.auth as ResolvedConnectionDefinition["authorization"],
+      connectionName: source.connectionName,
+      description: normalized.description,
+      exportName: source.exportName,
+      headers: normalized.headers,
+      instanceId: createConnectionInstanceId({
+        connectionName: source.connectionName,
+        instanceKey: normalized.instanceKey,
+        protocol,
+        sourceId: source.sourceId,
+        url: normalized.baseUrl ?? "",
+      }),
+      logicalPath: source.logicalPath,
+      protocol,
+      sourceId: source.sourceId,
+      sourceKind: "module" as const,
+      spec: normalized.spec,
+      toolCall: normalized.toolCall,
+      tools: normalized.operations,
+      url: normalized.baseUrl ?? "",
+    });
+  }
+
+  const normalized = normalizeMcpClientConnectionDefinition(value, message);
+  assertAuthenticatedDynamicInstanceKey(normalized.auth, normalized.instanceKey, message);
+  return omitUndefined({
+    approval: normalized.approval,
+    authorization: normalized.auth as ResolvedConnectionDefinition["authorization"],
+    connectionName: source.connectionName,
+    description: normalized.description,
+    exportName: source.exportName,
+    headers: normalized.headers,
+    instanceId: createConnectionInstanceId({
+      connectionName: source.connectionName,
+      instanceKey: normalized.instanceKey,
+      protocol,
+      sourceId: source.sourceId,
+      url: normalized.url,
+    }),
+    logicalPath: source.logicalPath,
+    protocol,
+    sourceId: source.sourceId,
+    sourceKind: "module" as const,
+    toolCall: normalized.toolCall,
+    protocolVersionDiscovery: normalized.protocolVersionDiscovery,
+    forwardPrincipal: normalized.forwardPrincipal,
+    tools: normalized.tools,
+    url: normalized.url,
+  });
+}
+
+function assertAuthenticatedDynamicInstanceKey(
+  authorization: unknown,
+  instanceKey: string | undefined,
+  message: string,
+): void {
+  if (authorization === undefined || instanceKey !== undefined) return;
+  throw new Error(
+    `${message} Authenticated dynamic connections must set "instanceKey" to a stable, non-secret account or tenant identifier.`,
+  );
+}
+
+function omitUndefined<T extends Record<string, unknown>>(value: T): T {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
 }

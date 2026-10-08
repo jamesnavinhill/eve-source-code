@@ -5,11 +5,15 @@ import type { TrustedForwarders } from "#channel/forwarded-principal.js";
 import type { AuthFn } from "#public/channels/auth.js";
 import type { UploadPolicyInput } from "#public/channels/upload-policy.js";
 import type {
+  AudienceContext,
   Channel,
   ChannelContinuationOps,
   ChannelEvents,
   ChannelMethod,
 } from "#public/definitions/channel.js";
+import type { ChannelAudience } from "#shared/channel-audience.js";
+
+export type { ForwardedAssertion, TrustedForwarders } from "#channel/forwarded-principal.js";
 
 /**
  * Event-handler channel context exposed by `eveChannel({ events })`. The default eve HTTP channel
@@ -51,6 +55,8 @@ export type EveChannelCors = boolean | EveChannelCorsOptions;
 export interface EveHandle {
   /** Route-auth result for the request; `onMessage` chooses session auth by returning `{ auth }`. */
   readonly caller: SessionAuthContext | null;
+  /** Replay-stable identity of a trusted remote-subagent create operation. */
+  readonly invocation?: { readonly operationId: string };
   readonly request: Request;
   /** Existing runtime session id for follow-up requests. */
   readonly sessionId?: string;
@@ -68,7 +74,7 @@ export interface EveMessageContext {
 export type EveMessageResult = {
   readonly auth: SessionAuthContext | null;
   readonly context?: readonly string[];
-  /** Overrides the workflow run title without changing the message sent to the model. */
+  /** Sets the title when creating a workflow or sending its first message after prewarming. */
   readonly title?: string;
 };
 
@@ -95,22 +101,45 @@ export interface EveChannelInput {
    */
   readonly auth: AuthFn<Request> | readonly AuthFn<Request>[];
   /**
+   * Conversation audience classification, fixed when the session is created.
+   *
+   * By default, `user`, `service`, and `runtime` principals are `private`.
+   * Anonymous callers and every other principal type are `unknown`, which
+   * trace consumers treat as non-public.
+   *
+   * Pass a constant audience, or a function receiving the authenticated
+   * principal, channel, and deployment environment. Continuation
+   * turns from a different caller do not reclassify an existing session.
+   */
+  readonly audience?:
+    | ChannelAudience
+    | ((input: Omit<AudienceContext<undefined>, "state">) => ChannelAudience);
+  /**
    * The trusted-forwarders policy: which transport-authenticated callers may
-   * assert a forwarded principal on the create-session or continuation route (the
-   * `forwardedPrincipal` body field a `defineRemoteAgent({ forwardPrincipal:
-   * true })` sender emits). The predicate receives the *verified* route-auth
-   * principal of the forwarder — who is asserting, never what is asserted —
-   * and must match it precisely (for example
+   * assert a forwarded principal, callback-marked public trace audience, or
+   * remote parent lineage. The predicate receives the *verified* route-auth
+   * principal of the forwarder and must match it precisely (for example
    * `(forwarder) => forwarder.subject === vercelSubject({ teamSlug, projectName })`).
-   * A permissive predicate lets any authenticated forwarder assert any
-   * principal.
+   * A permissive predicate lets any authenticated forwarder assert any principal,
+   * public trace audience, or remote lineage.
+   *
+   * The second argument carries what the forwarder asserts. `assertion.principal`
+   * holds the stamped `current` and `initiator` contexts the forwarder asserts,
+   * so a receiver can limit a forwarder to the identities it may speak for, such as
+   * one authenticator and issuer. `initiator` takes effect only on session
+   * creation; on continuation it is the asserted value, not the session's pinned
+   * initiator. `assertion.principal` is absent when the predicate decides remote
+   * parent lineage for a request that forwards no principal.
    *
    * When a trusted forwarder's assertion is accepted on session creation, the
    * forwarded principal replaces `session.auth.current` and
    * `session.auth.initiator`. On continuation, only `session.auth.current`
    * changes; the initiator remains pinned to the session's creator. The
    * forwarder is recorded on accepted contexts as the `eve:forwarded-by`
-   * attribute. Omit the option to reject every forwarded assertion with 403.
+   * attribute. An accepted public audience is evaluated by this deployment's
+   * trace policies; the default records model and tool content. Omit the option
+   * to reject forwarded principals with 403 and ignore forwarded audience and
+   * remote lineage.
    */
   readonly trustedForwarders?: TrustedForwarders;
   /**
@@ -128,7 +157,9 @@ export interface EveChannelInput {
   readonly turnPolicy?: TurnPolicy;
   /**
    * Pre-dispatch hook for inbound eve HTTP messages. Runs after route auth and body
-   * parsing, before runtime dispatch.
+   * parsing, before runtime dispatch. Message-free creation skips this hook and
+   * parks before session initialization. The first message supplies auth and context
+   * for initialization and its first turn.
    */
   readonly onMessage?: (
     ctx: EveMessageContext,

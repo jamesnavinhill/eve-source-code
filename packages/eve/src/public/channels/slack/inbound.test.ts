@@ -6,6 +6,7 @@ import {
   parseDirectMessageEvent,
   parseMessageEvent,
   parseSlackEventEnvelope,
+  slackEventReceivingBotUserId,
   slackEventInstallationTeamId,
   slackMessageFromWebhookPayload,
 } from "#public/channels/slack/inbound.js";
@@ -80,6 +81,25 @@ describe("slackEventInstallationTeamId", () => {
     expect(
       slackEventInstallationTeamId(envelope([{ is_bot: false, team_id: "T_INSTALLATION" }])),
     ).toBe("T_INSTALLATION");
+  });
+});
+
+describe("slackEventReceivingBotUserId", () => {
+  it("accepts an unflagged authorization only when the app mention names the same user", () => {
+    expect(
+      slackEventReceivingBotUserId({
+        authorizations: [{ user_id: "U_BOT" }],
+        event: { text: "<@U_BOT> investigate", type: "app_mention" },
+        type: "event_callback",
+      }),
+    ).toBe("U_BOT");
+    expect(
+      slackEventReceivingBotUserId({
+        authorizations: [{ is_bot: false, user_id: "U_INSTALLER" }],
+        event: { text: "<@U_INSTALLER> and <@U_BOT>", type: "app_mention" },
+        type: "event_callback",
+      }),
+    ).toBeUndefined();
   });
 });
 
@@ -190,7 +210,7 @@ describe("parseAppMentionEvent", () => {
 });
 
 describe("parseMessageEvent", () => {
-  it("preserves bot and subtype message events for onMessage", () => {
+  it("preserves bot messages for onMessage", () => {
     const bot = parseMessageEvent({
       type: "event_callback",
       event: {
@@ -202,20 +222,33 @@ describe("parseMessageEvent", () => {
         ts: "2.0",
       },
     });
-    const subtype = parseMessageEvent({
-      type: "event_callback",
-      event: {
-        type: "message",
-        subtype: "message_changed",
-        text: "edited",
-        channel: "C01",
-        ts: "3.0",
-      },
-    });
 
     expect(bot?.author?.isBot).toBe(true);
-    expect(subtype?.raw.subtype).toBe("message_changed");
   });
+
+  it.each(["bot_message", "file_share", "me_message", "thread_broadcast"])(
+    "keeps the posted-message subtype %s",
+    (subtype) => {
+      const message = parseMessageEvent({
+        type: "event_callback",
+        event: { type: "message", subtype, user: "U01", text: "hi", channel: "C01", ts: "2.0" },
+      });
+
+      expect(message?.raw.subtype).toBe(subtype);
+    },
+  );
+
+  it.each(["message_changed", "message_deleted", "channel_join"])(
+    "drops the system subtype %s",
+    (subtype) => {
+      const message = parseMessageEvent({
+        type: "event_callback",
+        event: { type: "message", subtype, text: "edited", channel: "C01", ts: "3.0" },
+      });
+
+      expect(message).toBeNull();
+    },
+  );
 });
 
 describe("parseDirectMessageEvent", () => {
@@ -414,6 +447,39 @@ describe("parseDirectMessageEvent", () => {
       },
     ]);
   });
+
+  it.each(["is_share", "is_msg_unfurl", "is_reply_unfurl"])(
+    "includes an app mention's %s attachment",
+    (sharedMessageFlag) => {
+      const payload = parseSlackWebhookBody(
+        JSON.stringify({
+          type: "event_callback",
+          team_id: "T01",
+          event: {
+            type: "app_mention",
+            user: "U01",
+            text: "<@U123> :eyes:",
+            channel: "C01",
+            ts: "1700000000.000200",
+            attachments: [
+              {
+                [sharedMessageFlag]: true,
+                text: "Ship it",
+                from_url: "https://example.slack.com/archives/C02/p1700000000000100",
+              },
+            ],
+          },
+        }),
+      );
+      expect(payload.kind).toBe("app_mention");
+      if (payload.kind !== "app_mention") throw new Error("expected app_mention");
+
+      const message = slackMessageFromWebhookPayload(payload);
+
+      expect(message?.text).toBe("<@U123> :eyes:\nShip it");
+      expect(message?.markdown).toContain("Ship it");
+    },
+  );
 });
 
 describe("Block Kit inbound markdown", () => {
@@ -483,6 +549,24 @@ describe("Block Kit inbound markdown", () => {
     expect(message?.markdown).toContain("Service");
     expect(message?.markdown).toContain("api");
     expect(message?.markdown).toContain("CI Bot");
+  });
+
+  it("keeps a short link preview alongside a question in the model-visible markdown", () => {
+    const message = parseMessageEvent({
+      type: "event_callback",
+      event: {
+        type: "message",
+        user: "U01",
+        text: "Can you check this alert? <https://x/a>",
+        channel: "C01",
+        ts: "1234567890.123458",
+        attachments: [{ title: "Grafana Alerts", text: "[FIRING:12] parse errors" }],
+      },
+    });
+
+    expect(message?.markdown).toContain("Can you check this alert?");
+    expect(message?.markdown).toContain("Grafana Alerts");
+    expect(message?.markdown).toContain("[FIRING:12] parse errors");
   });
 
   it("keeps plain top-level text when there are no blocks or attachments", () => {

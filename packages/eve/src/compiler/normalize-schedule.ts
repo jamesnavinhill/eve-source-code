@@ -3,11 +3,9 @@ import type { ScheduleSourceRef } from "#discover/manifest.js";
 import { normalizeScheduleDefinition } from "#internal/authored-definition/core.js";
 import type { ScheduleDefinition } from "#public/definitions/schedule.js";
 import type { CompiledScheduleDefinition } from "#compiler/manifest.js";
-import {
-  loadModuleBackedDefinition,
-  requireModuleBackedDefinitionLoadOptions,
-  type SourceDefinitionCompileOptions,
-} from "#compiler/normalize-helpers.js";
+import { readWorkflowFunctionId } from "#internal/workflow/reference.js";
+import { workflowCallbackErrorMessage } from "#shared/workflow-tool-context.js";
+import type { AgentSourceOwner } from "#compiler/source-graph.js";
 
 /**
  * Compiles one authored schedule into the normalized shape consumed by
@@ -20,25 +18,22 @@ import {
  * path under `schedules/` minus the extension
  * (`schedules/billing/invoice-sweep.ts` → `"billing/invoice-sweep"`).
  */
-export async function compileScheduleDefinition(
+export function compileScheduleDefinition(
   _agentRoot: string,
   source: ScheduleSourceRef,
-  options: SourceDefinitionCompileOptions,
-): Promise<CompiledScheduleDefinition> {
-  const definition: ScheduleDefinition =
+  value: unknown,
+  owner: AgentSourceOwner,
+): CompiledScheduleDefinition {
+  const definition: ScheduleDefinition = normalizeScheduleDefinition(
+    value,
     source.sourceKind === "markdown"
-      ? normalizeScheduleDefinition(
-          source.definition,
-          `Expected the compiled schedule definition at "${source.logicalPath}" to match the public eve shape.`,
-        )
-      : normalizeScheduleDefinition(
-          await loadModuleBackedDefinition({
-            ...requireModuleBackedDefinitionLoadOptions(options, source.logicalPath),
-            kind: "schedule",
-            source,
-          }),
-          `Expected the schedule export "${source.exportName ?? "default"}" from "${source.logicalPath}" to match the public eve shape.`,
-        );
+      ? `Expected the compiled schedule definition at "${source.logicalPath}" to match the public eve shape.`
+      : `Expected the schedule export "${source.exportName ?? "default"}" from "${source.logicalPath}" to match the public eve shape.`,
+  );
+
+  if (readWorkflowFunctionId(definition.run) !== undefined) {
+    throw new Error(`${source.logicalPath}: ${workflowCallbackErrorMessage("schedule")}`);
+  }
 
   const compiled = {
     cron: definition.cron,
@@ -56,7 +51,7 @@ export async function compileScheduleDefinition(
 
   return source.sourceKind === "module"
     ? { ...withMarkdown, sourceKind: "module" }
-    : { ...withMarkdown, owner: options.owner, sourceKind: "markdown" };
+    : { ...withMarkdown, owner, sourceKind: "markdown" };
 }
 
 function deriveScheduleName(logicalPath: string): string {

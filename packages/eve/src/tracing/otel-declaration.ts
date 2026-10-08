@@ -1,4 +1,5 @@
 import type {
+  MetricReader,
   PropagatorOrName,
   SamplerOrName,
   SpanExporter,
@@ -10,28 +11,22 @@ import { PROVIDER, type InstrumentationProvider } from "#public/instrumentation/
 import type { InstrumentationRuntimeContextInput } from "#public/instrumentation/index.js";
 import type { JsonObject } from "#shared/json.js";
 import { batchSpanProcessor } from "#tracing/batch-span-processor.js";
-import type { ResolvedContentOptions } from "#tracing/content-attributes.js";
 import { contentFilteringProcessor } from "#tracing/content-span-processor.js";
 import { vercelRuntimeSpanProcessor } from "#tracing/vercel-runtime-span-exporter.js";
-import type { ChannelAudience } from "#shared/channel-audience.js";
-import {
-  composeSpanExportPolicies,
-  redactSpanInputs,
-  redactSpanOutputs,
-  type SpanExportPolicy,
-} from "#tracing/span-export-policy.js";
+import type { TraceCapturePolicy } from "#shared/trace-policy.js";
+export type {
+  TraceCaptureContext,
+  TraceCapturePolicy,
+  TracePolicyDecision,
+} from "#shared/trace-policy.js";
+import type { SpanExportPolicy } from "#tracing/span-export-policy.js";
 
 export type {
   SpanAttributeDecision,
   SpanExportAttributeValue,
   SpanExportContext,
+  SpanExportDecision,
   SpanExportPolicy,
-  SpanExportPredicate,
-} from "#tracing/span-export-policy.js";
-export {
-  composeSpanExportPolicies,
-  redactSpanInputs,
-  redactSpanOutputs,
 } from "#tracing/span-export-policy.js";
 
 /**
@@ -42,10 +37,6 @@ export {
  * set. Destinations are the plural half and live in `otelIntegration()`.
  *
  * `contextManager` is deliberately absent: eve's span nesting depends on it.
- * `instrumentations` is accepted so providers can opt into Node auto-
- * instrumentations (e.g. `@opentelemetry/auto-instrumentations-node`); the
- * packages patch modules eve already imported, so their effects are limited
- * to code loaded after registration.
  */
 export interface OtelOptions {
   /**
@@ -54,14 +45,26 @@ export interface OtelOptions {
    */
   readonly functionId?: string;
   /**
-   * Whether to emit the inbound HTTP `SERVER` span that wraps each channel
-   * request — the parent of the turn trace and of any `hook.resume` or
-   * outgoing HTTP spans. Defaults to `false`.
+   * Whether to emit an eve-owned HTTP `SERVER` span around each channel
+   * request. For a one-to-one delivery, the activation remains a separate
+   * trace root and links to this span; when disabled, it links to any
+   * already-active upstream request or function span instead. Defaults to
+   * `false`.
    */
   readonly traceChannelRequests?: boolean;
   /**
-   * Process-wide head gate for an agent session trace. Defaults to retaining
-   * only public conversations. A thrown error rejects the trace.
+   * Process-wide trace and content decision. Boolean returns preserve the
+   * existing audience-aware behavior; explicit decisions can disable emission
+   * or select input and output capture independently. Defaults to emitting
+   * every audience, with content only for public conversations. The result is
+   * an OpenTelemetry capture ceiling: local delivery audience and destination
+   * settings can only narrow it. For a trusted remote trace, eve evaluates this
+   * policy against the immutable origin audience and intersects it with the
+   * parent's effective ceiling, so every hop can only narrow capture. It never
+   * changes what lifecycle instrumentation receives. A thrown error rejects trace production without
+   * silencing lifecycle providers. The policy may be invoked more than once
+   * while a new session is being prepared, so it must be deterministic for
+   * consistent results.
    */
   readonly tracePolicy?: TraceCapturePolicy;
   /**
@@ -80,44 +83,32 @@ export interface OtelOptions {
   readonly propagators?: readonly PropagatorOrName[];
   /**
    * OpenTelemetry `Instrumentation` instances passed through to
-   * `registerOTel`. Use them to patch Node.js built-ins (HTTP, DNS, fs, etc.)
-   * for automatic spans around outbound work. Disabled by default because eve
-   * already imports the model SDK before registration, so patching cannot
-   * reach it — but code loaded after registration (tool modules, connection
-   * clients) will be instrumented.
+   * `registerOTel` before the server entry loads. Disabled by default.
+   * Keep packages that rely on Node.js module hooks in
+   * `build.externalDependencies` and out of instrumentation modules' import
+   * graphs so they load after registration.
    */
   readonly instrumentations?: readonly unknown[];
 }
 
 export interface ManagedTraceOptions {
-  /** Destination policy applied before spans are exported. */
-  readonly exportPolicy?: SpanExportPolicy;
-  /** @deprecated Use `exportPolicy: redactSpanInputs()` instead. */
-  readonly recordInputs?: boolean;
-  /** @deprecated Use `exportPolicy: redactSpanOutputs()` instead. */
-  readonly recordOutputs?: boolean;
+  /** One destination policy, or policies applied in declaration order before export. */
+  readonly exportPolicy?: SpanExportPolicy | readonly SpanExportPolicy[];
 }
 
-/** @deprecated Compose `redactSpanInputs()` and `redactSpanOutputs()` into an export policy. */
-export interface ContentOptions {
-  readonly recordInputs?: boolean;
-  readonly recordOutputs?: boolean;
-}
-
-export interface TraceCaptureContext {
-  readonly agentName?: string;
-  readonly audience: ChannelAudience;
-  readonly channelType?: string;
-}
-
-export type TraceCapturePolicy = (trace: TraceCaptureContext) => boolean;
-
-/** Where one `otelIntegration()` sends spans. */
-export interface OtelIntegrationOptions extends ContentOptions {
+/** Where one `otelIntegration()` sends spans and metrics. */
+export interface OtelIntegrationOptions extends ManagedTraceOptions {
   /** Merged into the pipeline in declaration order. */
   readonly spanProcessors?: readonly SpanProcessor[];
   /** Wrapped in eve's batching processor and appended after `spanProcessors`. */
   readonly traceExporter?: SpanExporter;
+  /**
+   * Metric readers collected into the process's one meter provider in
+   * declaration order. Without any, the meter provider is not created and
+   * `metrics.getMeter()` returns a no-op meter. Readers come from the app's
+   * own `@opentelemetry/sdk-metrics` install.
+   */
+  readonly metricReaders?: readonly MetricReader[];
   /**
    * Contributes runtime context that the AI SDK merges into telemetry spans
    * for each model call. Child spans inherit the values, so a destination can
@@ -146,8 +137,7 @@ export interface OtelDeclaration extends InstrumentationProvider {
 /** One declared destination. A process may have as many as it has files. */
 export interface OtelIntegration extends InstrumentationProvider {
   readonly [OTEL_INTEGRATION]: true;
-  /** @deprecated Content is captured upstream and redacted by destination policies. */
-  readonly content: ResolvedContentOptions;
+  readonly metricReaders: readonly MetricReader[];
   readonly runtimeContext?: (input: InstrumentationRuntimeContextInput) => JsonObject | undefined;
   readonly spanProcessors: readonly SpanProcessorOrName[];
 }
@@ -178,16 +168,12 @@ export function otelIntegration(options: OtelIntegrationOptions = {}): OtelInteg
 }
 
 /** @internal Local and Agent Runs destination declaration. */
-export function managedOtelIntegration(
-  options: OtelIntegrationOptions & ManagedTraceOptions = {},
-): OtelIntegration {
-  return createOtelIntegration(options, options.exportPolicy);
+export function managedOtelIntegration(options: OtelIntegrationOptions = {}): OtelIntegration {
+  return createOtelIntegration(options);
 }
 
-function createOtelIntegration(
-  options: OtelIntegrationOptions,
-  exportPolicy?: SpanExportPolicy,
-): OtelIntegration {
+function createOtelIntegration(options: OtelIntegrationOptions): OtelIntegration {
+  assertNoRemovedContentOptions(options);
   const declared = options.spanProcessors ?? [];
   const spanProcessors =
     options.traceExporter === undefined
@@ -197,53 +183,30 @@ function createOtelIntegration(
   return {
     [OTEL_INTEGRATION]: true,
     [PROVIDER]: true,
-    content: resolveContentOptions(options),
+    metricReaders: options.metricReaders ?? [],
     runtimeContext: options.runtimeContext,
     spanProcessors: spanProcessors.map((processor) =>
-      withExportPolicies(processor, legacyContentRedactionPolicy(options), exportPolicy),
+      contentFilteringProcessor(processor, options.exportPolicy),
     ),
   };
 }
 
-/** Vercel Agent Runs through the production request-context transport. @internal */
+/** Vercel Agent Runs through the hosted request-context transport. @internal */
 export function agentRunsIntegration(options: ManagedTraceOptions = {}): OtelIntegration {
+  assertNoRemovedContentOptions(options);
   return {
     [OTEL_INTEGRATION]: true,
     [PROVIDER]: true,
-    content: resolveContentOptions(options),
-    spanProcessors: [
-      withExportPolicies(
-        vercelRuntimeSpanProcessor(),
-        legacyContentRedactionPolicy(options),
-        options.exportPolicy,
-      ),
-    ],
+    metricReaders: [],
+    spanProcessors: [contentFilteringProcessor(vercelRuntimeSpanProcessor(), options.exportPolicy)],
   };
 }
 
-function legacyContentRedactionPolicy(options: ContentOptions): SpanExportPolicy | undefined {
-  const policies: SpanExportPolicy[] = [];
-  if (options.recordInputs === false) policies.push(redactSpanInputs());
-  if (options.recordOutputs === false) policies.push(redactSpanOutputs());
-  return policies.length === 0 ? undefined : composeSpanExportPolicies(...policies);
-}
-
-export function resolveContentOptions(options: ContentOptions): ResolvedContentOptions {
-  return {
-    recordInputs: options.recordInputs !== false,
-    recordOutputs: options.recordOutputs !== false,
-  };
-}
-
-function withExportPolicies(
-  downstream: SpanProcessor,
-  ...policies: readonly (SpanExportPolicy | undefined)[]
-): SpanProcessor {
-  let processor = downstream;
-  for (const policy of policies.toReversed()) {
-    processor = contentFilteringProcessor(processor, policy);
-  }
-  return processor;
+function assertNoRemovedContentOptions(options: object): void {
+  if (!Object.hasOwn(options, "recordInputs") && !Object.hasOwn(options, "recordOutputs")) return;
+  throw new Error(
+    "OpenTelemetry destination options no longer support `recordInputs` or `recordOutputs`. Use an `exportPolicy` span decision with `{ redact: true, inputs: true }`, `{ redact: true, outputs: true }`, or both.",
+  );
 }
 
 export function isOtelDeclaration(value: unknown): value is OtelDeclaration {
@@ -265,6 +228,7 @@ export function isOtelIntegration(value: unknown): value is OtelIntegration {
 /** The one pipeline a process can register. @internal */
 export interface OtelPipeline {
   readonly instrumentations?: readonly unknown[];
+  readonly metricReaders?: readonly MetricReader[];
   readonly propagators?: readonly PropagatorOrName[];
   readonly resource?: Readonly<Record<string, unknown>>;
   readonly sampler?: SamplerOrName;
@@ -276,9 +240,10 @@ export interface OtelHarnessSettings {
   readonly functionId?: string;
   readonly traceChannelRequests: boolean;
   readonly tracePolicy?: TraceCapturePolicy;
-  /** Legacy `defineInstrumentation()` capture settings. Provider destinations capture fully. */
-  readonly recordInputs?: boolean;
-  readonly recordOutputs?: boolean;
+  /** Whether AI SDK spans include model and tool inputs. */
+  readonly recordInputs: boolean;
+  /** Whether AI SDK spans include model and tool outputs. */
+  readonly recordOutputs: boolean;
 }
 
 /** @internal */
@@ -310,6 +275,7 @@ export interface CollectedOtel {
  */
 export function collectOtelPipeline(values: readonly unknown[]): CollectedOtel {
   const spanProcessors: SpanProcessorOrName[] = [];
+  const metricReaders: MetricReader[] = [];
   const runtimeContextResolvers: RuntimeContextResolver[] = [];
   let declaration: OtelDeclaration | undefined;
   let declared = false;
@@ -320,6 +286,7 @@ export function collectOtelPipeline(values: readonly unknown[]): CollectedOtel {
       declared = true;
       capturesContent = true;
       spanProcessors.push(...value.spanProcessors);
+      metricReaders.push(...value.metricReaders);
       if (value.runtimeContext !== undefined) {
         runtimeContextResolvers.push(value.runtimeContext);
       }
@@ -349,6 +316,7 @@ export function collectOtelPipeline(values: readonly unknown[]): CollectedOtel {
     declared,
     pipeline: {
       instrumentations: options.instrumentations,
+      metricReaders: metricReaders.length > 0 ? metricReaders : undefined,
       propagators: options.propagators,
       resource: options.resource,
       sampler: options.sampler,

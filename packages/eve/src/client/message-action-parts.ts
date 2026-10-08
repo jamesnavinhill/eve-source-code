@@ -1,7 +1,7 @@
+import { actionRequestName } from "#shared/action-request-name.js";
 import type { RuntimeActionRequest, RuntimeActionResult } from "#shared/action-types.js";
 import type { InputRequest } from "#shared/input.js";
 import type {
-  EveDynamicToolPart,
   EveMessageInputRequest,
   EveMessageToolMetadata,
 } from "#client/message-reducer-types.js";
@@ -13,7 +13,7 @@ import type {
  * plain tool calls onto a single `dynamic-tool` UI part; this descriptor is the
  * shared shape those variants collapse to before rendering.
  */
-export interface ActionDescriptor {
+interface ActionDescriptor {
   readonly kind: "load-skill" | "subagent-call" | "tool-call";
   readonly name: string;
   readonly toolName: string;
@@ -69,56 +69,18 @@ export function mergeToolMetadata(
   };
 }
 
-/**
- * Derives the approved-approval descriptor a resolved tool result carries
- * forward, or `undefined` when the tool part never had an approval.
- */
-export function approvedApproval(part: EveDynamicToolPart | undefined):
-  | {
-      readonly id: string;
-      readonly approved: true;
-      readonly reason?: string;
-      readonly isAutomatic?: boolean;
-    }
-  | undefined {
-  if (!part?.approval?.id) {
-    return undefined;
-  }
-  return {
-    approved: true,
-    id: part.approval.id,
-    isAutomatic: part.approval.isAutomatic,
-    reason: part.approval.reason,
-  };
-}
-
 /** Maps a runtime action request onto its normalized tool descriptor. */
 export function normalizeActionRequest(action: RuntimeActionRequest): ActionDescriptor {
+  const name = actionRequestName(action);
   switch (action.kind) {
     case "load-skill":
-      return {
-        kind: "load-skill",
-        name: "load_skill",
-        toolName: "eve:load-skill",
-      };
+      return { kind: "load-skill", name, toolName: "eve:load-skill" };
     case "tool-call":
-      return {
-        kind: "tool-call",
-        name: action.toolName,
-        toolName: action.toolName,
-      };
+    case "workflow-tool-call":
+      return { kind: "tool-call", name, toolName: name };
     case "subagent-call":
-      return {
-        kind: "subagent-call",
-        name: action.subagentName,
-        toolName: `eve:subagent:${action.subagentName}`,
-      };
     case "remote-agent-call":
-      return {
-        kind: "subagent-call",
-        name: action.remoteAgentName,
-        toolName: `eve:subagent:${action.remoteAgentName}`,
-      };
+      return { kind: "subagent-call", name, toolName: `eve:subagent:${name}` };
   }
 }
 

@@ -1,3 +1,7 @@
+import {
+  sessionCommandHookToken,
+  sessionInboxHookToken,
+} from "#execution/session-inbox/address.js";
 /**
  * Authorization request/result API for tool execution.
  *
@@ -33,7 +37,7 @@
 
 import { loadContext } from "#context/container.js";
 import { ContextKey } from "#context/key.js";
-import { SessionIdKey } from "#context/keys.js";
+import { SessionIdKey, type SessionAuthContext } from "#context/keys.js";
 import { createWorkflowCallbackUrl } from "#execution/workflow-callback-url.js";
 import type { ConnectionAuthorizationChallenge } from "#connections/errors.js";
 import type { AuthorizationCallback, ConnectionPrincipal } from "#shared/connection-types.js";
@@ -52,11 +56,27 @@ export interface AuthorizationChallenge {
   /** Opaque identity of this exact authorization attempt. */
   readonly attemptId?: string;
   readonly candidateId?: string;
+  /**
+   * Credential this sign-in grants, shared by every scope that uses it (the
+   * Vercel Connect connector). Attempts for the same grant and principal are
+   * one sign-in, so only one is shown.
+   */
+  readonly grant?: string;
+  /** Opaque resolved connection identity; omitted for tool-hosted authorization. */
+  readonly instanceId?: string;
   readonly name: string;
   readonly challenge: ConnectionAuthorizationChallenge;
   readonly hookUrl: string;
   /** Principal passed to `startAuthorization`; omitted from model-facing copies. */
   readonly principal?: ConnectionPrincipal;
+  /** Session principal that started this attempt; projected onto authorization events. */
+  readonly principalId?: string;
+  /**
+   * Session identity that started this attempt. The callback carries no
+   * identity, so the resumed turn runs as this caller. Never projected onto
+   * events or model-facing output.
+   */
+  readonly requester?: SessionAuthContext;
   /**
    * Opaque resume value from the strategy's `startAuthorization`,
    * journaled across the park. Absent for provider-owned flows.
@@ -80,6 +100,7 @@ export interface AuthorizationPendingModelOutput {
 
 export interface AuthorizationResult {
   readonly attemptId?: string;
+  readonly instanceId?: string;
   readonly resume?: JsonValue;
   readonly callback: AuthorizationCallback;
   readonly hookUrl: string;
@@ -104,26 +125,6 @@ export function requestAuthorization(
 }
 
 /**
- * Returns a copy of `signal` with each challenge's `resume` value stripped.
- *
- * Used for the copy the AI SDK records as a tool output. The shape stays a
- * valid {@link AuthorizationSignal} so every `isAuthorizationSignal` consumer
- * still detects it; the park detector reads the full challenges from the
- * harness's out-of-band stash.
- */
-export function redactSignalResume(signal: AuthorizationSignal): AuthorizationSignal {
-  return requestAuthorization(
-    signal.challenges.map((entry) => ({
-      attemptId: entry.attemptId,
-      candidateId: entry.candidateId,
-      name: entry.name,
-      challenge: entry.challenge,
-      hookUrl: entry.hookUrl,
-    })),
-  );
-}
-
-/**
  * Reads the authorization callback on resume. Returns `undefined` if
  * not resuming from an authorization request.
  *
@@ -137,6 +138,11 @@ export function getAuthorizationResult(name?: string): AuthorizationResult | und
   return results.find((r) => r.name === name);
 }
 
+/** Returns every callback result available to the active step. */
+export function getAuthorizationResults(): readonly NamedAuthorizationResult[] {
+  return loadContext().get(PendingAuthorizationResultKey) ?? [];
+}
+
 /**
  * Removes and returns one authorization callback result.
  *
@@ -144,12 +150,26 @@ export function getAuthorizationResult(name?: string): AuthorizationResult | und
  * before completion prevents a failed or replayed callback from poisoning
  * every later tool call in the same step.
  */
-export function consumeAuthorizationResult(name: string): AuthorizationResult | undefined {
+export function consumeAuthorizationResult(
+  name: string,
+  instanceId?: string,
+): AuthorizationResult | undefined {
   const ctx = loadContext();
   const results = ctx.get(PendingAuthorizationResultKey);
   if (!results || results.length === 0) return undefined;
 
-  const index = results.findIndex((result) => result.name === name);
+  const index = results.findIndex(
+    (result) => result.name === name && result.instanceId === instanceId,
+  );
+  if (
+    index === -1 &&
+    instanceId !== undefined &&
+    results.some((result) => result.name === name && result.instanceId !== undefined)
+  ) {
+    throw new Error(
+      `Authorization for "${name}" cannot complete because its resolved connection changed while sign-in was pending. Start sign-in again.`,
+    );
+  }
   if (index === -1) return undefined;
 
   const result = results[index]!;
@@ -165,18 +185,19 @@ export function consumeAuthorizationResult(name: string): AuthorizationResult | 
  * Builds a callback URL for external systems. `name` and `attemptId` identify
  * the exact challenge in the URL path.
  *
- * The URL embeds the session's authorization hook token (`${sessionId}:auth`).
- * It is independent of the continuation token, so channel re-keying mid-turn
+ * By default the URL embeds the session's stable inbox token.
+ * A runtime with its own continuation supplies that hook through AuthorizationHookKey.
+ * It is independent of the continuation token, so channel aliasing mid-turn
  * does not invalidate the callback URL.
  *
- * Returns `undefined` if the session context isn't available.
+ * Returns `undefined` if no callback address is available.
  */
 export function getHookUrl(name: string, attemptId: string): string | undefined {
   const ctx = loadContext();
   const sessionId = ctx.get(SessionIdKey);
   const baseUrl = ctx.get(CallbackBaseUrlKey);
-  if (!sessionId || !baseUrl) return undefined;
-  const token = authHookToken(sessionId);
+  const token = ctx.get(AuthorizationHookKey) ?? (sessionId ? authHookToken(sessionId) : undefined);
+  if (!token || !baseUrl) return undefined;
   return createWorkflowCallbackUrl(
     baseUrl,
     createEveConnectionCallbackRoutePath(name, attemptId, token),
@@ -246,12 +267,12 @@ export function isPendingAuthorizationToolOutput(value: unknown): boolean {
 }
 
 /**
- * Deterministic hook token for all authorization callbacks in a
- * session. Both {@link getHookUrl} (inside tool execution) and the
- * workflow body (which creates the hook upfront) use this token.
+ * Physical hook token embedded in a session's authorization callback URLs.
+ * The callback route resumes exactly this hook, so it is the stable inbox's
+ * physical address rather than its logical session token.
  */
 export function authHookToken(sessionId: string): string {
-  return `${sessionId}:auth`;
+  return sessionInboxHookToken(sessionCommandHookToken(sessionId));
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +294,9 @@ export const PendingAuthorizationResultKey = new ContextKey<readonly NamedAuthor
  */
 export const CallbackBaseUrlKey = new ContextKey<string>("eve.callbackBaseUrl");
 
+/** Hook token of a runtime that owns its callback instead of using the session hook. */
+export const AuthorizationHookKey = new ContextKey<string>("eve.authorizationHook");
+
 // ---------------------------------------------------------------------------
 // Session state persistence (internal — used by framework only)
 // ---------------------------------------------------------------------------
@@ -287,32 +311,61 @@ export function setPendingAuthorization(
   sessionState: Record<string, unknown> | undefined,
   value: PendingAuthorizationState,
 ): Record<string, unknown> {
-  const previous = getPendingAuthorization(sessionState)?.challenges ?? [];
-  const superseded = getSupersededAuthorizationChallenges(sessionState, value.challenges);
   return {
     ...sessionState,
     [PENDING_AUTHORIZATION_KEY]: {
-      challenges: [
-        ...previous.filter((challenge) => !superseded.includes(challenge)),
-        ...value.challenges,
-      ],
+      challenges: withSignIns(
+        getPendingAuthorization(sessionState)?.challenges ?? [],
+        value.challenges,
+      ),
     },
   };
 }
 
-/** Existing same-scope attempts replaced by newer attempts for the same principal. */
-export function getSupersededAuthorizationChallenges(
-  sessionState: Record<string, unknown> | undefined,
+/** The pending sign-ins once `challenges` are asked for: each replaces the attempt it supersedes. */
+export function withSignIns(
+  previous: readonly AuthorizationChallenge[],
+  challenges: readonly AuthorizationChallenge[],
+): readonly AuthorizationChallenge[] {
+  const active = resolveActiveAuthorizationChallenges(challenges);
+  const superseded = supersededChallenges(previous, active);
+  return [...previous.filter((challenge) => !superseded.includes(challenge)), ...active];
+}
+
+/** Keeps the last challenge for each sign-in and principal. */
+export function resolveActiveAuthorizationChallenges(
+  challenges: readonly AuthorizationChallenge[],
+): readonly AuthorizationChallenge[] {
+  return challenges.filter(
+    (candidate, index) =>
+      !challenges.slice(index + 1).some((replacement) => sameSignIn(candidate, replacement)),
+  );
+}
+
+/** The attempts in `previous` that `replacements` replace: the same sign-in and principal. */
+export function supersededChallenges(
+  previous: readonly AuthorizationChallenge[],
   replacements: readonly AuthorizationChallenge[],
 ): readonly AuthorizationChallenge[] {
-  const previous = getPendingAuthorization(sessionState)?.challenges ?? [];
   return previous.filter((candidate) =>
-    replacements.some(
-      (replacement) =>
-        candidate.name === replacement.name &&
-        samePrincipal(candidate.principal, replacement.principal),
-    ),
+    replacements.some((replacement) => sameSignIn(candidate, replacement)),
   );
+}
+
+/**
+ * Same scope, or the same grant from another scope, such as two tools and a
+ * connection that all use one Vercel Connect connector. Approval sign-ins
+ * stay per candidate because each one settles its own approval.
+ */
+function sameSignIn(
+  left: Pick<AuthorizationChallenge, "candidateId" | "grant" | "name" | "principal">,
+  right: Pick<AuthorizationChallenge, "candidateId" | "grant" | "name" | "principal">,
+): boolean {
+  const sameGrant =
+    left.grant !== undefined &&
+    left.grant === right.grant &&
+    left.candidateId === right.candidateId;
+  return (left.name === right.name || sameGrant) && samePrincipal(left.principal, right.principal);
 }
 
 function samePrincipal(
@@ -339,7 +392,7 @@ export function clearPendingAuthorization(
     if (pending !== undefined) {
       const completedAttemptIds = new Set(attemptIds);
       const challenges = pending.challenges.filter(
-        (challenge) => !completedAttemptIds.has(challenge.attemptId ?? challenge.name),
+        (challenge) => !completedAttemptIds.has(authorizationAttemptKey(challenge)),
       );
       if (challenges.length > 0) {
         return {
@@ -353,6 +406,10 @@ export function clearPendingAuthorization(
   const state = { ...sessionState };
   delete state[PENDING_AUTHORIZATION_KEY];
   return Object.keys(state).length > 0 ? state : undefined;
+}
+
+function authorizationAttemptKey(challenge: AuthorizationChallenge): string {
+  return challenge.attemptId ?? challenge.candidateId ?? challenge.name;
 }
 
 export function getPendingAuthorization(

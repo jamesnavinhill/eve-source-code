@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => {
     suspend: vi.fn(async () => undefined),
   };
   const mocksWorldInstance = {
+    reconcileExpiredRuns: vi.fn(async () => undefined),
     close: vi.fn(async () => undefined),
     handleRequest: vi.fn(async () => undefined),
     start: vi.fn(async () => undefined),
@@ -125,7 +126,6 @@ const mocks = vi.hoisted(() => {
     rm: vi.fn(async (path: string) => {
       files.delete(path);
     }),
-    startDevelopmentSandboxPrewarmInBackground: vi.fn(() => undefined),
     pruneLocalSandboxTemplatesInBackground: vi.fn(() => undefined),
     stopDevelopmentSandboxResources: vi.fn(async () => undefined),
     resolveDiscoveryProject: vi.fn(async () => ({
@@ -199,22 +199,18 @@ vi.mock("#discover/project.js", () => ({
   resolveDiscoveryProject: mocks.resolveDiscoveryProject,
 }));
 
-vi.mock("#internal/nitro/routes/runtime-artifacts.js", () => ({
-  resolveNitroCompiledArtifactsSource: mocks.resolveNitroCompiledArtifactsSource,
+vi.mock("#internal/nitro/host/artifacts-config.js", () => ({
+  createDevelopmentGenerationArtifactsSource: () => mocks.resolveNitroCompiledArtifactsSource(),
 }));
 
-vi.mock("#execution/sandbox/development-prewarm.js", () => ({
-  startDevelopmentSandboxPrewarmInBackground: mocks.startDevelopmentSandboxPrewarmInBackground,
+vi.mock("#execution/sandbox/bindings/local.js", () => ({
+  pruneLocalSandboxTemplatesInBackground: mocks.pruneLocalSandboxTemplatesInBackground,
+  stopDevelopmentSandboxResources: mocks.stopDevelopmentSandboxResources,
 }));
 
-vi.mock("#execution/sandbox/bindings/local.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("#execution/sandbox/bindings/local.js")>();
-
-  return {
-    ...actual,
-    pruneLocalSandboxTemplatesInBackground: mocks.pruneLocalSandboxTemplatesInBackground,
-    stopDevelopmentSandboxResources: mocks.stopDevelopmentSandboxResources,
-  };
+beforeEach(() => {
+  mocks.fsControl.stateReadError = undefined;
+  mocks.fsControl.stateWriteError = undefined;
 });
 
 const developmentServerStatePath = join("/tmp/eve-test", ".eve", "dev-server-state.v1.json");
@@ -310,46 +306,10 @@ describe("normalizeDevelopmentServerClientUrl", () => {
   });
 });
 
-describe("isActiveDevelopmentServerForApp", () => {
-  it("matches only this app's recorded healthy loopback server", async () => {
-    const { isActiveDevelopmentServerForApp } = await import("./start-development-server.js");
-    seedStateRecord({ url: "http://127.0.0.1:42123/" });
-    mocks.fetch.mockImplementation(async () => Response.json({ revision: "test" }));
-    vi.stubGlobal("fetch", mocks.fetch);
-
-    try {
-      await expect(
-        isActiveDevelopmentServerForApp({
-          appRoot: "/tmp/eve-test",
-          serverUrl: "http://127.0.0.1:42123/",
-        }),
-      ).resolves.toBe(true);
-      await expect(
-        isActiveDevelopmentServerForApp({
-          appRoot: "/tmp/eve-test",
-          serverUrl: "http://127.0.0.1:42124/",
-        }),
-      ).resolves.toBe(false);
-      mocks.fetch.mockResolvedValueOnce(new Response(null, { status: 200 }));
-      await expect(
-        isActiveDevelopmentServerForApp({
-          appRoot: "/tmp/eve-test",
-          serverUrl: "http://127.0.0.1:42123/",
-        }),
-      ).resolves.toBe(false);
-    } finally {
-      mocks.files.clear();
-      vi.unstubAllGlobals();
-    }
-  });
-});
-
 describe("createDevelopmentServer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.fetch.mockImplementation(async () => Response.json({ revision: "test" }));
-    mocks.fsControl.stateReadError = undefined;
-    mocks.fsControl.stateWriteError = undefined;
     mocks.authoredSourceWatcher.close.mockResolvedValue(undefined);
     mocks.authoredSourceWatcher.flush.mockResolvedValue(undefined);
     mocks.authoredSourceWatcher.rebuild.mockResolvedValue(undefined);
@@ -394,14 +354,8 @@ describe("createDevelopmentServer", () => {
 
     const server = await startDevelopmentServer("/tmp/eve-test");
 
-    expect(mocks.prepareDevelopmentApplicationHost).toHaveBeenCalledWith("/tmp/eve-test");
-    expect(mocks.startDevelopmentSandboxPrewarmInBackground).toHaveBeenCalledWith({
-      appRoot: "/tmp/eve-test",
-      compiledArtifactsSource: {
-        appRoot: "/tmp/eve-test/.eve/dev-runtime-test",
-        kind: "disk",
-        moduleMapLoaderPath: "/tmp/eve-package/authored-module-map-loader.ts",
-      },
+    expect(mocks.prepareDevelopmentApplicationHost).toHaveBeenCalledWith("/tmp/eve-test", {
+      developmentExtensions: { enabled: ["self-modification"] },
     });
     expect(mocks.pruneLocalSandboxTemplatesInBackground).toHaveBeenCalledWith("/tmp/eve-test");
     expect(mocks.createParentDevelopmentWorkflowWorld).toHaveBeenCalledWith(
@@ -603,6 +557,33 @@ describe("createDevelopmentServer", () => {
     await server.close();
   });
 
+  it("passes an acquisition lease through suspend and resume control requests", async () => {
+    const startDevelopmentServer = await loadStartDevelopmentServer();
+    const server = await startDevelopmentServer("/tmp/eve-test");
+
+    await callControlHandler(
+      "http://localhost/eve/v1/dev/runtime-artifacts/suspend?lease=install-1",
+      { method: "POST" },
+    );
+    await callControlHandler(
+      "http://localhost/eve/v1/dev/runtime-artifacts/resume?lease=install-1",
+      { method: "POST" },
+    );
+
+    expect(mocks.authoredSourceWatcher.suspend).toHaveBeenCalledWith("install-1");
+    expect(mocks.authoredSourceWatcher.resume).toHaveBeenCalledWith("install-1", {
+      silent: false,
+    });
+
+    const missingLease = await callControlHandler(
+      "http://localhost/eve/v1/dev/runtime-artifacts/suspend",
+      { method: "POST" },
+    );
+    expect(missingLease?.status).toBe(400);
+
+    await server.close();
+  });
+
   it("registers a host-owned runtime rebuild handler that forces the live watcher", async () => {
     const startDevelopmentServer = await loadStartDevelopmentServer();
     const server = await startDevelopmentServer("/tmp/eve-test");
@@ -683,7 +664,7 @@ describe("createDevelopmentServer", () => {
     await expect(startDevelopmentServer("/tmp/eve-test")).rejects.toThrow(
       [
         "A dev server is already running for this eve agent.",
-        "To connect to the existing instance, run: pnpm exec eve dev http://localhost:2000/",
+        "To connect to the existing instance, run: pnpm exec eve remote connect --url http://localhost:2000/",
       ].join("\n"),
     );
     expect(mocks.createDevelopmentApplicationNitro).not.toHaveBeenCalled();

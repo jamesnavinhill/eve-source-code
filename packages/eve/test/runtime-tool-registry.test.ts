@@ -45,6 +45,105 @@ describe("createRuntimeToolRegistry", () => {
     });
   });
 
+  it("carries root-session availability into the prepared tool descriptor", async () => {
+    const registry = await createRuntimeToolRegistry({
+      tools: [
+        createResolvedToolDefinition({
+          behavior: {
+            availability: ["root-session"],
+          },
+          logicalPath: "tools/root_only.ts",
+          name: "root_only",
+          sourceId: "tools/root_only.ts",
+        }),
+      ],
+    });
+
+    expect(registry.preparedTools[0]?.behavior).toEqual({
+      availability: ["root-session"],
+      handling: undefined,
+      presentation: undefined,
+    });
+  });
+
+  it("keeps authored workflow execution metadata grouped", async () => {
+    const workflowId = "workflow//./agent/tools/deploy//execute";
+    const registry = await createRuntimeToolRegistry({
+      tools: [
+        createResolvedToolDefinition({
+          behavior: {
+            availability: [],
+            handling: { entryPoint: "execute", kind: "workflow-tool", workflowId },
+          },
+          logicalPath: "tools/deploy.ts",
+          name: "deploy",
+          sourceId: "tools/deploy.ts",
+        }),
+      ],
+    });
+
+    expect(registry.preparedTools[0]).toMatchObject({
+      behavior: {
+        handling: { kind: "dispatch", target: { kind: "workflow-tool-call", workflowId } },
+      },
+    });
+    expect(registry.preparedTools[0]).not.toHaveProperty("workflowId");
+    expect(registry.preparedTools[0]).not.toHaveProperty("nodeId");
+    expect(registry.preparedTools[0]).not.toHaveProperty("resultKind");
+  });
+
+  it("keeps an authored workflow named agent separate from self-delegation", async () => {
+    const workflowId = "workflow//./agent/tools/agent//execute";
+    const registry = await createRuntimeToolRegistry({
+      tools: [
+        createResolvedToolDefinition({
+          behavior: {
+            availability: [],
+            handling: { entryPoint: "execute", kind: "workflow-tool", workflowId },
+          },
+          logicalPath: "tools/agent.ts",
+          name: "agent",
+          sourceId: "tools/agent.ts",
+        }),
+      ],
+    });
+
+    const prepared = registry.preparedTools[0];
+    expect(prepared?.behavior?.handling).toEqual({
+      kind: "dispatch",
+      target: { entryPoint: "execute", kind: "workflow-tool-call", workflowId },
+    });
+  });
+
+  it("prepares a restored application-owned agent tool as self-delegation", async () => {
+    const registry = await createRuntimeToolRegistry(
+      {
+        tools: [
+          createResolvedToolDefinition({
+            behavior: {
+              availability: ["root-session"],
+              handling: { action: "self-agent", kind: "dispatch" },
+            },
+            logicalPath: "tools/agent.ts",
+            name: "agent",
+            sourceId: "tools/agent.ts",
+          }),
+        ],
+      },
+      { nodeId: "__root__" },
+    );
+
+    const prepared = registry.preparedTools[0];
+    expect(prepared?.behavior?.handling).toEqual({
+      kind: "dispatch",
+      target: {
+        kind: "self-agent-call",
+        nodeId: "__root__",
+        subagentName: "agent",
+      },
+    });
+  });
+
   it("rejects duplicate authored tool names", async () => {
     await expect(
       createRuntimeToolRegistry({
@@ -85,13 +184,16 @@ describe("createRuntimeToolRegistry", () => {
 });
 
 function createResolvedToolDefinition(input: {
+  readonly behavior?: ResolvedToolDefinition["behavior"];
   readonly description?: string;
   readonly inputSchema?: ResolvedToolDefinition["inputSchema"];
   readonly logicalPath: string;
   readonly name: string;
+  readonly owner?: ResolvedToolDefinition["owner"];
   readonly sourceId: string;
 }): ResolvedToolDefinition {
   return {
+    behavior: input.behavior,
     inputSchema: input.inputSchema ?? null,
     description: input.description ?? "Get the weather.",
     execute(inputValue: unknown) {
@@ -99,7 +201,7 @@ function createResolvedToolDefinition(input: {
     },
     logicalPath: input.logicalPath,
     name: input.name,
-    owner: { kind: "application" },
+    owner: input.owner ?? { kind: "application" },
     sourceId: input.sourceId,
     sourceKind: "module",
   };

@@ -6,13 +6,14 @@ import { toErrorMessage } from "#shared/errors.js";
 import type { ModuleSourceRef } from "#shared/source-ref.js";
 import type { CompiledRuntimeModelCatalogLoader } from "#compiler/model-catalog.js";
 import {
+  type AgentModuleBinding,
   type AgentSourceRegistry,
-  type CompiledModuleBinding,
   type AgentSourceOwner,
+  type ProgrammaticModuleNamespace,
 } from "#compiler/source-graph.js";
 import type { CompiledBindingNamespaceLoader } from "#compiler/load-binding-namespace.js";
 
-const SANDBOX_PARENT_DEFINITION_MARKER = Symbol.for("eve.sandbox-parent-definition");
+const SANDBOX_SELECTOR_MARKER = Symbol.for("eve.sandbox-selector");
 
 /**
  * Shared compile-time context threaded through every per-primitive
@@ -28,12 +29,12 @@ export interface ManifestCompileContext {
 }
 
 export interface ModuleBackedDefinitionLoadOptions {
-  readonly binding: CompiledModuleBinding;
+  readonly binding: AgentModuleBinding;
   readonly loadNamespace: CompiledBindingNamespaceLoader;
 }
 
 export interface SourceDefinitionCompileOptions {
-  readonly binding?: CompiledModuleBinding;
+  readonly binding?: AgentModuleBinding;
   readonly loadNamespace?: CompiledBindingNamespaceLoader;
   readonly owner: AgentSourceOwner;
 }
@@ -58,7 +59,8 @@ export function requireModuleBackedDefinitionLoadOptions(
  * authored file failed.
  */
 export async function loadModuleBackedDefinition(input: {
-  readonly binding: CompiledModuleBinding;
+  readonly binding: AgentModuleBinding;
+  readonly dependencyNamespaces?: Readonly<Record<string, ProgrammaticModuleNamespace>>;
   readonly displayPath?: string;
   readonly kind: string;
   readonly loadNamespace: CompiledBindingNamespaceLoader;
@@ -72,12 +74,12 @@ export async function loadModuleBackedDefinition(input: {
   const moduleNamespace = await input.loadNamespace(input.source.sourceId);
   const exportValue = getAuthoredModuleExport(moduleNamespace, input.source);
 
-  // defineSandbox marks parent selectors so they remain distinguishable from
-  // zero-argument module factories without relying on JavaScript function arity.
+  // Sandbox selectors execute only when a runtime session opens its environment.
+  // Keep them distinguishable from zero-argument definition factories at compile time.
   if (
     input.kind === "sandbox" &&
     typeof exportValue === "function" &&
-    Reflect.get(exportValue, SANDBOX_PARENT_DEFINITION_MARKER) === true
+    Reflect.get(exportValue, SANDBOX_SELECTOR_MARKER) === true
   ) {
     return exportValue;
   }
@@ -87,7 +89,7 @@ export async function loadModuleBackedDefinition(input: {
   } catch (error) {
     if (input.kind === "sandbox" && typeof exportValue === "function") {
       throw new Error(
-        `Failed to execute the sandbox export "${input.source.exportName ?? "default"}" from "${input.displayPath ?? input.source.logicalPath}" as a zero-argument definition factory. Parent-sharing callbacks must be passed to defineSandbox(...): ${toErrorMessage(error)}`,
+        `Failed to execute the sandbox export "${input.source.exportName ?? "default"}" from "${input.displayPath ?? input.source.logicalPath}" as a zero-argument definition factory. Runtime selectors must be passed to defineSandbox(...): ${toErrorMessage(error)}`,
       );
     }
     throw new Error(

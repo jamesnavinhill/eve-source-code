@@ -1,9 +1,10 @@
 import { resolve } from "node:path";
 
 import type { Command } from "#compiled/commander/index.js";
-import { applicationCommand, type CliApplicationContext } from "#cli/application-command.js";
+import type { CliApplicationContext } from "#cli/application-command.js";
 import { resolveInternalVercelServiceOutput } from "#cli/vercel-service-output.js";
 import { createCliTheme, renderCliTaggedLine } from "#cli/ui/output.js";
+import { EVE_INTERNAL_AGENT_WORKSPACE_MEMBER_ENV } from "#internal/application/build-output-environment.js";
 import type { ApplicationBuildOptions } from "#internal/nitro/host/types.js";
 import {
   EVE_PUBLIC_ROUTE_PREFIX_ENV,
@@ -30,17 +31,40 @@ export function registerBuildCommand(input: {
 }): void {
   const theme = createCliTheme();
 
-  applicationCommand(input.program.command("build"), input.applicationContext)
+  input.program
+    .command("build")
+    .hook("preAction", async () => {
+      const context = await input.applicationContext.resolveAgent();
+      if (context.kind !== "workspace") await input.applicationContext.resolve();
+    })
     .description("Build the current eve application.")
     .option("--profile <path>", "Write best-effort timing and output-size profile JSON to a file")
-    .option(
-      "--skip-sandbox-prewarm",
-      "Skip sandbox template prewarm for a Vercel build; output may not be deployable",
-    )
+    .option("--skip-sandbox-prewarm", "Skip sandbox preparation; output may not be deployable")
     .action(async (options: BuildCliOptions) => {
       const { loadDevelopmentEnvironmentFiles } = await import("#cli/dev/environment.js");
 
-      loadDevelopmentEnvironmentFiles(input.applicationContext.root);
+      await loadDevelopmentEnvironmentFiles(input.applicationContext.root);
+
+      const projectContext = await input.applicationContext.resolveAgent();
+      if (projectContext.kind === "workspace") {
+        if (options.profile !== undefined) {
+          throw new Error(
+            "Workspace builds do not support --profile. Run it from an individual agent directory.",
+          );
+        }
+        const { buildAgentWorkspace } = await import("#internal/vercel/build-agent-workspace.js");
+        const outputDir = await buildAgentWorkspace(projectContext.workspace, {
+          skipSandboxPrewarm: options.skipSandboxPrewarm,
+        });
+        input.logger.log(
+          renderCliTaggedLine(theme, {
+            message: `built output at ${outputDir}`,
+            tag: "build",
+            tone: "success",
+          }),
+        );
+        return;
+      }
 
       const buildHost =
         input.buildHost ?? (await import("#internal/nitro/host.js")).buildApplication;
@@ -51,12 +75,16 @@ export function registerBuildCommand(input: {
       const buildOptions: {
         profileOutputPath?: string;
         readonly publicRoutePrefix: ApplicationBuildOptions["publicRoutePrefix"];
-        readonly skipVercelSandboxPrewarm: boolean;
+        readonly skipSandboxPrewarm: boolean;
         readonly vercelServiceOutput: ApplicationBuildOptions["vercelServiceOutput"];
+        readonly workspaceMember: boolean;
       } = {
         publicRoutePrefix: normalizePublicRoutePrefix(process.env[EVE_PUBLIC_ROUTE_PREFIX_ENV]),
-        skipVercelSandboxPrewarm: options.skipSandboxPrewarm === true,
+        skipSandboxPrewarm: options.skipSandboxPrewarm === true,
         vercelServiceOutput: resolveInternalVercelServiceOutput(input.applicationContext.root),
+        workspaceMember:
+          projectContext.kind === "workspace-member" ||
+          process.env[EVE_INTERNAL_AGENT_WORKSPACE_MEMBER_ENV] === "1",
       };
       if (profileOutputPath !== undefined) {
         buildOptions.profileOutputPath = profileOutputPath;

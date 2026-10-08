@@ -1,3 +1,4 @@
+import type { PromptQueueState } from "#channel/prompt-queue.js";
 import type { SessionHandle } from "#channel/session.js";
 import type { SessionAuthContext, TurnPolicy } from "#channel/types.js";
 import type { RouteHandler } from "#channel/routes.js";
@@ -9,6 +10,7 @@ import { createLogger } from "#internal/logging.js";
 import type { UnstampedMessageStreamEvent } from "#protocol/message.js";
 import {
   callTwilioApi,
+  createTwilioFetchFile,
   sendTwilioMessage,
   twilioContinuationToken,
   updateTwilioCall,
@@ -27,6 +29,7 @@ import {
   parseTwilioTextMessage,
   parseTwilioVoiceCall,
   parseTwilioVoiceTranscription,
+  twilioMessageContent,
   type TwilioTextMessage,
   type TwilioVoiceCall,
   type TwilioVoiceTranscription,
@@ -45,7 +48,6 @@ import {
 import { type TwilioAuthToken, type TwilioWebhookUrl } from "#public/channels/twilio/verify.js";
 import { readNonEmptyString } from "#shared/guards.js";
 import { defineChannel, GET, POST, type Channel } from "#public/definitions/channel.js";
-import type { ChannelAudience } from "#shared/channel-audience.js";
 
 const log = createLogger("twilio.channel");
 
@@ -58,7 +60,7 @@ export interface TwilioContext {
 }
 
 /** Channel-owned Twilio context returned by `context()`. */
-export interface TwilioChannelContext extends TwilioContext {
+interface TwilioChannelContext extends TwilioContext {
   state: TwilioChannelState;
 }
 
@@ -66,7 +68,7 @@ export interface TwilioChannelContext extends TwilioContext {
 export interface TwilioEventContext extends TwilioChannelContext, ChannelContinuationOps {}
 
 /** JSON-serializable state for the phone-number conversation. */
-export interface TwilioChannelState {
+export interface TwilioChannelState extends PromptQueueState {
   /** Caller / sender phone number. */
   from: string | null;
   /** Twilio number or sender that received the latest session-starting webhook. */
@@ -79,7 +81,6 @@ export interface TwilioChannelState {
 
 /** Per-session instrumentation snapshot for Twilio runtime telemetry. Reports the active phone-number pair and the most recent message and call SIDs. */
 export interface TwilioInstrumentationMetadata extends Record<string, unknown> {
-  readonly audience: ChannelAudience;
   readonly from: string | null;
   readonly lastCallSid: string | null;
   readonly lastMessageSid: string | null;
@@ -164,6 +165,8 @@ export interface TwilioChannelEvents {
   readonly "message.completed"?: TwilioEventHandler<"message.completed">;
   readonly "message.appended"?: TwilioEventHandler<"message.appended">;
   readonly "input.requested"?: TwilioEventHandler<"input.requested">;
+  readonly "input.resolved"?: TwilioEventHandler<"input.resolved">;
+  readonly "approval.settled"?: TwilioEventHandler<"approval.settled">;
   readonly "turn.failed"?: TwilioEventHandler<"turn.failed">;
   readonly "turn.completed"?: TwilioEventHandler<"turn.completed">;
   readonly "turn.cancelled"?: TwilioEventHandler<"turn.cancelled">;
@@ -311,13 +314,14 @@ export function twilioChannel(config: TwilioChannelConfig): TwilioChannel {
     },
     metadata(state): TwilioInstrumentationMetadata {
       return {
-        audience: "private",
         from: state.from,
         lastCallSid: state.lastCallSid ?? null,
         lastMessageSid: state.lastMessageSid ?? null,
         to: state.to,
       };
     },
+    audience: () => "private",
+    fetchFile: createTwilioFetchFile({ ...config.api, credentials: config.credentials }),
 
     context(state, session) {
       return rebuildTwilioContext(state, session, config);
@@ -565,17 +569,19 @@ async function dispatchText(input: {
   });
 
   try {
-    await input.from(twilioContinuationToken(message.from, message.to)).send(message.body, {
-      auth: result.auth,
-      context: [contextBlock],
-      state: {
-        from: message.from,
-        lastCallSid: null,
-        lastMessageSid: message.messageSid ?? null,
-        to: message.to ?? null,
-      },
-      title: result.title,
-    });
+    await input
+      .from(twilioContinuationToken(message.from, message.to))
+      .send(twilioMessageContent(message), {
+        auth: result.auth,
+        context: [contextBlock],
+        state: {
+          from: message.from,
+          lastCallSid: null,
+          lastMessageSid: message.messageSid ?? null,
+          to: message.to ?? null,
+        },
+        title: result.title,
+      });
   } catch (error) {
     log.error("text delivery failed", { error });
   }

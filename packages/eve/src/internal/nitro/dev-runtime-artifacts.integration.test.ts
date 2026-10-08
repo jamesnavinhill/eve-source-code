@@ -21,10 +21,12 @@ import { createDiskRuntimeCompiledArtifactsSource } from "#runtime/compiled-arti
 import { getCompiledRuntimeAgentBundle } from "#runtime/sessions/compiled-agent-cache.js";
 import { createRuntimeSession, withRuntimeSession } from "#runtime/sessions/runtime-session.js";
 import { createDevelopmentNitroArtifactsConfig } from "#internal/nitro/host/artifacts-config.js";
-import { publishDevelopmentGeneration } from "#internal/nitro/development-generation.js";
+import {
+  activateDevelopmentGeneration,
+  stageDevelopmentGeneration,
+} from "#internal/nitro/development-generation.js";
 import { resolveLocalWorkflowWorldDataDirectory } from "#internal/workflow/local-world-data-directory.js";
 import {
-  activateDevelopmentRuntimeArtifactsSnapshot,
   activateDevelopmentRuntimeArtifactsSnapshotTransaction,
   pruneDevelopmentRuntimeArtifactsSnapshots,
   readDevelopmentRuntimeArtifactsSnapshotRoot,
@@ -36,6 +38,13 @@ import {
 import { resolveNitroCompiledArtifactsSource } from "#internal/nitro/routes/runtime-artifacts.js";
 
 const createScratchDirectory = useTemporaryDirectories();
+
+async function activateSnapshot(
+  input: Parameters<typeof activateDevelopmentRuntimeArtifactsSnapshotTransaction>[0],
+): Promise<void> {
+  const activation = await activateDevelopmentRuntimeArtifactsSnapshotTransaction(input);
+  activation.commit();
+}
 
 async function markSnapshotMaterialized(
   snapshot: DevelopmentRuntimeArtifactsSnapshot,
@@ -58,6 +67,7 @@ async function createNextStyleImportSnapshotFixture(): Promise<{ readonly appRoo
   const moduleMapPath = join(compileDirectoryPath, "module-map.mjs");
 
   await mkdir(agentRoot, { recursive: true });
+  await mkdir(join(agentRoot, "tools"), { recursive: true });
   await mkdir(join(appRoot, "node_modules"), { recursive: true });
   await mkdir(join(appRoot, "src", "features", "editor", "eve"), { recursive: true });
   await mkdir(compileDirectoryPath, { recursive: true });
@@ -80,14 +90,7 @@ async function createNextStyleImportSnapshotFixture(): Promise<{ readonly appRoo
   );
   await writeFile(
     join(agentRoot, "agent.ts"),
-    [
-      'import { createEveModelRouter } from "./model-router";',
-      'import { authSessionAuth } from "@/features/editor/eve/auth-session";',
-      "",
-      'export default { model: "openai/gpt-5.4-mini" };',
-      "export const routed = createEveModelRouter(authSessionAuth);",
-      "",
-    ].join("\n"),
+    ['export default { model: "openai/gpt-5.4-mini" };', ""].join("\n"),
   );
   await writeFile(
     join(agentRoot, "model-router.ts"),
@@ -102,15 +105,33 @@ async function createNextStyleImportSnapshotFixture(): Promise<{ readonly appRoo
     join(appRoot, "src", "features", "editor", "eve", "auth-session.ts"),
     'export const authSessionAuth = "session-auth";\n',
   );
+  await writeFile(
+    join(agentRoot, "tools", "routed.ts"),
+    [
+      'import { defineTool } from "eve/tools";',
+      'import { createEveModelRouter } from "../model-router";',
+      'import { authSessionAuth } from "@/features/editor/eve/auth-session";',
+      "",
+      "export const routed = createEveModelRouter(authSessionAuth);",
+      "",
+      "export default defineTool({",
+      '  description: "Return the routed session auth value.",',
+      '  inputSchema: { type: "object", properties: {}, additionalProperties: false },',
+      "  async execute() { return routed; },",
+      "});",
+      "",
+    ].join("\n"),
+  );
   await writeFile(join(agentRoot, "instructions.md"), "Use the routed model.\n");
 
   const compileResult = await compileAgent({ startPath: appRoot });
 
-  await publishDevelopmentGeneration({
+  const generation = await stageDevelopmentGeneration({
     ...compileResult,
     paths: { ...compileResult.paths, compileDirectoryPath, moduleMapPath },
     project: { appRoot },
   } as CompileAgentResult);
+  await activateDevelopmentGeneration({ appRoot, generation });
 
   return { appRoot };
 }
@@ -142,11 +163,11 @@ describe("development runtime artifact snapshots", () => {
     expect(readDevelopmentRuntimeArtifactsRevision(appRoot)).toEqual({
       revision: appRoot,
     });
-    expect(
-      JSON.parse(await readFile(join(snapshot.snapshotRoot, "generation.json"), "utf8")),
-    ).toEqual({ runtimeAppRoot: snapshot.runtimeAppRoot });
+    await expect(readFile(join(snapshot.snapshotRoot, "generation.json"), "utf8")).resolves.toBe(
+      `${JSON.stringify({ runtimeAppRoot: snapshot.runtimeAppRoot })}\n`,
+    );
 
-    await activateDevelopmentRuntimeArtifactsSnapshot({
+    await activateSnapshot({
       appRoot,
       snapshot: await markSnapshotMaterialized(snapshot),
     });
@@ -173,7 +194,7 @@ describe("development runtime artifact snapshots", () => {
     } as CompileAgentResult;
     const first = await stageDevelopmentRuntimeArtifactsSnapshot(compileResult);
     const second = await stageDevelopmentRuntimeArtifactsSnapshot(compileResult);
-    await activateDevelopmentRuntimeArtifactsSnapshot({
+    await activateSnapshot({
       appRoot,
       snapshot: await markSnapshotMaterialized(first),
     });
@@ -433,7 +454,7 @@ describe("development runtime artifact snapshots", () => {
     await utimes(retainedSnapshotRoot, new Date(now - 20_000), new Date(now - 20_000));
     await utimes(staleSnapshotRoot, new Date(now - 30_000), new Date(now - 30_000));
 
-    await activateDevelopmentRuntimeArtifactsSnapshot({
+    await activateSnapshot({
       appRoot,
       snapshot: await markSnapshotMaterialized({
         runtimeAppRoot: join(activeSnapshotRoot, "source", "app"),
@@ -472,12 +493,12 @@ describe("development runtime artifact snapshots", () => {
       snapshotSourceRoot: join(snapshotRoot, "source"),
       sourceRoot: appRoot,
     });
-    await activateDevelopmentRuntimeArtifactsSnapshot({
+    await activateSnapshot({
       appRoot,
       snapshot: await markSnapshotMaterialized(createSnapshot(firstSnapshotRoot)),
     });
     const beforeRetirement = Date.now();
-    await activateDevelopmentRuntimeArtifactsSnapshot({
+    await activateSnapshot({
       appRoot,
       snapshot: await markSnapshotMaterialized(createSnapshot(nextSnapshotRoot)),
     });
@@ -520,7 +541,7 @@ describe("development runtime artifact snapshots", () => {
         `${JSON.stringify({ retiredAt: now - gracePeriodMs - index - 1 })}\n`,
       );
     }
-    await activateDevelopmentRuntimeArtifactsSnapshot({
+    await activateSnapshot({
       appRoot,
       snapshot: await markSnapshotMaterialized({
         runtimeAppRoot: join(activeSnapshotRoot, "source"),
@@ -556,7 +577,7 @@ describe("development runtime artifact snapshots", () => {
       await mkdir(snapshotRoot, { recursive: true });
       await writeFile(join(snapshotRoot, "activated"), "");
     }
-    await activateDevelopmentRuntimeArtifactsSnapshot({
+    await activateSnapshot({
       appRoot,
       snapshot: await markSnapshotMaterialized({
         runtimeAppRoot: join(activeSnapshotRoot, "source", "app"),
@@ -601,7 +622,7 @@ describe("development runtime artifact snapshots", () => {
       join(retiredSnapshotRoot, "retired.json"),
       `${JSON.stringify({ retiredAt: 1 })}\n`,
     );
-    await activateDevelopmentRuntimeArtifactsSnapshot({
+    await activateSnapshot({
       appRoot,
       snapshot: await markSnapshotMaterialized({
         runtimeAppRoot: join(activeSnapshotRoot, "source"),
@@ -647,7 +668,7 @@ describe("development runtime artifact snapshots", () => {
         paths: { compileDirectoryPath },
         project: { appRoot },
       } as CompileAgentResult),
-    ).rejects.toThrow("outside runtime app root");
+    ).rejects.toThrow("outside runtime snapshot source root");
 
     await expect(readdir(join(appRoot, ".eve", "dev-runtime", "snapshots"))).resolves.toEqual([]);
   });
@@ -687,10 +708,10 @@ describe("development runtime artifact snapshots", () => {
       paths: { compileDirectoryPath },
       project: { appRoot },
     } as CompileAgentResult);
-    await expect(
-      activateDevelopmentRuntimeArtifactsSnapshot({ appRoot, snapshot }),
-    ).rejects.toThrow("before its authored modules are materialized");
-    await activateDevelopmentRuntimeArtifactsSnapshot({
+    await expect(activateSnapshot({ appRoot, snapshot })).rejects.toThrow(
+      "before its authored modules are materialized",
+    );
+    await activateSnapshot({
       appRoot,
       snapshot: await markSnapshotMaterialized(snapshot),
     });
@@ -744,9 +765,10 @@ describe("development runtime artifact snapshots", () => {
           createDevelopmentNitroArtifactsConfig({ appRoot }),
         ),
       });
-      const agentModule = bundle.moduleMap.nodes[ROOT_COMPILED_AGENT_NODE_ID]?.modules["agent.ts"];
+      const routedToolModule =
+        bundle.moduleMap.nodes[ROOT_COMPILED_AGENT_NODE_ID]?.modules["tools/routed.ts"];
 
-      expect(agentModule).toMatchObject({
+      expect(routedToolModule).toMatchObject({
         routed: "router:session-auth",
       });
     });
@@ -764,9 +786,10 @@ describe("development runtime artifact snapshots", () => {
       const bundle = await getCompiledRuntimeAgentBundle({
         compiledArtifactsSource: createDiskRuntimeCompiledArtifactsSource(runtimeAppRoot!),
       });
-      const agentModule = bundle.moduleMap.nodes[ROOT_COMPILED_AGENT_NODE_ID]?.modules["agent.ts"];
+      const routedToolModule =
+        bundle.moduleMap.nodes[ROOT_COMPILED_AGENT_NODE_ID]?.modules["tools/routed.ts"];
 
-      expect(agentModule).toMatchObject({
+      expect(routedToolModule).toMatchObject({
         routed: "router:session-auth",
       });
     });
@@ -982,6 +1005,98 @@ describe("development runtime artifact snapshots", () => {
     expect(existsSync(join(snapshot.snapshotSourceRoot, "packages", "acme-extension"))).toBe(false);
     const snapshotMountPath = join(snapshot.runtimeAppRoot, "node_modules", "@acme", "extension");
     await expect(realpath(snapshotMountPath)).resolves.toBe(await realpath(packageRoot));
+  });
+
+  it("rewrites hoisted extension subagent roots into source snapshots", async () => {
+    const workspaceRoot = await createScratchDirectory(
+      "eve-dev-runtime-hoisted-extension-subagent-",
+    );
+    const appRoot = join(workspaceRoot, "agents", "support");
+    const agentRoot = join(appRoot, "agent");
+    const packageRoot = join(workspaceRoot, "node_modules", "@acme", "crm");
+    const extensionRoot = join(packageRoot, "dist", "extension");
+    const reviewerRoot = join(extensionRoot, "subagents", "reviewer");
+    const compileDirectoryPath = join(appRoot, ".eve", "compile");
+    const manifestPath = join(compileDirectoryPath, "compiled-agent-manifest.json");
+
+    await mkdir(agentRoot, { recursive: true });
+    await mkdir(reviewerRoot, { recursive: true });
+    await mkdir(compileDirectoryPath, { recursive: true });
+    await writeFile(join(workspaceRoot, "pnpm-workspace.yaml"), "packages:\n  - agents/*\n");
+    await writeFile(
+      join(workspaceRoot, "package.json"),
+      JSON.stringify({
+        dependencies: { "@acme/crm": "1.0.0" },
+        private: true,
+      }),
+    );
+    await writeFile(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ name: "@acme/crm", version: "1.0.0" }),
+    );
+    await writeFile(join(reviewerRoot, "agent.ts"), "export const review = true;\n");
+    const compiledManifest = {
+      agentRoot,
+      appRoot,
+      extensionMounts: [{ sourceRoot: extensionRoot }],
+      subagents: [
+        {
+          agent: {
+            agentRoot: reviewerRoot,
+            appRoot: packageRoot,
+            extensionMounts: [{ sourceRoot: extensionRoot }],
+          },
+          owner: {
+            kind: "extension",
+            namespace: "crm",
+            packageName: "@acme/crm",
+          },
+        },
+      ],
+    };
+    await writeFile(manifestPath, `${JSON.stringify(compiledManifest, null, 2)}\n`);
+
+    const snapshot = await stageDevelopmentRuntimeArtifactsSnapshot({
+      manifest: compiledManifest,
+      paths: { compileDirectoryPath },
+      project: { appRoot },
+    } as CompileAgentResult);
+    const rewrittenManifest = JSON.parse(
+      await readFile(
+        join(snapshot.runtimeAppRoot, ".eve", "compile", "compiled-agent-manifest.json"),
+        "utf8",
+      ),
+    ) as {
+      subagents: Array<{ agent: { agentRoot: string; appRoot: string } }>;
+    };
+
+    expect(rewrittenManifest.subagents[0]?.agent).toMatchObject({
+      agentRoot: join(
+        snapshot.runtimeAppRoot,
+        "node_modules",
+        "@acme",
+        "crm",
+        "dist",
+        "extension",
+        "subagents",
+        "reviewer",
+      ),
+      appRoot: join(snapshot.runtimeAppRoot, "node_modules", "@acme", "crm"),
+    });
+    expect(
+      existsSync(
+        join(
+          snapshot.snapshotSourceRoot,
+          "node_modules",
+          "@acme",
+          "crm",
+          "dist",
+          "extension",
+          "subagents",
+          "reviewer",
+        ),
+      ),
+    ).toBe(true);
   });
 
   it("mounts workspace packages nested inside the app root without copying them", async () => {

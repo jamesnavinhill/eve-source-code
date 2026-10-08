@@ -34,7 +34,7 @@ describe("parseDiscordInteraction", () => {
     expect(interaction.commandName).toBe("ask");
     expect(interaction.channelType).toBe(1);
     expect(interaction.options).toEqual([
-      { name: "message", options: [], value: "hello from discord" },
+      { name: "message", options: [], type: 3, value: "hello from discord" },
     ]);
     expect(interaction.user).toMatchObject({
       globalName: "Ada Lovelace",
@@ -42,6 +42,45 @@ describe("parseDiscordInteraction", () => {
       username: "ada",
     });
     expect(interaction.member?.nick).toBe("Ada");
+  });
+
+  it("resolves files from attachment options and leaves their ids out of the prompt", () => {
+    const interaction = parseDiscordInteraction({
+      application_id: "APP1",
+      channel_id: "C01",
+      data: {
+        name: "ask",
+        options: [{ name: "file", type: 11, value: "A1" }],
+        resolved: {
+          attachments: {
+            A1: {
+              content_type: "image/png",
+              filename: "diagram.png",
+              id: "A1",
+              size: 42,
+              url: "https://cdn.discordapp.com/attachments/C01/A1/diagram.png?ex=1",
+            },
+            A2: { filename: "unused.png", id: "A2", url: "https://cdn.discordapp.com/x" },
+          },
+        },
+      },
+      id: "I01",
+      token: "tok",
+      type: 2,
+      user: { id: "U01", username: "ada" },
+    });
+    if (interaction?.type !== 2) throw new Error("Expected command interaction.");
+
+    expect(interaction.attachments).toEqual([
+      {
+        contentType: "image/png",
+        filename: "diagram.png",
+        id: "A1",
+        size: 42,
+        url: "https://cdn.discordapp.com/attachments/C01/A1/diagram.png?ex=1",
+      },
+    ]);
+    expect(commandInteractionMessage(interaction)).toBe("/ask");
   });
 
   it("parses a message component interaction", () => {
@@ -145,6 +184,7 @@ describe("commandInteractionMessage", () => {
 describe("Discord context rendering", () => {
   it("renders a deterministic context block", () => {
     const block = formatDiscordContextBlock({
+      applicationId: "APP1",
       channelId: "C01",
       commandName: "ask",
       guildId: "G01",
@@ -153,6 +193,7 @@ describe("Discord context rendering", () => {
       username: "ada",
     });
     expect(block).toContain("<discord_context>");
+    expect(block).toContain("application_id: APP1");
     expect(block).toContain("user_id: U01");
     expect(block).toContain("username: ada");
   });

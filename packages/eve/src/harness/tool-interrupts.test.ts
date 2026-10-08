@@ -7,9 +7,7 @@ import {
   type AuthorizationSignal,
   authorizationPendingAsJsonObject,
   isAuthorizationPendingModelOutput,
-  isAuthorizationSignal,
   modelFacingAuthorizationOutput,
-  redactSignalResume,
   requestAuthorization,
 } from "#harness/authorization.js";
 import { createRuntimeToolResultFromValue } from "#harness/action-result-helpers.js";
@@ -21,6 +19,7 @@ function signalWithVerifier(): AuthorizationSignal {
   return requestAuthorization([
     {
       attemptId: "attempt-linear",
+      instanceId: "connection:linear-account",
       name: "linear",
       challenge: { url: "https://idp.example/auth" },
       hookUrl: "https://app.example/cb",
@@ -60,21 +59,6 @@ describe("authorizationPendingAsJsonObject", () => {
       __eveAuthorizationPending: true,
       connections: ["linear"],
     });
-  });
-});
-
-describe("redactSignalResume", () => {
-  it("strips resume but keeps the signal shape + other challenge fields", () => {
-    const redacted = redactSignalResume(signalWithVerifier());
-    expect(isAuthorizationSignal(redacted)).toBe(true);
-    expect(redacted.challenges[0]).toEqual({
-      attemptId: "attempt-linear",
-      name: "linear",
-      challenge: { url: "https://idp.example/auth" },
-      hookUrl: "https://app.example/cb",
-    });
-    expect(redacted.challenges[0]).not.toHaveProperty("resume");
-    expect(redacted.challenges[0]).not.toHaveProperty("principal");
   });
 });
 

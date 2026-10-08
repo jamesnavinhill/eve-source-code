@@ -1,6 +1,7 @@
 "use client";
 
 import type {
+  ConversationInput,
   EveAuthorizationPart,
   EveDynamicToolPart,
   EveMessage,
@@ -54,11 +55,13 @@ export function AgentMessage({
   isStreaming,
   message,
   onInputResponses,
+  questionsFor,
 }: {
-  readonly canRespond: boolean;
+  readonly canRespond: (requestId: string) => boolean;
   readonly isStreaming: boolean;
   readonly message: EveMessage;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
+  readonly questionsFor: (callId: string) => readonly ConversationInput[];
 }) {
   const lastTextIndex = message.parts.reduce(
     (last, part, index) => (part.type === "text" ? index : last),
@@ -81,6 +84,7 @@ export function AgentMessage({
               key={partKey(part, index)}
               onInputResponses={onInputResponses}
               part={part}
+              questionsFor={questionsFor}
               showCaret={isStreaming && message.role === "assistant" && index === lastTextIndex}
             />
           ),
@@ -94,11 +98,13 @@ function AgentMessagePart({
   canRespond,
   onInputResponses,
   part,
+  questionsFor,
   showCaret,
 }: {
-  readonly canRespond: boolean;
+  readonly canRespond: (requestId: string) => boolean;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly part: EveMessagePart;
+  readonly questionsFor: (callId: string) => readonly ConversationInput[];
   readonly showCaret: boolean;
 }) {
   switch (part.type) {
@@ -122,44 +128,54 @@ function AgentMessagePart({
     case "authorization":
       return <AuthorizationPrompt part={part} />;
     case "dynamic-tool": {
-      const inputRequest = part.toolMetadata?.eve?.inputRequest;
-      if (inputRequest?.kind === "question") {
+      const questions = questionsFor(part.toolCallId);
+      if (questions.length > 0) {
         return (
-          <QuestionRequest
-            canRespond={canRespond}
-            inputRequest={inputRequest}
-            inputResponse={part.toolMetadata?.eve?.inputResponse}
-            onInputResponses={onInputResponses}
-          />
+          <div className="space-y-4">
+            {questions.map(({ request, response }) => (
+              <QuestionRequest
+                canRespond={canRespond(request.requestId)}
+                inputRequest={request}
+                inputResponse={response}
+                key={request.requestId}
+                onInputResponses={onInputResponses}
+              />
+            ))}
+          </div>
         );
       }
 
       return (
-        <Tool
-          defaultOpen={part.state === "approval-requested" || part.state === "approval-responded"}
-        >
-          <ToolHeader
-            state={part.state}
-            title={part.toolName}
-            toolName={part.toolName}
-            type="dynamic-tool"
-          />
-          <ToolContent>
-            {part.toolName === "bash" ? (
-              <BashToolContent errorText={part.errorText} input={part.input} output={part.output} />
-            ) : (
-              <ToolInput input={part.input} />
-            )}
-            <InputRequestActions
-              canRespond={canRespond}
-              part={part}
-              onInputResponses={onInputResponses}
+        <>
+          <Tool>
+            <ToolHeader
+              state={part.state}
+              title={part.toolName}
+              toolName={part.toolName}
+              type="dynamic-tool"
             />
-            {part.toolName === "bash" ? null : (
-              <ToolOutput errorText={part.errorText} output={part.output} />
-            )}
-          </ToolContent>
-        </Tool>
+            <ToolContent>
+              {part.toolName === "bash" ? (
+                <BashToolContent
+                  errorText={part.errorText}
+                  input={part.input}
+                  output={part.output}
+                />
+              ) : (
+                <>
+                  <ToolInput input={part.input} />
+                  <ToolOutput errorText={part.errorText} output={part.output} />
+                </>
+              )}
+            </ToolContent>
+          </Tool>
+          {/* Kept outside the collapsed card so a pending approval is always visible. */}
+          <InputRequestActions
+            canRespond={canRespond}
+            part={part}
+            onInputResponses={onInputResponses}
+          />
+        </>
       );
     }
   }
@@ -405,7 +421,7 @@ function InputRequestActions({
   onInputResponses,
   part,
 }: {
-  readonly canRespond: boolean;
+  readonly canRespond: (requestId: string) => boolean;
   readonly onInputResponses: (responses: readonly AgentInputResponse[]) => void | Promise<void>;
   readonly part: EveDynamicToolPart;
 }) {
@@ -418,19 +434,30 @@ function InputRequestActions({
   const selectedOption = inputRequest.options?.find(
     (option) => option.id === inputResponse?.optionId,
   );
+  // An approval can settle before its batch resolves, without an input response.
+  const settledApproval =
+    part.approval?.approved === undefined
+      ? undefined
+      : part.approval.approved
+        ? "Approved"
+        : "Denied";
 
   return (
     <div className="space-y-3 rounded-md border border-yellow-500/30 bg-yellow-500/5 p-3">
       <p className="text-muted-foreground text-sm">{inputRequest.prompt}</p>
-      {inputResponse ? (
+      {inputResponse || settledApproval ? (
         <p className="font-medium text-sm">
-          Responded: {selectedOption?.label ?? inputResponse.text ?? inputResponse.optionId}
+          Responded:{" "}
+          {selectedOption?.label ??
+            inputResponse?.text ??
+            inputResponse?.optionId ??
+            settledApproval}
         </p>
       ) : (
         <div className="flex flex-wrap gap-2">
           {inputRequest.options?.map((option) => (
             <Button
-              disabled={!canRespond}
+              disabled={!canRespond(inputRequest.requestId)}
               key={option.id}
               onClick={() => {
                 void onInputResponses([
@@ -456,9 +483,14 @@ function InputRequestActions({
 function partKey(part: EveMessagePart, index: number): string {
   switch (part.type) {
     case "authorization":
-      return `authorization:${part.turnId}:${part.stepIndex}:${part.name}`;
+      return part.attemptId === undefined
+        ? `authorization:${part.turnId}:${part.stepIndex}:${part.name}`
+        : `authorization:${part.attemptId}`;
     case "dynamic-tool":
       return part.toolCallId;
+    case "reasoning":
+    case "text":
+      return `${part.type}:${part.id ?? index}`;
     default:
       return `${part.type}:${index}`;
   }

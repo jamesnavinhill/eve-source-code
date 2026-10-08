@@ -2,7 +2,6 @@
 
 import { track } from "@vercel/analytics";
 import { Input } from "@vercel/geistdocs/components/input";
-import { InputGroup, InputGroupAddon } from "@vercel/geistdocs/components/input-group";
 import { SearchIcon } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -33,9 +32,9 @@ const FILTER_DESCRIPTIONS: Record<Exclude<GalleryFilter, "all">, string> = {
   connection:
     "Connections are the tools your agent calls during a run: services reached over MCP or OpenAPI.",
   extension: "Extensions are packages that add reusable tools, skills, connections, and hooks.",
+  memory: "Memory providers store and recall context across sessions through eve-managed scopes.",
   instrumentation:
     "Observability providers are OpenTelemetry backends that receive your agent's traces: every model call, tool execution, and turn.",
-  memory: "Memory integrations let your agent store and recall information across sessions.",
 };
 
 interface GalleryProps {
@@ -116,18 +115,16 @@ export const Gallery = ({ filter, integrations }: GalleryProps) => {
             </Link>
           ))}
         </div>
-        <InputGroup className="h-9 w-full bg-background min-[1024px]:w-64">
-          <InputGroupAddon>
-            <SearchIcon className="size-4 text-gray-700" />
-          </InputGroupAddon>
-          <Input
-            aria-label="Search integrations"
-            className="h-full border-0 bg-transparent shadow-none focus-visible:ring-0 dark:bg-transparent"
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search integrations"
-            value={query}
-          />
-        </InputGroup>
+        <Input
+          aria-label="Search integrations"
+          className="[&_input]:pl-2"
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search integrations"
+          prefix={<SearchIcon aria-hidden="true" className="ml-3 size-4 text-gray-700" />}
+          prefixStyling={false}
+          value={query}
+          wrapperClassName="w-full min-[1024px]:w-64"
+        />
       </div>
 
       {filter !== "all" && <p className="text-gray-800 text-sm">{FILTER_DESCRIPTIONS[filter]}</p>}

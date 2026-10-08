@@ -1,10 +1,16 @@
 import { z } from "#compiled/zod/index.js";
+import { mountIdSchema } from "#shared/extension-mount.js";
 
 const owner = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("application") }).strict(),
   z.object({ feature: z.string(), kind: z.literal("framework") }).strict(),
   z
-    .object({ kind: z.literal("extension"), namespace: z.string(), packageName: z.string() })
+    .object({
+      kind: z.literal("extension"),
+      mountId: mountIdSchema.optional(),
+      namespace: z.string(),
+      packageName: z.string(),
+    })
     .strict(),
 ]);
 
@@ -17,13 +23,17 @@ const moduleBacking = z.discriminatedUnion("kind", [
         .strict()
         .optional(),
       kind: z.literal("filesystem"),
+      mountId: z.string().optional(),
       sourcePath: z.string(),
     })
     .strict(),
   z
     .object({
+      dependencies: z.record(z.string(), z.string()).optional(),
       kind: z.literal("programmatic"),
+      mountId: z.string().optional(),
       moduleId: z.string(),
+      parameters: z.record(z.string(), z.unknown()).optional(),
       registryId: z.string(),
       revision: z.string(),
       semanticRevision: z.string().optional(),
@@ -81,7 +91,8 @@ const modelEndpoint = z.union([
     .object({
       kind: z.literal("gateway"),
       connected: z.literal(true),
-      credential: z.enum(["api-key", "oidc"]),
+      credential: z.enum(["api-key", "oidc", "oauth"]),
+      team: z.optional(z.string()),
     })
     .strict(),
   z.object({ kind: z.literal("gateway"), connected: z.literal(false) }).strict(),
@@ -167,6 +178,7 @@ const sourceDescriptor = z
       moduleBacking,
       z.object({ kind: z.literal("resource"), sourcePath: z.string() }).strict(),
     ]),
+    form: z.enum(["derived", "direct"]),
     layer: z.enum(["framework-default", "extension-package", "extension-override", "application"]),
     logicalPath: z.string(),
     owner,
@@ -198,14 +210,19 @@ const connection = source
 
 const hook = source.extend({ eventNames: z.array(z.string()), slug: z.string() }).strict();
 
+const memory = source
+  .extend({
+    description: z.string().optional(),
+    slot: z.string(),
+    visibility: z.enum(["scope", "session"]),
+  })
+  .strict();
+
 const sandbox = source
   .extend({
-    backendKind: z.string().optional(),
-    description: z.string().optional(),
-    hasBootstrap: z.boolean(),
-    hasOnSession: z.boolean(),
-    revalidationKey: z.string().optional(),
-    sourceHash: z.string().optional(),
+    provider: z.string().optional(),
+    environmentExportName: z.string().optional(),
+    revisionHash: z.string(),
   })
   .strict();
 
@@ -223,6 +240,7 @@ const subagent = entry
         connections: z.number(),
         hooks: z.number(),
         instructions: z.number(),
+        memories: z.number(),
         schedules: z.number(),
         skills: z.number(),
         tools: z.number(),
@@ -240,19 +258,21 @@ const remoteAgent = entry
   })
   .strict();
 
+// Kernel effects are inspection metadata only. Deployments can retain removed
+// effects across framework versions, so preserve the response and identify an
+// option this client cannot interpret instead of rejecting agent info entirely.
 const kernelEffect = z
   .object({
-    action: z.enum(["subagent-call", "task-update", "task-cancel"]).optional(),
+    action: z
+      .union([z.enum(["subagent-call", "workflow-tool-call"]), z.literal("unrecognized")])
+      .catch("unrecognized")
+      .optional(),
     audience: z.array(
-      z.enum([
-        "root-session",
-        "delegated-task-child",
-        "requires-request-input",
-        "requires-loadable-skill",
-        "below-subagent-depth",
-      ]),
+      z.union([z.literal("root-session"), z.literal("unrecognized")]).catch("unrecognized"),
     ),
-    kind: z.enum(["request-input", "dispatch", "provider-tool"]),
+    kind: z
+      .union([z.enum(["dispatch", "provider-tool"]), z.literal("unrecognized")])
+      .catch("unrecognized"),
     sourceId: z.string(),
   })
   .strict();
@@ -267,12 +287,7 @@ const compositionDiagnostic = z
   })
   .strict();
 
-const workflow = z.discriminatedUnion("enabled", [
-  z.object({ enabled: z.literal(false), toolName: z.string() }).strict(),
-  z.object({ enabled: z.literal(true), source, toolName: z.string() }).strict(),
-]);
-
-/** Runtime contract for the authoritative `/eve/v1/info` v3 response. */
+/** Runtime contract for the authoritative `/eve/v1/info` v5 response. */
 export const AgentInfoResultSchema = z
   .object({
     agent: z
@@ -306,6 +321,7 @@ export const AgentInfoResultSchema = z
     instrumentation: source.optional(),
     kernelEffects: z.array(kernelEffect),
     kind: z.literal("eve-agent-info"),
+    memories: z.array(memory),
     mode: z.enum(["development", "production"]),
     remoteAgents: z.object({ entries: z.array(remoteAgent), total: z.number() }).strict(),
     sandbox,
@@ -313,8 +329,7 @@ export const AgentInfoResultSchema = z
     skills: z.object({ dynamic: z.array(dynamicResolver), static: z.array(skill) }).strict(),
     subagents: z.object({ local: z.array(subagent), total: z.number() }).strict(),
     tools: z.object({ dynamic: z.array(dynamicResolver), static: z.array(tool) }).strict(),
-    version: z.literal(3),
-    workflow,
+    version: z.literal(5),
     workspace: z.object({ resourceRoot: z.unknown(), rootEntries: z.array(z.string()) }).strict(),
   })
   .strict()
@@ -360,6 +375,7 @@ export const AgentInfoResultSchema = z
     assertUnique(value.schedules, (entry) => entry.name, ["schedules"]);
     assertUnique(value.connections, (entry) => entry.connectionName, ["connections"]);
     assertUnique(value.hooks, (entry) => entry.slug, ["hooks"]);
+    assertUnique(value.memories, (entry) => entry.slot, ["memories"]);
     assertUnique(
       value.channels.routes,
       (entry) => `${entry.method} ${normalizeRoutePattern(entry.urlPath)}`,
@@ -393,6 +409,7 @@ export const AgentInfoResultSchema = z
       ...value.instructions.static.map(
         (entry, index) => [entry, ["instructions", "static", index]] as const,
       ),
+      ...value.memories.map((entry, index) => [entry, ["memories", index]] as const),
       ...(value.instrumentation === undefined
         ? []
         : ([[value.instrumentation, ["instrumentation"]]] as const)),
@@ -409,9 +426,6 @@ export const AgentInfoResultSchema = z
       ),
       ...value.tools.dynamic.map((entry, index) => [entry, ["tools", "dynamic", index]] as const),
       ...value.tools.static.map((entry, index) => [entry, ["tools", "static", index]] as const),
-      ...(value.workflow.enabled
-        ? ([[value.workflow.source, ["workflow", "source"]]] as const)
-        : []),
       [value.sandbox, ["sandbox"]],
     ];
     for (const [entry, path] of boundSources) {
@@ -479,4 +493,5 @@ export type AgentInfoChannelEntry = ReadonlyDeep<z.output<typeof channelRoute>>;
 export type AgentInfoChannels = AgentInfoResult["channels"];
 export type AgentInfoConnectionEntry = ReadonlyDeep<z.output<typeof connection>>;
 export type AgentInfoHookEntry = ReadonlyDeep<z.output<typeof hook>>;
+export type AgentInfoMemoryEntry = ReadonlyDeep<z.output<typeof memory>>;
 export type AgentInfoSandboxEntry = ReadonlyDeep<z.output<typeof sandbox>>;

@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { join, posix } from "node:path";
 
 import type {
   AgentSourceManifest,
@@ -9,6 +9,7 @@ import type {
   ScheduleSourceRef,
   SkillSourceRef,
 } from "#discover/manifest.js";
+import { mountRefNamespace } from "#discover/extensions.js";
 import { stripLogicalPathExtension } from "#discover/filesystem.js";
 import type { ModuleSourceRef } from "#shared/source-ref.js";
 import type {
@@ -18,7 +19,7 @@ import type {
   AgentSourceLayer,
   AgentSourceOwner,
 } from "#compiler/source-graph.js";
-import { canonicalSourceSlot } from "#compiler/source-graph.js";
+import { canonicalSourceSlot, extensionMountId } from "#compiler/source-graph.js";
 
 export type ProjectedModuleSource =
   | {
@@ -34,7 +35,7 @@ export type ProjectedModuleSource =
         | "extension"
         | "hook"
         | "instructions"
-        | "instrumentation"
+        | "memory"
         | "sandbox"
         | "schedule"
         | "skill"
@@ -69,7 +70,7 @@ const MODULE_KIND_BY_SLOT_ROOT: Partial<
   extensions: "extension",
   hooks: "hook",
   instructions: "instructions",
-  instrumentation: "instrumentation",
+  memory: "memory",
   sandbox: "sandbox",
   schedules: "schedule",
   skills: "skill",
@@ -77,7 +78,9 @@ const MODULE_KIND_BY_SLOT_ROOT: Partial<
 };
 
 export interface ProjectedSubagentSource {
+  readonly mountId?: string;
   readonly candidate: AgentResourceCandidate;
+  readonly nodePath: string;
   readonly extensionScope?: { readonly namespace: string; readonly sourceRoot: string };
   readonly owner: AgentSourceOwner;
   readonly source: LocalSubagentSourceRef;
@@ -95,7 +98,9 @@ export function projectAgentSources(input: {
   readonly layer?: AgentSourceLayer;
   readonly manifest: AgentSourceManifest;
   readonly nodeId: string;
+  readonly nodePath: string;
   readonly owner?: AgentSourceOwner;
+  readonly mountId?: string;
 }): ProjectedAgentSources {
   const owner = input.owner ?? { kind: "application" as const };
   const candidates: AgentSourceCandidate[] = [];
@@ -105,11 +110,19 @@ export function projectAgentSources(input: {
   projectManifest({
     externalDependencies: input.externalDependencies,
     candidates,
-    extensionScope: input.extensionScope,
+    projection: createApplicationManifestSourceProjection(input.extensionScope),
     layer: input.layer ?? "application",
     manifest: input.manifest,
     nodeId: input.nodeId,
+    subagentsPath: posix.join(input.nodePath, "subagents"),
     owner,
+    mountId: input.mountId,
+    declarationMountIds: new Map(
+      input.manifest.extensions.map((source) => [
+        source.sourceId,
+        posix.join(input.nodePath, "extensions", mountRefNamespace(source.logicalPath)),
+      ]),
+    ),
     resources,
     subagents,
   });
@@ -117,8 +130,11 @@ export function projectAgentSources(input: {
   for (const mount of [...input.manifest.resolvedExtensions].sort((left, right) =>
     left.namespace.localeCompare(right.namespace),
   )) {
+    const mountId = extensionMountId(input.nodePath, mount.namespace);
+    const projection = createExtensionManifestSourceProjection(mount);
     const extensionOwner: AgentSourceOwner = {
       kind: "extension",
+      mountId,
       namespace: mount.namespace,
       packageName: mount.packageName,
     };
@@ -128,11 +144,13 @@ export function projectAgentSources(input: {
         mount.externalDependencies,
       ),
       candidates,
-      extension: mount,
+      projection,
       layer: "extension-package",
       manifest: mount.manifest,
       nodeId: input.nodeId,
+      subagentsPath: posix.join(mountId, "subagents"),
       owner: extensionOwner,
+      mountId,
       resources,
       sourceIdPrefix: `ext:${mount.namespace}:`,
       subagents,
@@ -141,11 +159,13 @@ export function projectAgentSources(input: {
       projectManifest({
         externalDependencies: input.externalDependencies,
         candidates,
-        extension: mount,
+        projection,
         layer: "extension-override",
         manifest: mount.overrides,
         nodeId: input.nodeId,
+        subagentsPath: posix.join(mountId, "subagents"),
         owner: { kind: "application" },
+        mountId,
         resources,
         sourceIdPrefix: `ext-override:${mount.namespace}:`,
         subagents,
@@ -175,30 +195,25 @@ export function projectSelectedSources(input: {
   return projected;
 }
 
-export function createFilesystemModuleCandidate(input: {
+function createFilesystemModuleCandidate(input: {
   readonly externalDependencies: readonly string[];
-  readonly extension?: ResolvedExtensionMount;
   readonly extensionScope?: { readonly namespace: string; readonly sourceRoot: string };
   readonly layer: AgentSourceLayer;
   readonly logicalPath: string;
   readonly nodeId: string;
   readonly owner: AgentSourceOwner;
+  readonly mountId?: string;
   readonly source: ModuleSourceRef;
   readonly sourceId?: string;
   readonly sourceRoot: string;
 }): AgentModuleCandidate {
   const backing = {
     externalDependencies: [...input.externalDependencies],
-    ...(input.owner.kind === "extension" &&
-    (input.extension !== undefined || input.extensionScope !== undefined)
-      ? {
-          extensionScope: {
-            namespace: input.extension?.namespace ?? input.extensionScope!.namespace,
-            sourceRoot: input.extension?.sourceRoot ?? input.extensionScope!.sourceRoot,
-          },
-        }
+    ...(input.owner.kind === "extension" && input.extensionScope !== undefined
+      ? { extensionScope: input.extensionScope }
       : {}),
     kind: "filesystem" as const,
+    mountId: input.mountId,
     sourcePath: join(input.sourceRoot, input.source.logicalPath),
   };
   return {
@@ -213,34 +228,74 @@ export function createFilesystemModuleCandidate(input: {
   };
 }
 
+interface ManifestSourceProjection {
+  readonly extensionScope?: { readonly namespace: string; readonly sourceRoot: string };
+  readonly logicalPath: (logicalPath: string) => string;
+  readonly name: (name: string) => string;
+}
+
+function createApplicationManifestSourceProjection(extensionScope?: {
+  readonly namespace: string;
+  readonly sourceRoot: string;
+}): ManifestSourceProjection {
+  const projection: {
+    extensionScope?: { readonly namespace: string; readonly sourceRoot: string };
+    logicalPath: (logicalPath: string) => string;
+    name: (name: string) => string;
+  } = {
+    logicalPath: (logicalPath) => logicalPath,
+    name: (name) => name,
+  };
+  if (extensionScope !== undefined) {
+    projection.extensionScope = extensionScope;
+  }
+  return projection;
+}
+
+function createExtensionManifestSourceProjection(
+  extension: ResolvedExtensionMount,
+): ManifestSourceProjection {
+  const { namespace, sourceRoot } = extension;
+  return {
+    extensionScope: { namespace, sourceRoot },
+    logicalPath: (logicalPath) => qualifyExtensionContributionLogicalPath(logicalPath, namespace),
+    name: (name) => `${namespace}__${name}`,
+  };
+}
+
 function projectManifest(input: {
   readonly candidates: AgentSourceCandidate[];
+  readonly declarationMountIds?: ReadonlyMap<string, string>;
   readonly externalDependencies: readonly string[];
-  readonly extension?: ResolvedExtensionMount;
-  readonly extensionScope?: { readonly namespace: string; readonly sourceRoot: string };
+  readonly projection: ManifestSourceProjection;
   readonly layer: AgentSourceLayer;
   readonly manifest: AgentSourceManifest;
   readonly nodeId: string;
+  readonly subagentsPath: string;
   readonly owner: AgentSourceOwner;
+  readonly mountId?: string;
   readonly resources: ProjectedResourceSource[];
   readonly sourceIdPrefix?: string;
   readonly subagents: ProjectedSubagentSource[];
 }): void {
-  const qualify = (logicalPath: string) =>
-    input.extension === undefined
-      ? logicalPath
-      : qualifyExtensionLogicalPath(logicalPath, input.extension.namespace);
+  const { projection } = input;
   const sourceId = (id: string) => `${input.sourceIdPrefix ?? ""}${id}`;
-  const pushModule = (source: ModuleSourceRef, logicalPathOverride?: string) => {
-    const logicalPath = logicalPathOverride ?? qualify(source.logicalPath);
+  const pushModule = (
+    source: ModuleSourceRef,
+    logicalPathOverride?: string,
+    mountId = input.mountId,
+  ) => {
+    const logicalPath = projection.logicalPath(logicalPathOverride ?? source.logicalPath);
     const candidate = createFilesystemModuleCandidate({
       externalDependencies: input.externalDependencies,
-      extension: input.extension,
-      extensionScope: input.extensionScope,
+      ...(projection.extensionScope === undefined
+        ? {}
+        : { extensionScope: projection.extensionScope }),
       layer: input.layer,
       logicalPath,
       nodeId: input.nodeId,
       owner: input.owner,
+      mountId,
       source,
       sourceId: sourceId(source.sourceId),
       sourceRoot: input.manifest.agentRoot,
@@ -251,15 +306,12 @@ function projectManifest(input: {
     kind: ProjectedResourceSource["kind"],
     source: InstructionsSourceRef | ScheduleSourceRef | SkillSourceRef,
   ) => {
-    const logicalPath = qualify(source.logicalPath);
+    const logicalPath = projection.logicalPath(source.logicalPath);
     const projected = {
       ...source,
       ...(source.sourceKind === "skill-package"
         ? {
-            name:
-              input.extension === undefined
-                ? source.name
-                : `${input.extension.namespace}__${source.name}`,
+            name: projection.name(source.name),
           }
         : {}),
       logicalPath,
@@ -288,22 +340,20 @@ function projectManifest(input: {
     } as ProjectedResourceSource);
   };
 
-  if (input.extension === undefined && input.manifest.configModule !== undefined) {
+  if (input.manifest.configModule !== undefined) {
     const logicalPath = input.manifest.configModule.logicalPath;
     pushModule(
       input.manifest.configModule,
       canonicalSourceSlot(logicalPath) === "agent" ? undefined : "agent.ts",
     );
   }
-  if (input.manifest.instrumentation !== undefined) {
-    pushModule(input.manifest.instrumentation);
-  }
-  if (input.extension === undefined) {
-    for (const source of input.manifest.extensions) pushModule(source);
+  for (const source of input.manifest.extensions) {
+    pushModule(source, undefined, input.declarationMountIds?.get(source.sourceId));
   }
   for (const source of input.manifest.channels) pushModule(source);
   for (const source of input.manifest.connections) pushModule(source);
   for (const source of input.manifest.hooks) pushModule(source);
+  for (const source of input.manifest.memories) pushModule(source);
   if (input.manifest.sandbox !== null) pushModule(input.manifest.sandbox);
   for (const source of input.manifest.tools) pushModule(source);
   for (const source of input.manifest.instructions) {
@@ -319,14 +369,13 @@ function projectManifest(input: {
     else pushResource("skill", source);
   }
   for (const source of input.manifest.subagents) {
-    const name =
-      input.extension === undefined
-        ? source.subagentId
-        : `${input.extension.namespace}__${source.subagentId}`;
-    const logicalPath =
-      input.extension === undefined
-        ? source.logicalPath
-        : qualifyExtensionLogicalPath(source.logicalPath, input.extension.namespace);
+    const name = projection.name(source.subagentId);
+    const logicalPath = projection.logicalPath(source.logicalPath);
+    if (name === "agent") {
+      throw new Error(
+        `Subagent "${logicalPath}" uses the reserved name "agent". Rename its path; eve reserves "agent" for the built-in root-copy target.`,
+      );
+    }
     const projectedSource = {
       ...source,
       logicalPath,
@@ -345,14 +394,11 @@ function projectManifest(input: {
     input.candidates.push(candidate);
     input.subagents.push({
       candidate,
-      ...(input.extension === undefined && input.extensionScope === undefined
+      mountId: input.mountId,
+      nodePath: posix.join(input.subagentsPath, source.subagentId),
+      ...(projection.extensionScope === undefined
         ? {}
-        : {
-            extensionScope:
-              input.extension === undefined
-                ? input.extensionScope
-                : { namespace: input.extension.namespace, sourceRoot: input.extension.sourceRoot },
-          }),
+        : { extensionScope: projection.extensionScope }),
       owner: input.owner,
       source: projectedSource,
     });
@@ -385,11 +431,34 @@ function isModuleCandidate(candidate: AgentSourceCandidate): candidate is AgentM
   return candidate.backing.kind !== "resource";
 }
 
-export function qualifyExtensionLogicalPath(logicalPath: string, namespace: string): string {
+const EXTENSION_CONTRIBUTION_ROOTS = new Set([
+  "channels",
+  "connections",
+  "hooks",
+  "instructions",
+  "schedules",
+  "skills",
+  "subagents",
+  "tools",
+]);
+
+export function qualifyExtensionContributionLogicalPath(
+  logicalPath: string,
+  namespace: string,
+): string {
   const parts = logicalPath.split("/");
-  if (parts.length < 2) return logicalPath;
+  if (parts.length === 1) {
+    const slot = stripLogicalPathExtension(logicalPath);
+    if (slot === "instructions" || slot === "system") {
+      return `instructions/${namespace}${logicalPath.slice(logicalPath.lastIndexOf("."))}`;
+    }
+    throw new Error(`Extension source slot "${logicalPath}" cannot be namespace-scoped.`);
+  }
+
   const root = parts[0]!;
-  if (root === "sandbox" || root === "extensions" || root === "lib") return logicalPath;
+  if (!EXTENSION_CONTRIBUTION_ROOTS.has(root)) {
+    throw new Error(`Extension source slot "${logicalPath}" cannot be namespace-scoped.`);
+  }
   parts[1] = `${namespace}__${parts[1]}`;
   return parts.join("/");
 }

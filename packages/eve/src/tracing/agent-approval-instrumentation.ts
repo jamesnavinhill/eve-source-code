@@ -1,7 +1,5 @@
 import {
   ROOT_CONTEXT,
-  SpanStatusCode,
-  type Span,
   type SpanContext,
   type Tracer,
   trace,
@@ -12,14 +10,21 @@ import type {
   InstrumentationInputRequestedEvent,
   InstrumentationInputResolvedEvent,
   InstrumentationProviderDefinition,
-} from "#harness/instrumentation/lifecycle.js";
+} from "#instrumentation/lifecycle.js";
 import type { JsonValue } from "#shared/json.js";
 import { contentAttribute } from "#tracing/agent-otel-content.js";
-import type { AgentActionContext } from "#tracing/agent-action-instrumentation.js";
+import { agentSpanNamingAttributes } from "#tracing/agent-span-naming.js";
+import { agentTraceIdentityAttributes, traceSessionIdOf } from "#tracing/agent-otel-attributes.js";
+import { decodeTraceSessionId } from "#tracing/agent-trace-context-codec.js";
+import { AGENT_SPAN_NAMES } from "#tracing/agent-span-contract.js";
+import { recordAgentSpanError as recordError } from "#tracing/agent-span-error.js";
+import { withChannelAudience } from "#tracing/channel-audience-context.js";
+import type { AgentToolContext } from "#tracing/agent-tool-instrumentation.js";
 import type { AgentSpanIdGenerator } from "#tracing/agent-span-id-generator.js";
 import { normalizeChannelAudience, type ChannelAudience } from "#shared/channel-audience.js";
 
 interface AgentApprovalSpanState {
+  readonly traceSessionId: string;
   readonly actionCallId: string;
   readonly actionName: string;
   readonly attemptIndex: number;
@@ -40,11 +45,9 @@ export function createAgentApprovalInstrumentation(input: {
     sessionId: string,
     turnId: string,
     callId: string,
-  ) => Promise<AgentActionContext | undefined>;
+  ) => Promise<AgentToolContext | undefined>;
   readonly frameworkVersion: string;
   readonly idGenerator: AgentSpanIdGenerator;
-  readonly recordInputs: boolean;
-  readonly recordOutputs: boolean;
   readonly tracer: Tracer;
 }): Pick<
   NonNullable<InstrumentationProviderDefinition["events"]>,
@@ -73,14 +76,13 @@ export function createAgentApprovalInstrumentation(input: {
       },
       requestId: event.requestId,
       rootSessionId: event.scope.rootSessionId ?? event.scope.sessionId,
+      traceSessionId: traceSessionIdOf(event.scope),
       sessionId: event.scope.sessionId,
       startTimeMs: Date.now(),
       stepIndex: event.scope.stepIndex,
       turnId: event.scope.turnId,
     };
-    const requestAttribute = input.recordInputs
-      ? contentAttribute(event.request, false)
-      : undefined;
+    const requestAttribute = contentAttribute(event.request);
     if (requestAttribute !== undefined) state["requestAttribute"] = requestAttribute;
     ctx.state.set(state);
   };
@@ -95,31 +97,42 @@ export function createAgentApprovalInstrumentation(input: {
       input.idGenerator.deriveSpanId(`approval:${event.idempotencyKey}`),
       () =>
         input.tracer.startSpan(
-          "agent.approval",
+          AGENT_SPAN_NAMES.approval,
           {
             attributes: {
-              "agent.action.call_id": state.actionCallId,
+              "gen_ai.tool.call.id": state.actionCallId,
               "agent.action.name": state.actionName,
               "agent.approval.kind": "tool-approval",
               "agent.approval.outcome": event.outcome,
               "agent.approval.request_id": state.requestId,
               "agent.framework.name": "eve",
               "agent.framework.version": input.frameworkVersion,
-              "agent.session.id": state.sessionId,
               "agent.step.attempt": state.attemptIndex,
               "agent.step.index": state.stepIndex,
               "agent.turn.id": state.turnId,
+              ...agentSpanNamingAttributes("agent.approval"),
+              ...agentTraceIdentityAttributes({
+                rootSessionId: state.rootSessionId,
+                traceSessionId: state.traceSessionId,
+                sessionId: state.sessionId,
+              }),
             },
             startTime: state.startTimeMs,
           },
-          trace.setSpan(ROOT_CONTEXT, trace.wrapSpanContext({ ...state.parent, isRemote: false })),
+          withChannelAudience(
+            trace.setSpan(
+              ROOT_CONTEXT,
+              trace.wrapSpanContext({ ...state.parent, isRemote: false }),
+            ),
+            state.channelAudience,
+          ),
         ),
     );
     if (state.requestAttribute !== undefined) {
       span.setAttribute("agent.approval.request", state.requestAttribute);
     }
-    if (input.recordOutputs && event.response !== undefined) {
-      const response = contentAttribute(event.response, false);
+    if (event.response !== undefined) {
+      const response = contentAttribute(event.response);
       if (response !== undefined) span.setAttribute("agent.approval.response", response);
     }
     if (event.outcome === "failed") recordError(span, event.error);
@@ -170,16 +183,10 @@ function readState(value: unknown): AgentApprovalSpanState | undefined {
     requestAttribute,
     requestId: state["requestId"],
     rootSessionId: state["rootSessionId"],
+    traceSessionId: decodeTraceSessionId(state),
     sessionId: state["sessionId"],
     startTimeMs: state["startTimeMs"],
     stepIndex: state["stepIndex"],
     turnId: state["turnId"],
   };
-}
-
-function recordError(span: Span, error: unknown): void {
-  if (error instanceof Error) {
-    span.recordException(error);
-    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
-  } else span.setStatus({ code: SpanStatusCode.ERROR });
 }

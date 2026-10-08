@@ -2,25 +2,48 @@ import { ToolLoopAgent } from "ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Runtime } from "#channel/types.js";
 import { ContextContainer, contextStorage } from "#context/container.js";
-import { AuthKey, InitiatorAuthKey, SessionIdKey, SessionKey } from "#context/keys.js";
+import type { OldSourceOffsetDynamicToolMetadata } from "#context/dynamic-tool-metadata.js";
+import {
+  AuthKey,
+  InitiatorAuthKey,
+  SessionIdKey,
+  SessionKey,
+  StepDynamicToolMetadataKey,
+} from "#context/keys.js";
 import { BundleKey, ChannelKey } from "#runtime/sessions/runtime-context-keys.js";
-import { getPendingRuntimeActionBatch } from "#harness/runtime-actions.js";
+import { withParkedStep } from "#internal/testing/session-machine.js";
+import { createInstrumentationHooks } from "#instrumentation/lifecycle.js";
+import {
+  bindInstrumentationRuntime,
+  type InstrumentationRuntime,
+} from "#instrumentation/runtime.js";
 import type { RuntimeTurnAgent } from "#runtime/agent/bootstrap.js";
 import { resolveRuntimeModelReference } from "#runtime/agent/resolve-model.js";
 import { createBundledRuntimeCompiledArtifactsSource } from "#runtime/compiled-artifacts-source.js";
 import { ROOT_RUNTIME_AGENT_NODE_ID, type ResolvedRuntimeAgentNode } from "#runtime/graph.js";
-import { createEmptyHookRegistry } from "#runtime/hooks/registry.js";
+import { createRuntimeHookRegistry } from "#runtime/hooks/registry.js";
 import type { RuntimeToolRegistry } from "#runtime/tools/registry.js";
 import { createRuntimeToolRegistry } from "#runtime/tools/registry.js";
+import { createPreparedRuntimeSubagentTool } from "#runtime/subagents/registry.js";
 import { createExecutionNodeStep, createNodeHarnessTools } from "#execution/node-step.js";
-import { countLocalSubagentCalls } from "#execution/tools/subagent/local.js";
 import { createSession } from "#execution/session.js";
 import { createStubSandboxRegistry } from "#internal/testing/stub-sandbox-registry.js";
+import { defineTool } from "#tools/definition.js";
+import { stampDurableDynamicCallback } from "#tools/durable-callbacks.js";
 import { toInputSchema } from "#tools/schema.js";
+import {
+  AGENT_TOOL_DESCRIPTION,
+  AGENT_TOOL_NAME,
+  SUBAGENT_TOOL_INPUT_SCHEMA,
+} from "#tools/framework/agent-contract.js";
 
-vi.mock("ai", () => ({
+// The harness runs outside a workflow body here, where run attributes cannot
+// be written; the attribute contract is covered by emit.test.ts.
+vi.mock("#runtime/attributes/emit.js", () => ({ setEveAttributes: vi.fn(async () => {}) }));
+
+vi.mock("ai", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("ai")>()),
   ToolLoopAgent: vi.fn(),
-  jsonSchema: vi.fn((schema: unknown) => schema),
   isStepCount: vi.fn((count: number) => count),
   tool: vi.fn((definition: unknown) => definition),
 }));
@@ -42,20 +65,31 @@ function setupMockAgentForToolExecution(toolName: string, args: unknown): void {
     const prepareStep = settings.prepareStep as
       | ((...args: unknown[]) => Promise<unknown>)
       | undefined;
-    const onStepFinish = settings.onStepFinish as
+    const onStepStart = settings.onStepStart as
       | ((...args: unknown[]) => Promise<unknown>)
       | undefined;
+    const onStepEnd = settings.onStepEnd as ((...args: unknown[]) => Promise<unknown>) | undefined;
 
     this.generate = vi.fn().mockImplementation(async (options: { messages: unknown[] }) => {
+      let preparedMessages = options.messages;
       if (prepareStep) {
-        await prepareStep({
+        const prepared = await prepareStep({
           messages: options.messages,
           steps: [],
           stepNumber: 0,
           model: {},
           context: undefined,
         });
+        if (
+          prepared !== null &&
+          typeof prepared === "object" &&
+          "messages" in prepared &&
+          Array.isArray(prepared.messages)
+        ) {
+          preparedMessages = prepared.messages;
+        }
       }
+      if (onStepStart) await onStepStart({ messages: preparedMessages });
 
       const tools = (
         settings as {
@@ -87,81 +121,7 @@ function setupMockAgentForToolExecution(toolName: string, args: unknown): void {
         usage: undefined,
       };
 
-      if (onStepFinish) await onStepFinish(result);
-      return { ...result, responseMessages: result.response.messages };
-    });
-
-    return this as unknown as ToolLoopAgent;
-  } as unknown as ConstructorParameters<typeof ToolLoopAgent> extends [infer S]
-    ? (settings: S) => ToolLoopAgent
-    : never);
-}
-
-function setupMockAgentForToolCall(toolName: string, args: unknown): void {
-  vi.mocked(ToolLoopAgent).mockImplementation(function (
-    this: Record<string, unknown>,
-    settings: Record<string, unknown>,
-  ) {
-    const prepareStep = settings.prepareStep as
-      | ((...args: unknown[]) => Promise<unknown>)
-      | undefined;
-    const onStepFinish = settings.onStepFinish as
-      | ((...args: unknown[]) => Promise<unknown>)
-      | undefined;
-
-    this.generate = vi.fn().mockImplementation(async (options: { messages: unknown[] }) => {
-      if (prepareStep) {
-        await prepareStep({
-          context: undefined,
-          messages: options.messages,
-          model: {},
-          stepNumber: 0,
-          steps: [],
-        });
-      }
-
-      const result = {
-        content: [
-          {
-            input: args,
-            toolCallId: "call-subagent-1",
-            toolName,
-            type: "tool-call",
-          },
-        ],
-        finishReason: "tool-calls",
-        response: {
-          messages: [
-            {
-              content: [
-                {
-                  input: args,
-                  toolCallId: "call-subagent-1",
-                  toolName,
-                  type: "tool-call",
-                },
-              ],
-              role: "assistant",
-            },
-          ],
-        },
-        text: undefined,
-        toolCalls: [
-          {
-            input: args,
-            toolCallId: "call-subagent-1",
-            toolName,
-            type: "tool-call",
-          },
-        ],
-        toolResults: [],
-        usage: undefined,
-      };
-
-      if (onStepFinish) {
-        await onStepFinish(result);
-      }
-
+      if (onStepEnd) await onStepEnd(result);
       return { ...result, responseMessages: result.response.messages };
     });
 
@@ -200,7 +160,7 @@ function createTestNode(
   return {
     agent,
     channels: [],
-    hookRegistry: createEmptyHookRegistry(),
+    hookRegistry: createRuntimeHookRegistry([]),
     nodeId: ROOT_RUNTIME_AGENT_NODE_ID,
     sandboxRegistry: createStubSandboxRegistry(),
     subagentRegistry: {
@@ -218,21 +178,35 @@ function createTestNode(
 
 async function createNodeWithSourceOwnedTools(input: {
   readonly names: readonly string[];
-  readonly tasks?: boolean;
+  readonly owner?:
+    | { readonly kind: "application" }
+    | { readonly feature: string; readonly kind: "framework" };
   readonly turnTools?: StaticRuntimeTurnAgent["tools"];
 }): Promise<ResolvedRuntimeAgentNode> {
-  const toolRegistry = await createRuntimeToolRegistry({
-    tools: input.names.map((name) => ({
-      description: `${name} programmatic tool.`,
-      execute: async () => `${name}-sentinel`,
-      inputSchema: null,
-      logicalPath: `tools/${name}.ts`,
-      name,
-      owner: { feature: "test", kind: "framework" },
-      sourceId: `framework:tools/${name}.ts`,
-      sourceKind: "module",
-    })),
-  });
+  const toolRegistry = await createRuntimeToolRegistry(
+    {
+      tools: input.names.map((name) => {
+        const frameworkAgent = name === AGENT_TOOL_NAME && input.owner?.kind !== "application";
+        return {
+          behavior: frameworkAgent
+            ? {
+                availability: ["root-session"] as const,
+                handling: { action: "self-agent" as const, kind: "dispatch" as const },
+              }
+            : undefined,
+          description: frameworkAgent ? AGENT_TOOL_DESCRIPTION : `${name} programmatic tool.`,
+          execute: async () => `${name}-sentinel`,
+          inputSchema: frameworkAgent ? SUBAGENT_TOOL_INPUT_SCHEMA : null,
+          logicalPath: `tools/${name}.ts`,
+          name,
+          owner: input.owner ?? { feature: "test", kind: "framework" },
+          sourceId: `framework:tools/${name}.ts`,
+          sourceKind: "module",
+        };
+      }),
+    },
+    { nodeId: ROOT_RUNTIME_AGENT_NODE_ID },
+  );
   const node = createTestNode(
     createTestTurnAgent({
       tools: [...toolRegistry.preparedTools, ...(input.turnTools ?? [])],
@@ -244,7 +218,6 @@ async function createNodeWithSourceOwnedTools(input: {
     agent: {
       ...node.agent,
       config: {
-        experimental: { tasks: input.tasks === true },
         model: { id: "test-model" },
         name: "test",
       },
@@ -270,123 +243,101 @@ function createNoopRuntime(): Runtime {
 }
 
 describe("createNodeHarnessTools", () => {
-  it("keeps the compiled framework question tool client-side", async () => {
-    const node = await createNodeWithSourceOwnedTools({ names: ["ask_question"] });
+  it("adds the framework label start callback to provider-managed web search", async () => {
+    const node = await createNodeWithSourceOwnedTools({ names: ["web_search"] });
+    const label = createNodeHarnessTools({ node }).get("web_search")?.label?.start;
 
-    expect(createNodeHarnessTools({ node }).get("ask_question")?.execute).toBeUndefined();
+    expect(label?.({ query: "Slack plan blocks" })).toBe("Search Slack plan blocks");
   });
 
-  it("lowers the compiled framework agent tool to the canonical dispatch action", async () => {
+  it("does not add the framework label to an authored web_search override", async () => {
+    const node = await createNodeWithSourceOwnedTools({
+      names: ["web_search"],
+      owner: { kind: "application" },
+    });
+
+    expect(createNodeHarnessTools({ node }).get("web_search")?.label?.start).toBeUndefined();
+  });
+
+  it("lowers the compiled framework agent tool as a workflow tool", async () => {
     const node = await createNodeWithSourceOwnedTools({ names: ["agent"] });
     const agentTool = createNodeHarnessTools({ node }).get("agent");
 
     expect(agentTool?.description).toContain("split a large task into independent pieces");
-    expect(agentTool?.description).toContain("multiple `agent` calls in one response");
-    expect(agentTool?.description).toContain("run a small fixed set in parallel");
-    expect(agentTool?.description).toContain("include essential context");
+    expect(agentTool?.description).toContain("several agents can work at once");
+    expect(agentTool?.description).toContain("state the goal, what to return");
+    expect(agentTool?.description).toContain("put everything it needs in message");
     expect(agentTool?.description).toContain("non-overlapping scopes");
-    expect(agentTool?.description).not.toContain("eve");
-    expect(agentTool?.runtimeAction).toEqual({
-      kind: "subagent-call",
-      nodeId: ROOT_RUNTIME_AGENT_NODE_ID,
-      subagentName: "agent",
-    });
+    expect(agentTool?.description).not.toMatch(/\beve\b/);
+    expect(agentTool?.execute).toBeUndefined();
+    expect(agentTool?.workflowId).toBe("workflow//eve//agentToolServeWorkflow");
   });
 
-  it("omits compiled task-control tools unless experimental.tasks is on", async () => {
+  it("keeps an authored agent tool separate from self-delegation", async () => {
     const node = await createNodeWithSourceOwnedTools({
-      names: ["task_cancel", "task_update"],
+      names: ["agent"],
+      owner: { kind: "application" },
     });
-    const tools = createNodeHarnessTools({ node });
+    const agentTool = createNodeHarnessTools({ node }).get("agent");
 
-    for (const name of ["task_cancel", "task_update"]) {
-      expect(tools.has(name)).toBe(false);
-    }
+    expect(agentTool?.availableInSubagents).toBeUndefined();
+    expect(agentTool).not.toHaveProperty("resultKind");
+    expect(agentTool?.rootOnly).toBeUndefined();
+    expect(agentTool?.workflowId).toBeUndefined();
   });
 
-  it("lowers compiled task-control tools when experimental.tasks is on", async () => {
-    const tools = createNodeHarnessTools({
-      node: await createNodeWithSourceOwnedTools({
-        names: ["task_cancel", "task_update"],
-        tasks: true,
-      }),
-    });
-
-    for (const name of ["task_cancel", "task_update"]) {
-      expect(tools.get(name)?.runtimeAction).toEqual({ kind: "task-control" });
-      expect(tools.get(name)?.execute).toBeUndefined();
-    }
-    expect(tools.has("task_sleep")).toBe(false);
-  });
-
-  it("executes compiled local and remote delegation tools in the selected task mode", async () => {
+  it("lowers compiled local and remote delegation tools as workflow tools", async () => {
     const delegationTools: StaticRuntimeTurnAgent["tools"] = [
-      {
+      createPreparedRuntimeSubagentTool({
         description: "Delegate local research.",
-        inputSchema: { type: "object" },
         kind: "subagent",
         logicalPath: "subagents/research",
         name: "research",
         nodeId: "subagents/research",
         sourceId: "subagents/research",
-      },
-      {
+        sourceKind: "module",
+      }),
+      createPreparedRuntimeSubagentTool({
         description: "Delegate remote review.",
-        inputSchema: { type: "object" },
         kind: "remote",
         logicalPath: "remote-agents/reviewer",
         name: "reviewer",
         nodeId: "remote-agents/reviewer",
+        path: "/eve/v1/session",
         sourceId: "remote-agents/reviewer",
-      },
+        sourceKind: "module",
+        url: "https://review.example.com",
+      }),
     ];
-    const legacy = createNodeHarnessTools({
-      node: await createNodeWithSourceOwnedTools({
-        names: ["agent"],
-        turnTools: delegationTools,
-      }),
-    });
-    expect(legacy.get("research")?.runtimeAction?.kind).toBe("subagent-call");
-    expect(legacy.get("reviewer")?.runtimeAction?.kind).toBe("remote-agent-call");
-    expect(legacy.get("research")?.execution).toBeUndefined();
-    expect(legacy.get("reviewer")?.execution).toBeUndefined();
-
-    const background = createNodeHarnessTools({
-      node: await createNodeWithSourceOwnedTools({
-        names: ["agent"],
-        tasks: true,
-        turnTools: delegationTools,
-      }),
-    });
-    for (const name of ["agent", "research", "reviewer"]) {
-      expect(background.get(name)?.execution).toBe("background");
-      expect(background.get(name)?.execute).toBeDefined();
-      expect(background.get(name)?.runtimeAction).toBeUndefined();
-    }
-    expect(
-      countLocalSubagentCalls(
-        ["agent", "research", "reviewer"].map((name) => {
-          const execute = background.get(name)?.execute;
-          if (execute === undefined) throw new Error(`Missing background executor for ${name}.`);
-          return { definition: { execute } };
-        }),
-      ),
-    ).toBe(2);
-  });
-
-  it("does not recreate task tools absent from the compiled graph", async () => {
     const tools = createNodeHarnessTools({
-      node: await createNodeWithSourceOwnedTools({ names: ["task_update"], tasks: true }),
+      node: await createNodeWithSourceOwnedTools({
+        names: ["agent"],
+        turnTools: delegationTools,
+      }),
     });
-
-    expect(tools.has("task_update")).toBe(true);
-    expect(tools.has("task_cancel")).toBe(false);
+    for (const name of ["research", "reviewer"]) {
+      expect(tools.get(name)?.execute).toBeUndefined();
+      expect(tools.get(name)?.workflowId).toBe("workflow//eve//agentToolServeWorkflow");
+    }
   });
 });
 
 describe("createExecutionNodeStep", () => {
   it("builds a usable harness step for the root node", async () => {
     setupMockAgentForToolExecution("regular-tool", { question: "Run the tool." });
+    const forceFlush = vi.fn(async () => undefined);
+    const runtime: InstrumentationRuntime = {
+      forceFlush,
+      hooks: createInstrumentationHooks([]),
+      otelSettings: undefined,
+      runInContext: (_operation, execute) => execute(),
+      shutdown: async () => undefined,
+    };
+    const instrumentation = bindInstrumentationRuntime(runtime, new ContextContainer(), {
+      agentName: "test-agent",
+      rootSessionId: "sess-root",
+      sessionId: "sess-root",
+    });
 
     const toolRegistry = await createRuntimeToolRegistry({
       tools: [
@@ -416,7 +367,7 @@ describe("createExecutionNodeStep", () => {
     };
     const step = createExecutionNodeStep({
       createRuntime: () => createNoopRuntime(),
-      mode: "task",
+      instrumentation,
       modelResolutionScope,
       node: rootNode,
     });
@@ -448,101 +399,158 @@ describe("createExecutionNodeStep", () => {
       ),
     );
 
-    expect(result.next).toEqual({ done: true, output: "tool-output" });
+    expect(result.next).toBeNull();
+    expect(result.settledTurn).toEqual({ output: "tool-output" });
     expect(resolveRuntimeModelReference).toHaveBeenCalledWith(
       rootNode.turnAgent.model,
       modelResolutionScope,
     );
   });
 
-  it("records visible subagent tools as pending runtime actions", async () => {
-    setupMockAgentForToolCall("child-agent", { task: "Delegate this." });
+  it("prepares persisted step tools with the node's dynamic resolvers", async () => {
+    const executeCallback = vi.fn(async (closure: unknown) => {
+      return (closure as { version: string }).version;
+    });
+    const handler = vi.fn(() => ({
+      wired_dynamic_tool: defineTool({
+        approval: stampDurableDynamicCallback(() => "user-approval" as const, {
+          callback: () => "user-approval" as const,
+          closure: { version: "current-request" },
+        }),
+        description: "A dynamic tool.",
+        execute: stampDurableDynamicCallback(async () => "current-execute", {
+          callback: executeCallback,
+          closure: { version: "current-execute" },
+        }),
+        inputSchema: { type: "object" },
+      }),
+    }));
+    const dynamicToolResolver = {
+      eventNames: ["step.started"],
+      events: { "step.started": handler },
+      logicalPath: "agent/tools/wired.ts",
+      slug: "wired",
+      sourceId: "test:wired-dynamic-tool",
+      sourceKind: "module",
+    } as never;
+    const baseNode = createTestNode();
+    const node = {
+      ...baseNode,
+      agent: {
+        ...baseNode.agent,
+        dynamicToolResolvers: [dynamicToolResolver],
+      },
+    };
+    setupMockAgentForToolExecution("wired_dynamic_tool", {});
+    const step = createExecutionNodeStep({
+      createRuntime: () => createNoopRuntime(),
+      instrumentation: undefined,
+      modelResolutionScope: { moduleMap: { nodes: {} }, nodeId: undefined },
+      node,
+    });
 
-    const createRuntime = vi.fn();
-
-    const testCompiledArtifactsSource = createBundledRuntimeCompiledArtifactsSource();
-    const rootNode = createTestNode(
-      createTestTurnAgent({
-        tools: [
+    const responder = {
+      attributes: {},
+      authenticator: "test",
+      issuer: "test",
+      principalId: "user-1",
+      principalType: "user" as const,
+    };
+    const ctx = new ContextContainer();
+    ctx.set(AuthKey, responder);
+    ctx.set(InitiatorAuthKey, null);
+    ctx.set(BundleKey, {
+      compiledArtifactsSource: createBundledRuntimeCompiledArtifactsSource(),
+    } as never);
+    ctx.set(ChannelKey, { kind: "http" });
+    ctx.set(SessionIdKey, "sess-dynamic");
+    ctx.set(SessionKey, {
+      auth: { current: responder, initiator: null },
+      sessionId: "sess-dynamic",
+      turn: { id: "turn-1", sequence: 1 },
+    });
+    ctx.set(StepDynamicToolMetadataKey, [
+      {
+        callbacks: {
+          approvalRequest: {
+            closure: { version: "persisted-request" },
+            stepId: "eve:dynamic-tool//old/approval-request/0-100",
+          },
+          execute: {
+            closure: { version: "persisted-execute" },
+            stepId: "eve:dynamic-tool//old/execute/0-100",
+          },
+        },
+        description: "Old dynamic tool.",
+        entryKey: "wired_dynamic_tool",
+        inputSchema: { type: "object" },
+        name: "wired_dynamic_tool",
+        resolverSlug: "wired",
+      } satisfies OldSourceOffsetDynamicToolMetadata,
+    ]);
+    const session = withParkedStep(
+      createSession({
+        continuationToken: "test-dynamic",
+        sessionId: "sess-dynamic",
+        turnAgent: node.turnAgent,
+      }),
+      {
+        messages: [
           {
-            description: "Delegate work to the child agent.",
-            inputSchema: { type: "object" },
-            kind: "subagent",
-            logicalPath: "subagents/child",
-            name: "child-agent",
-            nodeId: "child-node",
-            sourceId: "subagents/child",
+            content: [
+              {
+                input: {},
+                toolCallId: "call-wired",
+                toolName: "wired_dynamic_tool",
+                type: "tool-call",
+              },
+              {
+                approvalId: "approval-wired",
+                toolCallId: "call-wired",
+                type: "tool-approval-request",
+              },
+            ],
+            role: "assistant",
+          },
+        ],
+        requests: [
+          {
+            action: {
+              callId: "call-wired",
+              input: {},
+              kind: "tool-call",
+              toolName: "wired_dynamic_tool",
+            },
+            allowFreeform: false,
+            display: "confirmation",
+            kind: "tool-approval",
+            options: [
+              { id: "approve", label: "Approve" },
+              { id: "cancel", label: "Cancel" },
+            ],
+            prompt: "Approve dynamic tool",
+            requestId: "approval-wired",
+          },
+        ],
+      },
+    );
+
+    await contextStorage.run(ctx, () =>
+      step(session, {
+        attributedInputResponses: [
+          {
+            auth: responder,
+            response: { optionId: "approve", requestId: "approval-wired" },
           },
         ],
       }),
     );
-    const step = createExecutionNodeStep({
-      createRuntime,
-      mode: "task",
-      modelResolutionScope: {
-        moduleMap: { nodes: {} },
-        nodeId: undefined,
-      },
-      node: rootNode,
-    });
 
-    const ctx = new ContextContainer();
-    ctx.set(AuthKey, null);
-    ctx.set(InitiatorAuthKey, null);
-    ctx.set(BundleKey, { compiledArtifactsSource: testCompiledArtifactsSource } as never);
-    ctx.set(ChannelKey, { kind: "http" });
-    ctx.set(SessionIdKey, "parent-session");
-    ctx.set(SessionKey, {
-      auth: { current: null, initiator: null },
-      sessionId: "parent-session",
-      turn: { id: "parent-turn", sequence: 0 },
-    });
-
-    const result = await contextStorage.run(ctx, async () =>
-      step(
-        createSession({
-          continuationToken: "test-root",
-          sessionId: "sess-root",
-          turnAgent: rootNode.turnAgent,
-        }),
-        {
-          message: "Delegate this.",
-        },
-      ),
+    expect(handler).toHaveBeenCalledOnce();
+    expect(executeCallback).toHaveBeenCalledWith(
+      { version: "persisted-execute" },
+      {},
+      expect.objectContaining({ callId: "call-wired_dynamic_tool" }),
     );
-
-    expect(result.next).toBeNull();
-    expect(createRuntime).not.toHaveBeenCalled();
-    expect(getPendingRuntimeActionBatch(result.session.state)).toEqual({
-      actions: [
-        {
-          callId: "call-subagent-1",
-          description: "Delegate work to the child agent.",
-          input: { task: "Delegate this." },
-          kind: "subagent-call",
-          name: "child-agent",
-          nodeId: "child-node",
-          subagentName: "child-agent",
-        },
-      ],
-      event: {
-        sequence: 0,
-        stepIndex: 0,
-        turnId: "",
-      },
-      responseMessages: [
-        {
-          content: [
-            {
-              input: { task: "Delegate this." },
-              toolCallId: "call-subagent-1",
-              toolName: "child-agent",
-              type: "tool-call",
-            },
-          ],
-          role: "assistant",
-        },
-      ],
-    });
   });
 });

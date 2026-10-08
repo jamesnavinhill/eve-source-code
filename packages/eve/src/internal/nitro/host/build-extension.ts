@@ -68,7 +68,7 @@ export async function buildExtensionPackage(
   let preserveTransactionRoot = false;
   try {
     await mkdir(stagedDistRoot, { recursive: true });
-    await emitExtensionDistribution({
+    const runtimeImports = await emitExtensionDistribution({
       appRoot,
       declarationModule,
       declarationsRoot: join(transactionRoot, "declarations"),
@@ -80,6 +80,9 @@ export async function buildExtensionPackage(
       stagedOutDir,
       transactionRoot,
     });
+    // Rewrite package.json before stamping the manifest: production builds treat
+    // a package.json newer than the manifest as a stale distribution.
+    await ensureExtensionExports(appRoot, config.outDir);
     await writeExtensionCompatibilityManifest(stagedDistRoot, {
       kind: EXTENSION_COMPATIBILITY_MANIFEST_KIND,
       formatVersion: EXTENSION_COMPATIBILITY_MANIFEST_FORMAT_VERSION,
@@ -88,6 +91,8 @@ export async function buildExtensionPackage(
         ? {}
         : { build: { externalDependencies: config.externalDependencies } }),
       requires: await deriveExtensionCapabilityRequirements({
+        runtimeImports,
+        runtimeRoot: stagedOutDir,
         declarationModule,
         manifest,
         packageName: config.packageName,
@@ -96,7 +101,6 @@ export async function buildExtensionPackage(
         sourceRoot: config.sourceRoot,
       }),
     });
-    await ensureExtensionExports(appRoot, config.outDir);
     await replaceExtensionBuildOutput({ outDir: config.outDir, stagedOutDir, transactionRoot });
     return config.outDir;
   } catch (error) {

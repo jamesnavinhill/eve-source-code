@@ -4,7 +4,7 @@ import { createCompiledBindingNamespaceLoader } from "#compiler/load-binding-nam
 import {
   createAgentSourceRegistry,
   defineProgrammaticAgentSource,
-  type CompiledModuleBinding,
+  type AgentModuleBinding,
 } from "#compiler/source-graph.js";
 
 const mocks = vi.hoisted(() => ({
@@ -24,7 +24,7 @@ describe("compiled binding namespace loader", () => {
       revision: "test:template:v1",
     });
     const registry = createAgentSourceRegistry([], { templates: [template] });
-    const bindings: Record<string, CompiledModuleBinding> = {
+    const bindings: Record<string, AgentModuleBinding> = {
       dependency: {
         backing: {
           externalDependencies: [],
@@ -48,6 +48,7 @@ describe("compiled binding namespace loader", () => {
       },
     };
     const loadNamespace = createCompiledBindingNamespaceLoader({
+      appRoot: undefined,
       bindings,
       registries: [registry],
     });
@@ -73,7 +74,7 @@ describe("compiled binding namespace loader", () => {
       revision: "test:cyclic-template:v1",
     });
     const registry = createAgentSourceRegistry([], { templates: [template] });
-    const programmatic = (dependency: string): CompiledModuleBinding => ({
+    const programmatic = (dependency: string): AgentModuleBinding => ({
       backing: {
         dependencies: { source: dependency },
         kind: "programmatic",
@@ -85,6 +86,7 @@ describe("compiled binding namespace loader", () => {
       owner: { feature: "test", kind: "framework" },
     });
     const loadNamespace = createCompiledBindingNamespaceLoader({
+      appRoot: undefined,
       bindings: { first: programmatic("second"), second: programmatic("first") },
       registries: [registry],
     });

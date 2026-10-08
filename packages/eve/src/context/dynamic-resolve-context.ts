@@ -2,6 +2,7 @@ import type { ModelMessage } from "ai";
 
 import type { DynamicResolveContext } from "#dynamic/definition.js";
 import type { AlsContext } from "#context/container.js";
+import { getEffectiveModelSelection } from "#context/effective-model.js";
 import {
   AuthKey,
   ChannelInstrumentationKey,
@@ -11,6 +12,8 @@ import {
 } from "#context/keys.js";
 import { ChannelKey } from "#runtime/sessions/runtime-context-keys.js";
 import { getAdapterKind } from "#channel/adapter.js";
+import { readSessionSchedule } from "#context/session-schedule.js";
+import { ConversationContextKey } from "#shared/conversation-context.js";
 
 type ReadableContext = Pick<AlsContext, "get">;
 
@@ -30,10 +33,13 @@ export function buildResolveContext(
   const channelAdapter = ctx.get(ChannelKey);
   const continuationToken = ctx.get(ContinuationTokenKey);
   const channelInstrumentation = ctx.get(ChannelInstrumentationKey);
+  const effectiveModel = getEffectiveModelSelection(ctx);
 
   return {
+    model: effectiveModel === null ? null : { id: effectiveModel.reference.id },
     session: {
       id: sessionId,
+      schedule: readSessionSchedule(ctx),
       auth: {
         current: currentAuth,
         initiator: initiatorAuth,
@@ -44,6 +50,9 @@ export function buildResolveContext(
       continuationToken,
       metadata: channelInstrumentation?.metadata,
     },
+    ...(ctx.get(ConversationContextKey) === undefined
+      ? undefined
+      : { conversation: ctx.get(ConversationContextKey) }),
     messages,
   };
 }

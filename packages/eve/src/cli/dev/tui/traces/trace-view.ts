@@ -37,7 +37,7 @@ const BODY_MIN_WIDTH = 20;
 const PANEL_MIN_WIDTH = 20;
 const PANEL_MAX_WIDTH = 64;
 
-export interface TraceViewerFrame {
+interface TraceViewerFrame {
   readonly rows: readonly string[];
   /** Detail rows the panel has for the selected span — fed back into key handling. */
   readonly panelTotalRows: number;
@@ -49,7 +49,7 @@ export interface TraceViewerFrame {
   readonly contentWidth: number;
 }
 
-export interface RenderTraceViewerOptions {
+interface RenderTraceViewerOptions {
   readonly width: number;
   readonly height: number;
   readonly theme: Theme;
@@ -191,8 +191,8 @@ function overlayRight(row: string, segment: string, width: number, margin: numbe
  * them in conversation mode so it stays metadata-focused.
  */
 const CONVERSATION_CONTENT_KEYS: ReadonlySet<string> = new Set([
-  "ai.prompt.messages",
-  "ai.prompt.system",
+  "gen_ai.input.messages",
+  "gen_ai.system_instructions",
   "ai.response.reasoning",
   "ai.response.text",
   "ai.response.tool_calls",
@@ -261,8 +261,8 @@ function renderHeader(state: TraceViewerState, options: RenderTraceViewerOptions
   if (state.trace?.agentName !== undefined) {
     segments.push(stripTerminalControls(state.trace.agentName));
   }
-  if (state.trace?.sessionId !== undefined) {
-    segments.push(`session ${stripTerminalControls(state.trace.sessionId)}`);
+  if (state.trace?.conversationId !== undefined) {
+    segments.push(`conversation ${stripTerminalControls(state.trace.conversationId)}`);
   }
   if (state.trace !== undefined) {
     const end =

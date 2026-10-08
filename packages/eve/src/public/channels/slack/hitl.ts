@@ -19,8 +19,10 @@ import {
   truncatePlainText,
   truncateSectionText,
 } from "#public/channels/slack/limits.js";
+import type { BlockKitBlock } from "#public/channels/slack/blocks.js";
 import {
   type InputRequest,
+  type InputResponse,
   parseInputResponse,
   type ValidatedInputResponse,
 } from "#shared/input.js";
@@ -58,6 +60,14 @@ export const HITL_FREEFORM_MODAL_BLOCK_ID = "eve_freeform_block";
  */
 export const HITL_FREEFORM_MODAL_ACTION_ID = "eve_freeform_text";
 
+const HITL_ROUTE_PREFIX = `${HITL_ACTION_PREFIX}route:`;
+
+/** Slack thread a routed HITL widget answers back to. */
+export interface SlackHitlRoute {
+  readonly channelId: string;
+  readonly threadTs: string;
+}
+
 /**
  * Maximum radio-button option count before the renderer falls back to
  * a `static_select` dropdown. Matches Slack's UX guidance (radio
@@ -78,7 +88,7 @@ type CardButtonOption = Pick<InputRequestOption, "id" | "label" | "style">;
  * Subset of one Slack interactivity action the HITL decoder reads.
  * Mirrors the relevant fields of `SlackInteractionAction`.
  */
-interface SlackHitlAction {
+export interface SlackHitlAction {
   readonly actionId: string;
   /** `value` field on Slack `button` payloads. */
   readonly value?: string;
@@ -88,50 +98,50 @@ interface SlackHitlAction {
 
 /**
  * Resolved HITL response derived from one Slack interactivity action.
- * Slack-local classification stays beside the typed eve input response so
+ * Slack-local classification stays beside the eve input response so
  * presentation metadata cannot cross the durable session-inbox boundary.
  */
-interface DerivedHitlResponse {
+export interface DerivedHitlResponse {
   readonly kind?: "tool-approval";
+  readonly response: InputResponse;
+  readonly route?: SlackHitlRoute;
+}
+
+/** A derived response whose input response already passed schema validation. */
+interface ValidatedHitlResponse extends DerivedHitlResponse {
   readonly response: ValidatedInputResponse;
 }
 
+interface DecodedHitlActionId {
+  button: boolean;
+  kind?: "tool-approval";
+  requestId: string;
+  route?: SlackHitlRoute;
+}
+
 /**
- * Decodes one Slack interactivity action into an HITL response, or
- * returns `null` when the action does not match an HITL widget the
- * framework rendered.
+ * Decodes one Slack interactivity action on a widget from
+ * {@link renderInputRequestBlocks} into an HITL response, or returns `null`
+ * when the action does not match an HITL widget eve rendered.
  */
-export function deriveHitlResponse(action: SlackHitlAction): DerivedHitlResponse | null {
-  if (!action.actionId.startsWith(HITL_ACTION_PREFIX)) return null;
+export const deriveHitlResponse: (action: SlackHitlAction) => DerivedHitlResponse | null = (
+  action,
+) => decodeHitlResponse(action);
 
-  const encodedRequest = action.actionId.slice(HITL_ACTION_PREFIX.length);
-
-  if (action.selectedOptionValue !== undefined) {
-    const { kind, requestId } = splitEncodedRequest(encodedRequest);
-    if (!requestId) return null;
-    return kind === "tool-approval"
-      ? {
-          kind,
-          response: parseInputResponse({ optionId: action.selectedOptionValue, requestId }),
-        }
-      : {
-          response: parseInputResponse({ optionId: action.selectedOptionValue, requestId }),
-        };
-  }
-
-  if (action.value !== undefined) {
-    const match = BUTTON_ACTION_ID_RE.exec(encodedRequest);
-    const requestId = match?.groups?.requestId;
-    if (!requestId) return null;
-    return match.groups?.kind === "tool-approval"
-      ? {
-          kind: "tool-approval",
-          response: parseInputResponse({ optionId: action.value, requestId }),
-        }
-      : { response: parseInputResponse({ optionId: action.value, requestId }) };
-  }
-
-  return null;
+/** {@link deriveHitlResponse}, keeping the validated type `respond()` accepts. */
+export function decodeHitlResponse(action: SlackHitlAction): ValidatedHitlResponse | null {
+  const decoded = decodeHitlActionId(action.actionId);
+  if (decoded === null) return null;
+  const optionId = action.selectedOptionValue ?? action.value;
+  if (optionId === undefined || (action.value !== undefined && !decoded.button)) return null;
+  const derived: {
+    kind?: "tool-approval";
+    response: ValidatedInputResponse;
+    route?: SlackHitlRoute;
+  } = { response: parseInputResponse({ optionId, requestId: decoded.requestId }) };
+  if (decoded.kind !== undefined) derived.kind = decoded.kind;
+  if (decoded.route !== undefined) derived.route = decoded.route;
+  return derived;
 }
 
 function splitEncodedRequest(value: string): {
@@ -153,8 +163,42 @@ export function isHitlAction(actionId: string): boolean {
   return actionId.startsWith(HITL_ACTION_PREFIX);
 }
 
+/** Decodes the framework-owned identity and optional return route from one action id. */
+export function decodeHitlActionId(actionId: string): DecodedHitlActionId | null {
+  if (!actionId.startsWith(HITL_ACTION_PREFIX)) return null;
+  let encoded = actionId.slice(HITL_ACTION_PREFIX.length);
+  let route: SlackHitlRoute | undefined;
+  if (encoded.startsWith("route:")) {
+    encoded = encoded.slice("route:".length);
+    const first = encoded.indexOf(":");
+    const second = encoded.indexOf(":", first + 1);
+    if (first <= 0 || second <= first + 1) return null;
+    route = { channelId: encoded.slice(0, first), threadTs: encoded.slice(first + 1, second) };
+    encoded = encoded.slice(second + 1);
+  }
+  const button = BUTTON_ACTION_ID_RE.exec(encoded);
+  const request = splitEncodedRequest(button?.groups?.requestId ?? encoded);
+  if (!request.requestId) return null;
+  const kind = button?.groups?.kind === "tool-approval" ? "tool-approval" : request.kind;
+  const decoded: DecodedHitlActionId = {
+    button: button !== null,
+    requestId: request.requestId,
+  };
+  if (kind !== undefined) decoded.kind = kind;
+  if (route !== undefined) decoded.route = route;
+  return decoded;
+}
+
+function encodeHitlActionId(request: InputRequest, route?: SlackHitlRoute): string {
+  const requestIdentity = `${request.kind === "tool-approval" ? "tool-approval:" : ""}${request.requestId}`;
+  return route === undefined
+    ? `${HITL_ACTION_PREFIX}${requestIdentity}`
+    : `${HITL_ROUTE_PREFIX}${route.channelId}:${route.threadTs}:${requestIdentity}`;
+}
+
 /**
- * Renders one `InputRequest` as Block Kit blocks:
+ * Renders one `InputRequest` as Block Kit blocks. Clicks on the rendered
+ * widgets decode with {@link deriveHitlResponse}:
  *
  * - `display === "select"` with ≤ {@link RADIO_SELECT_OPTION_LIMIT}
  *   options → `radio_buttons`. Single-click answer, options stay
@@ -171,15 +215,16 @@ export function isHitlAction(actionId: string): boolean {
  *
  * Always emits at least the prompt section.
  */
-export function renderInputRequestBlocks(request: InputRequest): unknown[] {
+export function renderInputRequestBlocks(
+  request: InputRequest,
+  route?: SlackHitlRoute,
+): BlockKitBlock[] {
   const prompt = {
     text: { text: truncateSectionText(request.prompt), type: "mrkdwn" },
     type: "section",
   };
   const details = renderInputRequestDetailBlocks(request);
-  const actionId = `${HITL_ACTION_PREFIX}${
-    request.kind === "tool-approval" ? "tool-approval:" : ""
-  }${request.requestId}`;
+  const actionId = encodeHitlActionId(request, route);
 
   const options = request.options;
   const acceptsFreeform = request.allowFreeform === true || !options || options.length === 0;
@@ -204,6 +249,7 @@ export function renderInputRequestBlocks(request: InputRequest): unknown[] {
   }
 
   if (acceptsFreeform) {
+    const freeformActionId = actionId.replace(HITL_ACTION_PREFIX, HITL_FREEFORM_ACTION_PREFIX);
     return [
       prompt,
       ...details,
@@ -212,7 +258,7 @@ export function renderInputRequestBlocks(request: InputRequest): unknown[] {
         elements: [
           {
             type: "button",
-            action_id: `${HITL_FREEFORM_ACTION_PREFIX}${request.requestId}`,
+            action_id: freeformActionId,
             text: { type: "plain_text", text: "Type your answer" },
             style: "primary",
             value: request.requestId,
@@ -235,11 +281,14 @@ export interface SlackInputRequestPostPart {
  * originating message in `block_actions`, so putting large tool input beside
  * the buttons makes the callback body grow with model-authored input.
  */
-export function renderInputRequestPostParts(request: InputRequest): {
+export function renderInputRequestPostParts(
+  request: InputRequest,
+  route?: SlackHitlRoute,
+): {
   readonly controls: SlackInputRequestPostPart;
   readonly details?: SlackInputRequestPostPart;
 } {
-  const blocks = renderInputRequestBlocks(request);
+  const blocks = renderInputRequestBlocks(request, route);
   const firstBlock = blocks[0];
   if (!isApprovalRequest(request) || !isBlockType(firstBlock, "card") || blocks.length === 1) {
     return {
@@ -278,6 +327,8 @@ export interface HitlFreeformModalMetadata {
   /** Workspace whose app installation supplies credentials for modal follow-up API calls. */
   readonly installationTeamId?: string;
   readonly threadTs: string;
+  /** Slack conversation containing the interactive card. */
+  readonly messageChannelId?: string;
   readonly messageTs: string;
   readonly requestId: string;
 }
@@ -329,13 +380,11 @@ export function isFreeformAction(actionId: string): boolean {
   return actionId.startsWith(HITL_FREEFORM_ACTION_PREFIX);
 }
 
-/**
- * Extracts the requestId from a freeform-answer button's `action_id`.
- */
-export function freeformRequestIdFromActionId(actionId: string): string | undefined {
-  if (!isFreeformAction(actionId)) return undefined;
-  const slice = actionId.slice(HITL_FREEFORM_ACTION_PREFIX.length);
-  return slice.length > 0 ? slice : undefined;
+export function decodeFreeformHitlActionId(actionId: string): DecodedHitlActionId | null {
+  if (!isFreeformAction(actionId)) return null;
+  return decodeHitlActionId(
+    `${HITL_ACTION_PREFIX}${actionId.slice(HITL_FREEFORM_ACTION_PREFIX.length)}`,
+  );
 }
 
 function buildCardButton(
@@ -371,7 +420,7 @@ function renderInputRequestCardBlock(
   request: InputRequest,
   actionId: string,
 ): Record<string, unknown> {
-  return {
+  const card: Record<string, unknown> = {
     type: "card",
     body: {
       type: "mrkdwn",
@@ -380,6 +429,11 @@ function renderInputRequestCardBlock(
     },
     actions: cardButtonOptions(request).map((opt, index) => buildCardButton(opt, actionId, index)),
   };
+  // A tool approval holds the turn until someone acts, so say so on the card.
+  if (isApprovalRequest(request)) {
+    card.subtext = { type: "mrkdwn", text: "I've paused until someone approves or cancels." };
+  }
+  return card;
 }
 
 function cardButtonOptions(request: InputRequest): CardButtonOption[] {
@@ -444,7 +498,7 @@ export function buildAnsweredBlocks(input: {
   return blocks;
 }
 
-function renderInputRequestDetailBlocks(request: InputRequest): unknown[] {
+function renderInputRequestDetailBlocks(request: InputRequest): BlockKitBlock[] {
   const details = formatToolInputDetails(request);
   return details === undefined
     ? []

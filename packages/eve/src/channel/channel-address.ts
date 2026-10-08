@@ -21,15 +21,12 @@ import type {
   TurnPolicy,
 } from "#channel/types.js";
 import { DEFAULT_TURN_POLICY } from "#channel/types.js";
-import { isRuntimeSessionOwnershipConflictError } from "#execution/runtime-errors.js";
-import { isReservedSessionCommandToken } from "#execution/session-command-token.js";
-import type { RunMode } from "#shared/run-mode.js";
+import { isReservedSessionCommandToken } from "#execution/session-inbox/address.js";
 
 interface BaseChannelAddressDeliveryOptions {
   readonly auth: SessionAuthContext | null;
   readonly callback?: SessionCallback;
   readonly initiatorAuth?: SessionAuthContext | null;
-  readonly mode?: RunMode;
   readonly title?: string;
   readonly turnPolicy?: TurnPolicy;
 }
@@ -43,7 +40,7 @@ export type ChannelAddressDeliveryOptions<TState = undefined> = [TState] extends
  * Dynamic handle for whichever durable session currently owns one channel-local address.
  * Only {@link send} may create a session when the address is unowned.
  */
-export interface ChannelAddress<TState = undefined> {
+interface ChannelAddress<TState = undefined> {
   readonly continuationToken: string;
   deliver(input: SendPayload, options: ChannelAddressDeliveryOptions<TState>): Promise<Session>;
   send(
@@ -62,9 +59,7 @@ export interface ChannelAddress<TState = undefined> {
 }
 
 /** Factory for binding a route-local continuation token to a {@link ChannelAddress}. */
-export type ChannelAddressFn<TState = undefined> = (
-  continuationToken: string,
-) => ChannelAddress<TState>;
+type ChannelAddressFn<TState = undefined> = (continuationToken: string) => ChannelAddress<TState>;
 
 /** Creates one channel address backed by the runtime's continuation dispatch primitive. */
 export function createChannelAddress<TState = undefined>(input: {
@@ -138,9 +133,10 @@ export function createChannelAddress<TState = undefined>(input: {
       const runInput: RunInput = {
         adapter,
         auth: options.auth,
-        capabilities: options.mode === "task" ? undefined : { requestInput: true },
+        capabilities: { requestInput: true },
         callback: options.callback,
         channelName: input.channelName,
+        continuationConflictCommand: command,
         continuationToken: namespacedToken,
         delivery,
         initiatorAuth: options.initiatorAuth,
@@ -148,23 +144,16 @@ export function createChannelAddress<TState = undefined>(input: {
           context: payload.context,
           message: serializeUrlFilePartsInMessage(payload.message) ?? "",
           outputSchema: payload.outputSchema,
+          state: payload.state,
         },
-        mode: options.mode ?? "conversation",
         requestId: metadata.requestId,
         title: options.title,
       };
-      try {
-        const handle = await input.runtime.createSession(runInput);
-        return createSession(handle.sessionId, input.runtime, {
-          ...metadata,
-          turnPolicy: input.turnPolicy,
-        });
-      } catch (error) {
-        if (!isRuntimeSessionOwnershipConflictError(error)) throw error;
-        const winner = await dispatch();
-        if (winner !== undefined) return winner;
-        throw error;
-      }
+      const handle = await input.runtime.createSession(runInput);
+      return createSession(handle.sessionId, input.runtime, {
+        ...metadata,
+        turnPolicy: input.turnPolicy,
+      });
     },
     async send(message, options) {
       return await this.deliver({ message }, options);

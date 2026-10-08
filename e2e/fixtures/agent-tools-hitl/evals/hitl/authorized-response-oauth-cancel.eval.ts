@@ -7,21 +7,24 @@ export default defineEval({
   tags: ["real-model"],
   description: "Cancel beats a candidate parked on OAuth and a late callback cannot execute.",
   async test(t) {
-    await t.send(`Call the \`${TOOL_NAME}\` tool with marker "${MARKER}".`);
-    const approval = t.requireInputRequest({ display: "confirmation", toolName: TOOL_NAME });
-    const approvalTurn = await t.startRespond(
+    const { session: conversation } = await t.send(
+      `Call the \`${TOOL_NAME}\` tool with marker "${MARKER}".`,
+    );
+    const approval = conversation.requireInputRequest({
+      display: "confirmation",
+      toolName: TOOL_NAME,
+    });
+    const approvalTurn = await conversation.startRespond(
       [{ optionId: "approve", requestId: approval.requestId }],
       { headers: { "x-eve-fixture-user": "oauth-cancel-responder" } },
     );
     const required = await approvalTurn.waitForEvent("authorization.required");
+    // The responder's sign-in holds the turn, so this read stops there.
+    const held = await approvalTurn.result();
 
-    const cancelTurn = await approvalTurn.session.startRespond([
+    const cancelled = await held.session.respond([
       { optionId: "cancel", requestId: approval.requestId },
     ]);
-    await cancelTurn.waitForEvent("approval.settled", {
-      data: { outcome: "cancelled", requestId: approval.requestId },
-    });
-    const cancelled = await cancelTurn.result();
     cancelled.event("approval.settled", {
       count: 1,
       data: { outcome: "cancelled", requestId: approval.requestId },
@@ -41,7 +44,7 @@ export default defineEval({
     if (!callback.ok)
       throw new Error(`Late fixture OAuth callback failed (${String(callback.status)}).`);
 
-    const late = await cancelTurn.session.send("Confirm the cancelled action did not execute.");
+    const late = await cancelled.session.send("Confirm the cancelled action did not execute.");
     late.notEvent("approval.settled", { data: { outcome: "approved" } });
     late.notEvent("action.result", {
       data: { result: { kind: "tool-result", toolName: TOOL_NAME }, status: "completed" },

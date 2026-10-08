@@ -2,7 +2,7 @@ import type { ChannelAdapter } from "#channel/adapter.js";
 import { getAdapterKind } from "#channel/adapter.js";
 import { HTTP_ADAPTER } from "#channel/http.js";
 import { SCHEDULE_ADAPTER } from "#channel/schedule.js";
-import { SUBAGENT_ADAPTER } from "#execution/subagent-adapter.js";
+import { SUBAGENT_ADAPTER } from "#subagents/adapter.js";
 import type { RuntimeRegistryEntryLocation } from "#internal/runtime-registry.js";
 import { RuntimeRegistryError } from "#internal/runtime-registry.js";
 import type { ResolvedChannelDefinition } from "#runtime/types.js";
@@ -129,9 +129,6 @@ export function deserializeRuntimeAdapter(
     );
   }
 
-  // Merge the serialized state onto the adapter config. The behavior
-  // functions come from the registry entry; the state comes from the
-  // serialized context.
   return { ...adapterConfig, state: serialized.state };
 }
 

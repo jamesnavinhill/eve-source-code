@@ -5,11 +5,13 @@ export function createDynamicCapabilityTransformPlugin(
   options: {
     readonly dynamicRemoteAgents?: boolean;
     readonly dynamicTools?: boolean;
+    /** Names of a module's `"use workflow"` functions, when a directive transform ran before this one. */
+    readonly workflowFunctions?: (id: string) => ReadonlySet<string> | undefined;
   } = {},
 ) {
   return {
     async transform(code: string, id: string) {
-      const normalizedId = id.replaceAll("\\", "/");
+      const normalizedId = id.split("?")[0]!.replaceAll("\\", "/");
       const transformDynamicTools = options.dynamicTools !== false;
       const transformDynamicRemoteAgents =
         options.dynamicRemoteAgents !== false && normalizedId.includes("/subagents/");
@@ -20,14 +22,18 @@ export function createDynamicCapabilityTransformPlugin(
       let transformed = code;
       let changed = false;
       if (transformDynamicTools) {
-        const result = await transformDynamicToolExecute(id, transformed);
+        const result = await transformDynamicToolExecute(
+          normalizedId,
+          transformed,
+          options.workflowFunctions?.(id),
+        );
         if (result !== null) {
           transformed = result.code;
           changed = true;
         }
       }
       if (transformDynamicRemoteAgents) {
-        const result = await transformDynamicRemoteAgentCredentials(id, transformed);
+        const result = await transformDynamicRemoteAgentCredentials(normalizedId, transformed);
         if (result !== null) {
           transformed = result.code;
           changed = true;

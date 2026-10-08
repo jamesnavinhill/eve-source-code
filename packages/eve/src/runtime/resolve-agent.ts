@@ -7,12 +7,8 @@ import type { AgentSourceOwner } from "#compiler/source-graph.js";
 import type { CompiledModuleMap } from "#compiler/module-map.js";
 import { resolveChannelDefinition } from "#runtime/resolve-channel.js";
 
-// Re-exported so external consumers (tests, integrations) can keep
-// importing the error class from this path even though it now lives
-// in resolve-helpers.ts.
-export { ResolveAgentError } from "#runtime/resolve-helpers.js";
-
 import { resolveConnectionDefinition } from "#runtime/resolve-connection.js";
+import { resolveDynamicConnectionDefinition } from "#runtime/resolve-dynamic-connection.js";
 import { resolveHookDefinition } from "#runtime/resolve-hook.js";
 import { createResolvedModuleSourceRef } from "#runtime/resolve-helpers.js";
 import { resolveSandboxDefinition } from "#runtime/resolve-sandbox.js";
@@ -20,6 +16,7 @@ import { resolveDynamicInstructionsDefinition } from "#runtime/resolve-dynamic-i
 import { resolveDynamicSkillDefinition } from "#runtime/resolve-dynamic-skill.js";
 import { resolveDynamicToolDefinition } from "#runtime/resolve-dynamic-tool.js";
 import { resolveToolDefinition } from "#runtime/resolve-tool.js";
+import { resolveMemoryDefinition } from "#runtime/resolve-memory.js";
 import type {
   ResolvedAgent,
   ResolvedChannelDefinition,
@@ -30,7 +27,7 @@ import type {
 /**
  * Input for resolving one compiled authored agent into a runtime-owned model.
  */
-export interface ResolveAgentInput {
+interface ResolveAgentInput {
   manifest: CompiledAgentNodeManifest | CompiledAgentResources;
   moduleMap: CompiledModuleMap;
   nodeId?: string;
@@ -65,6 +62,11 @@ export async function resolveAgent(input: ResolveAgentInput): Promise<ResolvedAg
       ),
     ),
   );
+  const resolvedDynamicConnectionResolvers = await Promise.all(
+    input.manifest.dynamicConnections.map((definition) =>
+      resolveDynamicConnectionDefinition(definition, input.moduleMap, input.nodeId),
+    ),
+  );
   const resolvedDynamicInstructionsResolvers = await Promise.all(
     (input.manifest.dynamicInstructions ?? []).map((def) =>
       resolveDynamicInstructionsDefinition(def, input.moduleMap, input.nodeId),
@@ -93,6 +95,11 @@ export async function resolveAgent(input: ResolveAgentInput): Promise<ResolvedAg
       resolveConnectionDefinition(connectionDefinition, input.moduleMap, input.nodeId),
     ),
   );
+  const resolvedMemories = await Promise.all(
+    input.manifest.memories.map((definition) =>
+      resolveMemoryDefinition(definition, input.moduleMap, input.nodeId),
+    ),
+  );
   const authoredSandbox = await resolveSandboxDefinition(
     input.manifest.sandbox,
     input.moduleMap,
@@ -105,11 +112,7 @@ export async function resolveAgent(input: ResolveAgentInput): Promise<ResolvedAg
   const resolvedAgent: ResolvedAgent = {
     channels: resolvedChannels,
     connections: resolvedConnections,
-    workflowTool:
-      input.manifest.workflowTool === undefined
-        ? undefined
-        : { maxSubagents: input.manifest.workflowTool.maxSubagents },
-    webSearchProvider: input.manifest.webSearchProvider,
+    dynamicConnectionResolvers: resolvedDynamicConnectionResolvers,
     dynamicInstructionsResolvers: resolvedDynamicInstructionsResolvers,
     dynamicSkillResolvers: resolvedDynamicSkillResolvers,
     dynamicToolResolvers: resolvedDynamicToolResolvers,
@@ -120,6 +123,7 @@ export async function resolveAgent(input: ResolveAgentInput): Promise<ResolvedAg
       appRoot: input.manifest.appRoot,
       diagnosticsSummary: input.manifest.diagnosticsSummary,
     },
+    memories: resolvedMemories,
     sandbox: authoredSandbox,
     workspaceResourceRoot,
     skills: resolvedSkills,
@@ -175,15 +179,24 @@ function createResolvedAgentConfig(
 ): NonNullable<ResolvedAgent["config"]> {
   const config: {
     compaction?: NonNullable<ResolvedAgent["config"]>["compaction"];
+    defaultTools?: boolean;
+    description?: string;
     experimental?: NonNullable<ResolvedAgent["config"]>["experimental"];
     name: string;
-    outputSchema?: NonNullable<ResolvedAgent["config"]>["outputSchema"];
     reasoning?: NonNullable<ResolvedAgent["config"]>["reasoning"];
     source?: NonNullable<ResolvedAgent["config"]>["source"];
+    tool?: boolean;
     limits?: NonNullable<ResolvedAgent["config"]>["limits"];
   } = {
     name: manifest.config.name,
   };
+
+  if (manifest.config.defaultTools !== undefined) {
+    config.defaultTools = manifest.config.defaultTools;
+  }
+  if (manifest.config.description !== undefined) {
+    config.description = manifest.config.description;
+  }
 
   if (manifest.config.compaction !== undefined) {
     const compaction: {
@@ -223,17 +236,15 @@ function createResolvedAgentConfig(
 
   if (manifest.config.experimental !== undefined) {
     config.experimental = {
-      instrumentationProviders: manifest.config.experimental.instrumentationProviders,
-      tasks: manifest.config.experimental.tasks,
       workflow:
         manifest.config.experimental.workflow === undefined
           ? undefined
-          : { world: manifest.config.experimental.workflow.world },
+          : {
+              modelCallsPerStep: manifest.config.experimental.workflow.modelCallsPerStep,
+              retention: manifest.config.experimental.workflow.retention,
+              world: manifest.config.experimental.workflow.world,
+            },
     };
-  }
-
-  if (manifest.config.outputSchema !== undefined) {
-    config.outputSchema = manifest.config.outputSchema;
   }
 
   if (manifest.config.reasoning !== undefined) {
@@ -244,10 +255,15 @@ function createResolvedAgentConfig(
     config.source = createResolvedModuleSourceRef(manifest.config.source);
   }
 
+  if (manifest.config.tool !== undefined) {
+    config.tool = manifest.config.tool;
+  }
+
   if (manifest.config.limits !== undefined) {
     config.limits = {
       maxInputTokensPerSession: manifest.config.limits.maxInputTokensPerSession,
       maxOutputTokensPerSession: manifest.config.limits.maxOutputTokensPerSession,
+      maxTokenCostUsdPerSession: manifest.config.limits.maxTokenCostUsdPerSession,
       sessionTimeoutMs: manifest.config.limits.sessionTimeoutMs,
     };
   }

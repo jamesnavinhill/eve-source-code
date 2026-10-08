@@ -1,9 +1,9 @@
-import { LogoEve } from "@vercel/geistdocs/assets/logos/logo-eve";
-import type { GeistdocsGithubConfig } from "@vercel/geistdocs/config";
+import { LogoEveSvg } from "@vercel/geistdocs/assets/logos/logo-eve-svg";
+import type { GeistdocsEveAgentConfig, GeistdocsGithubConfig } from "@vercel/geistdocs/config";
 
 export { translations } from "@/lib/geistdocs/languages";
 
-export const Logo = () => <LogoEve />;
+export const Logo = () => <LogoEveSvg aria-label="eve" height={18} role="img" />;
 
 export const github: GeistdocsGithubConfig = {
   owner: "vercel",
@@ -23,6 +23,10 @@ export const nav = [
     label: "Templates",
     href: "/templates",
   },
+  {
+    label: "Changelog",
+    href: "/changelog",
+  },
 ];
 
 export const suggestions = [
@@ -33,6 +37,13 @@ export const suggestions = [
 ];
 
 export const agent = {
+  links: [
+    {
+      label: "Changelog",
+      href: "/changelog.md",
+      description: "eve release notes as Markdown, with links to older releases.",
+    },
+  ],
   product: {
     name: "eve",
     description:
@@ -48,7 +59,7 @@ export const agent = {
   instructions: [
     "To create or extend an eve agent for the user, start from the Getting Started guide — get it as Markdown from /llms.mdx/getting-started (or via /llms.txt).",
     "Ask the user only for genuine decisions (name, model, channels, provider, deploy) and for browser/OAuth steps (vercel login, vercel link, vercel connect create slack); automate everything else.",
-    "Verify setup with `eve info --json` and `eve channels list --json` before reporting success.",
+    "Verify setup with `eve info --json` before reporting success.",
     "Use /llms.txt as a concise task-oriented index and /sitemap.md as the exhaustive page map.",
     "Use /llms-full.txt only when you need the complete documentation corpus for offline indexing or a large context window.",
     "Fetch individual docs or integration pages with a .md or .mdx extension for focused page-level context. Template pages are HTML discovery pages and do not expose this alternate Markdown route.",
@@ -66,7 +77,9 @@ export const prompt =
 // The deployment keeps the framework's pre-rename "ash" domain.
 export const eveAgent = {
   url: "https://help-ash.vercel.sh",
-};
+  // Starts the eve session when Ask AI loads. Needs GEISTDOCS_CHAT_SECRET.
+  prewarm: true,
+} satisfies GeistdocsEveAgentConfig;
 
 export const basePath: string | undefined = undefined;
 

@@ -4,39 +4,56 @@ import {
   InMemorySpanExporter,
   SimpleSpanProcessor,
   type ReadableSpan,
+  type SpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
 import { describe, expect, it, vi } from "vitest";
 
+import { JsonTraceSerializer } from "#compiled/@opentelemetry/otlp-transformer/index.js";
 import {
   ROOT_CONTEXT,
   context,
   trace as runtimeTrace,
 } from "#compiled/@opentelemetry/api/index.js";
 import { ContextContainer, contextStorage } from "#context/container.js";
+import { ActiveChannelDeliveriesKey, SessionTraceSeedKey } from "#context/keys.js";
 import { deserializeContext, serializeContext } from "#context/serialize.js";
-import { createAiSdkHookBridge } from "#harness/ai-sdk-hook-bridge.js";
+import { createAiSdkHookBridge } from "#instrumentation/ai-sdk-hook-bridge.js";
+import { createInstrumentationHandleEvent } from "#instrumentation/native-events.js";
+import { createPresentedRuntimeActionRequestFromToolCall } from "#harness/action-presentation.js";
+import type { HarnessToolMap } from "#harness/types.js";
+import { createActionResultEvent, createActionsRequestedEvent } from "#protocol/message.js";
 import {
   createAgentOtelInstrumentation,
   type AgentOtelInstrumentationInput,
 } from "#tracing/agent-otel-provider.js";
 import { AgentSpanIdGenerator } from "#tracing/agent-span-id-generator.js";
 import { ContextAgentTraceStateStore } from "#tracing/agent-trace-context-store.js";
-import {
-  type AgentTraceStateStore,
-  InMemoryAgentTraceStateStore,
-} from "#tracing/agent-trace-state.js";
+import type { AgentTraceStateStore } from "#tracing/agent-trace-state.js";
+import { InMemoryAgentTraceStateStore } from "#internal/testing/in-memory-agent-trace-state-store.js";
 import {
   createInstrumentationHooks,
-  type InstrumentationActionKind,
+  type InstrumentationToolCallKind,
   type InstrumentationAttemptScope,
   type InstrumentationContextRunner,
+  type InstrumentationEvent,
   type InstrumentationHooks,
   type InstrumentationParentLineage,
+  type InstrumentationPrincipalSummary,
   type InstrumentationTraceContext,
   type InstrumentationUsage,
-} from "#harness/instrumentation/lifecycle.js";
+} from "#instrumentation/lifecycle.js";
 import type { ChannelAudience } from "#shared/channel-audience.js";
+import { channelAudienceFromContext } from "#tracing/channel-audience-context.js";
+import {
+  agentToolContentPolicy,
+  agentToolSpanContext,
+  annotateAgentToolSpan,
+} from "#tracing/agent-tool-span-context.js";
+import { contentFilteringProcessor } from "#tracing/content-span-processor.js";
+import { parseLocalTraceSegment } from "#tracing/local-trace-reader.js";
+import { CONTENT_ATTRIBUTE_LIMIT } from "#tracing/agent-otel-content.js";
 import type { TraceCapturePolicy } from "#tracing/otel-declaration.js";
+import type { TraceCaptureContext } from "#shared/trace-policy.js";
 import {
   actionIdempotencyKey,
   attemptIdempotencyKey,
@@ -44,7 +61,16 @@ import {
   modelCallIdempotencyKey,
   sessionIdempotencyKey,
   turnIdempotencyKey,
-} from "#harness/instrumentation/lifecycle.js";
+} from "#instrumentation/lifecycle.js";
+import { isRuntimeWorkflowToolAction } from "#shared/action-types.js";
+
+const traceContext = (audience: ChannelAudience = "public") => ({
+  agentName: "weather",
+  audience,
+  channel: { kind: "http" as const },
+  environment: "production" as const,
+  principalType: "anonymous",
+});
 
 interface TestRuntime {
   readonly exporter: InMemorySpanExporter;
@@ -54,39 +80,52 @@ interface TestRuntime {
     typeof createAgentOtelInstrumentation
   >["prepareSessionTrace"];
   readonly prepareTurnTrace: ReturnType<typeof createAgentOtelInstrumentation>["prepareTurnTrace"];
+  readonly projectEvent: NonNullable<
+    ReturnType<typeof createAgentOtelInstrumentation>["hook"]["projectEvent"]
+  >;
   readonly runInContext: InstrumentationContextRunner;
   readonly tracer: ReturnType<BasicTracerProvider["getTracer"]>;
 }
 
 function createRuntime(
   stateStore: AgentTraceStateStore = new InMemoryAgentTraceStateStore(),
-  tracePolicy: TraceCapturePolicy | null = () => true,
+  tracePolicy: TraceCapturePolicy | null = () => ({
+    emit: true,
+    recordInputs: true,
+    recordOutputs: true,
+  }),
+  extraSpanProcessors: readonly SpanProcessor[] = [],
+  samplesTrace?: AgentOtelInstrumentationInput["samplesTrace"],
 ): TestRuntime {
   const exporter = new InMemorySpanExporter();
   const idGenerator = new AgentSpanIdGenerator();
   const provider = new BasicTracerProvider({
     idGenerator,
-    spanProcessors: [new SimpleSpanProcessor(exporter)],
+    spanProcessors: [new SimpleSpanProcessor(exporter), ...extraSpanProcessors],
   });
   const tracer = provider.getTracer("eve.agent");
   const agentOtelInput: Omit<AgentOtelInstrumentationInput, "tracePolicy"> & {
     tracePolicy?: TraceCapturePolicy;
   } = {
+    // Pin the environment so an inherited EVE_DEV/VERCEL_ENV cannot relax audience ceilings.
+    environment: "production",
     frameworkVersion: "test",
     idGenerator,
     recordInputs: true,
     recordOutputs: true,
+    samplesTrace,
     stateStore,
     tracer,
   };
   if (tracePolicy !== null) agentOtelInput.tracePolicy = tracePolicy;
   const agentOtel = createAgentOtelInstrumentation(agentOtelInput);
-  const hooks = createInstrumentationHooks([agentOtel.hook]);
+  const hooks = createInstrumentationHooks([agentOtel.hook]).forTrace!(traceContext());
   return {
     exporter,
     hooks,
     prepareSessionTrace: agentOtel.prepareSessionTrace,
     prepareTurnTrace: agentOtel.prepareTurnTrace,
+    projectEvent: agentOtel.hook.projectEvent!,
     provider,
     runInContext: agentOtel.runInContext,
     tracer,
@@ -99,11 +138,12 @@ async function emitAttempt(input: {
   readonly attemptError?: Error;
   readonly channelAudience?: ChannelAudience;
   readonly hooks: InstrumentationHooks;
+  readonly modelTools?: readonly Record<string, unknown>[];
   readonly parentLineage?: InstrumentationParentLineage;
   readonly parentTraceContext?: InstrumentationTraceContext;
   readonly runInContext: InstrumentationContextRunner;
   readonly providerMetadata?: Readonly<Record<string, unknown>>;
-  readonly actionKind?: InstrumentationActionKind;
+  readonly actionKind?: InstrumentationToolCallKind;
   readonly runtimeContext?: Readonly<Record<string, unknown>>;
   readonly sessionId: string;
   readonly skipModelTerminal?: boolean;
@@ -116,22 +156,19 @@ async function emitAttempt(input: {
   const scope: InstrumentationAttemptScope = {
     attemptId: `${input.sessionId}:${input.turnId}:0:${input.attemptIndex ?? 0}`,
     attemptIndex: input.attemptIndex ?? 0,
-    channelAudience: input.channelAudience,
+    channelAudience: input.channelAudience ?? "public",
     functionId: "weather",
     sessionId: input.sessionId,
     stepIndex: 0,
     turnId: input.turnId,
   };
+  const hooks =
+    input.hooks.forTrace?.(traceContext(scope.channelAudience ?? "unknown")) ?? input.hooks;
   if (input.turnAlreadyStarted !== true) {
-    await publishTurnStarted(input);
+    await publishTurnStarted({ ...input, hooks });
   }
 
-  const bridge = createAiSdkHookBridge(
-    scope,
-    input.hooks,
-    input.runInContext,
-    input.runtimeContext,
-  );
+  const bridge = createAiSdkHookBridge(scope, hooks, input.runInContext, input.runtimeContext);
   Reflect.apply(bridge.onStart!, bridge, [
     {
       callId: "call-1",
@@ -156,6 +193,7 @@ async function emitAttempt(input: {
       ],
       modelId: "claude-test",
       provider: "anthropic",
+      tools: input.modelTools,
     },
   ]);
   await bridge.executeLanguageModelCall!({ callId: "call-1", execute: async () => undefined });
@@ -183,6 +221,7 @@ async function emitAttempt(input: {
           },
         ],
         finishReason: "tool-calls",
+        modelId: "claude-response",
         performance: { responseTimeMs: 10 },
         responseId: "response-1",
         usage: {
@@ -194,14 +233,14 @@ async function emitAttempt(input: {
     ]);
   }
   const actionKey = actionIdempotencyKey(input.sessionId, input.turnId, "tool-1");
-  await input.hooks.publish({
+  await hooks.publish({
     callId: "tool-1",
     idempotencyKey: actionKey,
     input: { secret: "value" },
     kind: input.actionKind ?? "tool-call",
-    name: "weather",
+    toolName: "weather",
     scope,
-    type: "action.started",
+    type: "tool.call.started",
   });
   await Reflect.apply(bridge.onToolExecutionStart!, bridge, [
     {
@@ -227,14 +266,14 @@ async function emitAttempt(input: {
             : { error: input.toolError, type: "tool-error" },
       },
     ]);
-    await input.hooks.publish(
+    await hooks.publish(
       input.toolError === undefined
         ? {
             idempotencyKey: actionKey,
             outcome: "completed",
             output: { output: { temperature: 72 }, type: "result" },
             scope,
-            type: "action.completed",
+            type: "tool.call.completed",
             usage: input.actionUsage,
           }
         : {
@@ -243,13 +282,13 @@ async function emitAttempt(input: {
             idempotencyKey: actionKey,
             outcome: "failed",
             scope,
-            type: "action.failed",
+            type: "tool.call.failed",
           },
     );
   }
 
   if (input.providerMetadata !== undefined) {
-    await input.hooks.publish({
+    await hooks.publish({
       idempotencyKey: attemptIdempotencyKey(scope),
       providerMetadata: input.providerMetadata,
       scope,
@@ -257,7 +296,7 @@ async function emitAttempt(input: {
     });
   }
 
-  await input.hooks.publish(
+  await hooks.publish(
     input.attemptError === undefined
       ? {
           idempotencyKey: attemptIdempotencyKey(scope),
@@ -271,13 +310,13 @@ async function emitAttempt(input: {
           type: "step.attempt.failed",
         },
   );
-  await input.hooks.publish({
+  await hooks.publish({
     idempotencyKey: turnIdempotencyKey(input.sessionId, input.turnId),
     sessionId: input.sessionId,
     turnId: input.turnId,
     type: "turn.completed",
   });
-  await input.hooks.publish({
+  await hooks.publish({
     idempotencyKey: sessionIdempotencyKey(input.sessionId),
     sessionId: input.sessionId,
     turnId: input.turnId,
@@ -287,27 +326,39 @@ async function emitAttempt(input: {
 
 async function publishTurnStarted(input: {
   readonly channelAudience?: ChannelAudience;
+  readonly channelKind?: string;
+  readonly currentPrincipal?: InstrumentationPrincipalSummary;
   readonly hooks: InstrumentationHooks;
+  readonly initiatorPrincipal?: InstrumentationPrincipalSummary;
   readonly parentLineage?: InstrumentationParentLineage;
   readonly parentTraceContext?: InstrumentationTraceContext;
   readonly rootSessionId?: string;
+  readonly scheduleId?: string;
   readonly sessionId: string;
+  readonly title?: string;
+  readonly traceSeed?: InstrumentationTraceContext;
   readonly turnId: string;
   readonly turnSequence: number;
 }): Promise<void> {
   const rootSessionId = input.rootSessionId ?? input.sessionId;
   await input.hooks.publish({
     agentName: "weather",
-    channelAudience: input.channelAudience,
-    channelKind: "http",
+    channelAudience: input.channelAudience ?? "public",
+    channelKind: input.channelKind ?? "http",
     idempotencyKey: sessionIdempotencyKey(input.sessionId),
+    parentLineage: input.parentLineage,
     parentTraceContext: input.parentTraceContext,
     rootSessionId,
+    scheduleId: input.scheduleId,
     sessionId: input.sessionId,
+    title: input.title,
+    traceSeed: input.traceSeed,
     type: "session.started",
   });
   await input.hooks.publish({
+    currentPrincipal: input.currentPrincipal,
     idempotencyKey: turnIdempotencyKey(input.sessionId, input.turnId),
+    initiatorPrincipal: input.initiatorPrincipal,
     parentLineage: input.parentLineage,
     parentTraceContext: input.parentTraceContext,
     rootSessionId,
@@ -347,6 +398,149 @@ function nanos(hrTime: readonly [number, number]): bigint {
 }
 
 describe("createAgentOtelInstrumentation", () => {
+  it.each([
+    { channelKind: "channel:eve", expectedKind: "channel:eve", expectedOrigin: "channel" },
+    { channelKind: "unknown", expectedKind: undefined, expectedOrigin: undefined },
+  ])("classifies a step before the invocation span exists ($channelKind)", async (input) => {
+    const runtime = createRuntime();
+    const scope: InstrumentationAttemptScope = {
+      attemptId: "session-1:turn_0:0:0",
+      attemptIndex: 0,
+      functionId: "weather",
+      sessionId: "session-1",
+      stepIndex: 0,
+      turnId: "turn_0",
+    };
+    await publishTurnStarted({
+      channelKind: input.channelKind,
+      hooks: runtime.hooks,
+      sessionId: scope.sessionId,
+      turnId: scope.turnId,
+      turnSequence: 0,
+    });
+    await runtime.hooks.publish({
+      idempotencyKey: attemptIdempotencyKey(scope),
+      operation: { modelId: "model", operationId: "ai.streamText", provider: "test" },
+      scope,
+      type: "step.attempt.started",
+    });
+    await runtime.hooks.publish({
+      idempotencyKey: attemptIdempotencyKey(scope),
+      scope,
+      type: "step.attempt.completed",
+    });
+    await runtime.provider.forceFlush();
+
+    const spans = runtime.exporter.getFinishedSpans();
+    expect(byName(spans, "invoke_agent weather")).toHaveLength(0);
+    const attributes = byName(spans, "agent.step")[0]?.attributes;
+    if (input.expectedKind === undefined) {
+      expect(attributes).not.toHaveProperty("agent.channel.kind");
+      expect(attributes).not.toHaveProperty("agent.session.origin");
+    } else {
+      expect(attributes).toMatchObject({
+        "agent.channel.kind": input.expectedKind,
+        "agent.session.origin": input.expectedOrigin,
+      });
+    }
+  });
+
+  it.each(["public", "private"] as const)(
+    "exports explicit names for %s spans across bounded activation traces",
+    async (channelAudience) => {
+      const metadata = new InMemorySpanExporter();
+      const runtime = createRuntime(undefined, undefined, [
+        contentFilteringProcessor(new SimpleSpanProcessor(metadata), {
+          span: () => ({ redact: true, inputs: true, outputs: true }),
+        }),
+      ]);
+      for (const sequence of [0, 1]) {
+        await emitAttempt({
+          channelAudience,
+          hooks: runtime.hooks,
+          runInContext: runtime.runInContext,
+          sessionId: "session-1",
+          turnId: `turn_${sequence}`,
+          turnSequence: sequence,
+        });
+      }
+      await runtime.provider.forceFlush();
+      const exported = runtime.exporter.getFinishedSpans();
+      const traceIds = [...new Set(exported.map((span) => span.spanContext().traceId))];
+      expect(traceIds).toHaveLength(2);
+      for (const spans of [exported, metadata.getFinishedSpans()]) {
+        const serialized = new TextDecoder().decode(JsonTraceSerializer.serializeRequest(spans)!);
+        const parsed = traceIds.flatMap((traceId) => parseLocalTraceSegment(serialized, traceId));
+        expect(parsed).toHaveLength(exported.length);
+        for (const span of parsed) {
+          expect(span.attributes["resource.name"]).toBe(span.name);
+          expect(span.attributes["operation.name"]).toBe(
+            span.attributes["gen_ai.operation.name"] ?? span.name,
+          );
+          expect(span.attributes["agent.trace.schema.version"]).toBe(4);
+          expect(span.attributes["gen_ai.conversation.id"]).toBe("session-1");
+        }
+        expect(parsed.some((span) => span.name === "agent.session")).toBe(false);
+        const turns = parsed.filter((span) => span.name === "invoke_agent weather");
+        expect(turns).toHaveLength(2);
+        expect(turns.every((span) => span.parentSpanId === undefined)).toBe(true);
+        expect(turns.map((span) => span.attributes["agent.turn.outcome"])).toEqual([
+          "completed",
+          "completed",
+        ]);
+      }
+      await runtime.provider.shutdown();
+    },
+  );
+
+  it.each(["completed", "failed", "cancelled"] as const)(
+    "exports the %s turn outcome after content redaction and event removal",
+    async (outcome) => {
+      const metadata = new InMemorySpanExporter();
+      const runtime = createRuntime(undefined, undefined, [
+        contentFilteringProcessor(new SimpleSpanProcessor(metadata), {
+          span: () => ({ redact: true, inputs: true, outputs: true }),
+        }),
+      ]);
+      await publishTurnStarted({
+        hooks: runtime.hooks,
+        sessionId: "session-1",
+        turnId: "turn_0",
+        turnSequence: 0,
+      });
+      const identity = {
+        idempotencyKey: turnIdempotencyKey("session-1", "turn_0"),
+        sessionId: "session-1",
+        turnId: "turn_0",
+      };
+      await runtime.hooks.publish(
+        outcome === "failed"
+          ? { ...identity, type: "turn.failed", error: new Error("private failure") }
+          : { ...identity, type: outcome === "completed" ? "turn.completed" : "turn.cancelled" },
+      );
+      await runtime.hooks.publish({
+        idempotencyKey: sessionIdempotencyKey("session-1"),
+        sessionId: "session-1",
+        turnId: "turn_0",
+        type: "session.waiting",
+      });
+      await runtime.provider.forceFlush();
+      const spans = metadata.getFinishedSpans();
+      const serialized = new TextDecoder().decode(
+        JsonTraceSerializer.serializeRequest(
+          spans.map((span) => ({ ...span, events: [], spanContext: () => span.spanContext() })),
+        )!,
+      );
+      const turn = parseLocalTraceSegment(serialized, spans[0]!.spanContext().traceId).find(
+        (span) => span.name === "invoke_agent weather",
+      )!;
+      expect(turn.attributes["agent.turn.outcome"]).toBe(outcome);
+      expect(turn.statusCode).toBe(outcome === "failed" ? 2 : 0);
+      expect(serialized).not.toContain("private failure");
+      await runtime.provider.shutdown();
+    },
+  );
+
   it("prepares a stable stream trace before lifecycle hooks observe the turn", async () => {
     const runtime = createRuntime();
     const sessionEvent = {
@@ -376,14 +570,145 @@ describe("createAgentOtelInstrumentation", () => {
     expect(turnTrace).toEqual(sessionTrace);
     expect(replayedTrace).toEqual(turnTrace);
     const spans = runtime.exporter.getFinishedSpans();
-    const session = byName(spans, "agent.session")[0]!;
-    const turn = byName(spans, "agent.turn")[0]!;
-    expect(session.spanContext()).toMatchObject(turnTrace);
-    expect(turn.spanContext().traceId).toBe(turnTrace.traceId);
-    expect(turn.parentSpanContext?.spanId).toBe(turnTrace.spanId);
+    const turn = byName(spans, "invoke_agent weather")[0]!;
+    expect(byName(spans, "agent.session")).toHaveLength(0);
+    expect(turn.spanContext()).toMatchObject({
+      spanId: turnTrace.spanId,
+      traceFlags: turnTrace.traceFlags,
+      traceId: turnTrace.traceId,
+    });
+    expect(turn.parentSpanContext).toBeUndefined();
   });
 
-  it("uses the pre-allocated trace seed's trace id for agent.session", async () => {
+  it.each([
+    false,
+    { emit: true, recordInputs: false, recordOutputs: false },
+    { emit: true, recordInputs: false, recordOutputs: true },
+    { emit: true, recordInputs: true, recordOutputs: false },
+    { emit: true, recordInputs: true, recordOutputs: true },
+  ] as const)(
+    "applies trace policy %j to principals before sampling and storage",
+    async (policy) => {
+      const store = new InMemoryAgentTraceStateStore();
+      const samplesTrace = vi.fn(() => true);
+      const runtime = createRuntime(store, () => policy, [], samplesTrace);
+      const includesId = policy !== false && policy.recordInputs && policy.recordOutputs;
+      try {
+        await runtime.prepareSessionTrace({
+          agentName: "weather",
+          channelAudience: "public",
+          idempotencyKey: sessionIdempotencyKey("session-1"),
+          rootSessionId: "session-1",
+          sessionId: "session-1",
+          type: "session.started",
+        });
+        await runtime.prepareTurnTrace({
+          currentPrincipal: { id: "current-secret", type: "service" },
+          initiatorPrincipal: { id: "initiator-secret", type: "user" },
+          idempotencyKey: turnIdempotencyKey("session-1", "turn-1"),
+          rootSessionId: "session-1",
+          sequence: 0,
+          sessionId: "session-1",
+          turnId: "turn-1",
+          type: "turn.started",
+        });
+        const turn = await store.getTurn("session-1", "turn-1");
+        expect(turn?.currentPrincipal).toStrictEqual(
+          includesId ? { id: "current-secret", type: "service" } : { type: "service" },
+        );
+        expect(turn?.initiatorPrincipal).toStrictEqual(
+          includesId ? { id: "initiator-secret", type: "user" } : { type: "user" },
+        );
+        expect(samplesTrace).toHaveBeenCalledTimes(policy === false ? 0 : 1);
+        if (!includesId) expect(JSON.stringify(samplesTrace.mock.calls)).not.toContain("-secret");
+        await completeTurn(runtime.hooks, "session-1", "turn-1");
+        await runtime.provider.forceFlush();
+        const spans = runtime.exporter.getFinishedSpans();
+        expect(spans).toHaveLength(policy === false ? 0 : 1);
+        if (policy !== false) {
+          expect(spans[0]?.attributes["agent.principal.current.type"]).toBe("service");
+          expect(spans[0]?.attributes["agent.principal.current.id"]).toBe(
+            includesId ? "current-secret" : undefined,
+          );
+          expect(spans[0]?.attributes["agent.principal.initiator.id"]).toBe(
+            includesId ? "initiator-secret" : undefined,
+          );
+        }
+      } finally {
+        await runtime.provider.shutdown();
+      }
+    },
+  );
+
+  it("exports and activates standard memory spans", async () => {
+    const runtime = createRuntime();
+    await publishTurnStarted({
+      hooks: runtime.hooks,
+      sessionId: "session-1",
+      turnId: "turn-1",
+      turnSequence: 0,
+    });
+    const operation = {
+      idempotencyKey: "eve-memory-operation-v1:session-1:0:turn-1:turn.started:profile",
+      operationName: "search_memory" as const,
+      phase: "turn.started",
+      rootSessionId: "session-1",
+      sessionId: "session-1",
+      slot: "profile",
+      storeId: "memscope1_scope",
+      turnId: "turn-1",
+    };
+    await runtime.hooks.publish({ ...operation, type: "memory.operation.started" });
+    const contextWith = vi.spyOn(context, "with");
+    await runtime.runInContext(
+      {
+        idempotencyKey: operation.idempotencyKey,
+        sessionId: operation.sessionId,
+        turnId: operation.turnId,
+        type: "memory.operation",
+      },
+      async () => undefined,
+    );
+    const memoryContext = contextWith.mock.calls[0]?.[0];
+    contextWith.mockRestore();
+    await runtime.hooks.publish({
+      ...operation,
+      outputRecords: [{ content: "The user prefers dark mode.", id: "preference" }],
+      recordCount: 1,
+      type: "memory.operation.completed",
+    });
+    await completeTurn(runtime.hooks, "session-1", "turn-1");
+    await runtime.provider.forceFlush();
+
+    const spans = runtime.exporter.getFinishedSpans();
+    const memory = byName(spans, "search_memory")[0]!;
+    const turn = byName(spans, "invoke_agent weather")[0]!;
+    if (memoryContext === undefined) throw new Error("memory operation did not activate a context");
+    expect(memory.kind).toBe(SpanKind.CLIENT);
+    expect(memory.parentSpanContext?.spanId).toBe(turn.spanContext().spanId);
+    expect(runtimeTrace.getSpan(memoryContext)?.spanContext().spanId).toBe(
+      memory.spanContext().spanId,
+    );
+    expect(memory.attributes).toMatchObject({
+      "agent.memory.phase": "turn.started",
+      "agent.memory.slot": "profile",
+      "agent.turn.id": "turn-1",
+      "gen_ai.memory.record.count": 1,
+      "gen_ai.memory.store.id": "memscope1_scope",
+      "gen_ai.operation.name": "search_memory",
+      "operation.name": "search_memory",
+      "resource.name": "search_memory",
+    });
+    expect(memory.attributes).not.toHaveProperty("agent.framework.name");
+    expect(memory.attributes).not.toHaveProperty("agent.framework.version");
+    expect(memory.attributes).not.toHaveProperty("agent.session.id");
+    expect(memory.attributes["gen_ai.memory.records"]).toBe(
+      '[{"content":"The user prefers dark mode.","id":"preference"}]',
+    );
+    await runtime.provider.shutdown();
+  });
+
+  it("uses the pre-allocated trace seed for the first activation root", async () => {
     const runtime = createRuntime();
     const seed: InstrumentationTraceContext = {
       spanId: "a".repeat(16),
@@ -398,15 +723,184 @@ describe("createAgentOtelInstrumentation", () => {
       traceSeed: seed,
       type: "session.started" as const,
     };
+    const turnEvent = {
+      idempotencyKey: turnIdempotencyKey("session-seed", "turn-1"),
+      rootSessionId: "session-seed",
+      sequence: 0,
+      sessionId: "session-seed",
+      turnId: "turn-1",
+      type: "turn.started" as const,
+    };
 
     await runtime.prepareSessionTrace(sessionEvent);
+    await runtime.prepareTurnTrace(turnEvent);
     await runtime.hooks.publish(sessionEvent);
+    await runtime.hooks.publish(turnEvent);
+    await completeTurn(runtime.hooks, "session-seed", "turn-1");
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    const session = byName(spans, "agent.session")[0]!;
-    expect(session.spanContext().traceId).toBe(seed.traceId);
-    expect(session.spanContext().spanId).toBe(seed.spanId);
+    const turn = byName(spans, "invoke_agent weather")[0]!;
+    expect(byName(spans, "agent.session")).toHaveLength(0);
+    expect(turn.spanContext()).toMatchObject(seed);
+    expect(turn.parentSpanContext).toBeUndefined();
+    expect(turn.attributes).toMatchObject({
+      "operation.name": "invoke_agent",
+      "resource.name": "invoke_agent weather",
+    });
+  });
+
+  it("parents a delegated activation to the exact caller while retaining its span seed", async () => {
+    const runtime = createRuntime();
+    const parent = {
+      spanId: "c".repeat(16),
+      traceFlags: 1,
+      traceId: "d".repeat(32),
+    };
+    const seed = {
+      spanId: "a".repeat(16),
+      traceFlags: 1,
+      traceId: "b".repeat(32),
+    };
+    const parentLineage = {
+      callId: "call-child",
+      sessionId: "parent-session",
+      subagentName: "researcher",
+      turnId: "parent-turn",
+    };
+
+    await publishTurnStarted({
+      currentPrincipal: { id: "user-123", type: "user" },
+      hooks: runtime.hooks,
+      initiatorPrincipal: { type: "none" },
+      parentLineage,
+      parentTraceContext: parent,
+      rootSessionId: "root-session",
+      scheduleId: "daily-report",
+      sessionId: "child-session",
+      title: "Research the incident",
+      traceSeed: seed,
+      turnId: "child-turn",
+      turnSequence: 0,
+    });
+    const scope: InstrumentationAttemptScope = {
+      attemptId: "child-session:child-turn:0:0",
+      attemptIndex: 0,
+      functionId: "weather",
+      sessionId: "child-session",
+      stepIndex: 0,
+      turnId: "child-turn",
+    };
+    await runtime.hooks.publish({
+      idempotencyKey: attemptIdempotencyKey(scope),
+      operation: { modelId: "model", operationId: "ai.streamText", provider: "test" },
+      scope,
+      type: "step.attempt.started",
+    });
+    await runtime.hooks.publish({
+      idempotencyKey: attemptIdempotencyKey(scope),
+      scope,
+      type: "step.attempt.completed",
+    });
+    await completeTurn(runtime.hooks, "child-session", "child-turn");
+    await runtime.provider.forceFlush();
+
+    const spans = runtime.exporter.getFinishedSpans();
+    const invocation = byName(spans, "invoke_agent weather")[0]!;
+    expect(byName(spans, "agent.session")).toHaveLength(0);
+    expect(invocation.spanContext().traceId).toBe(parent.traceId);
+    expect(invocation.spanContext().spanId).toBe(seed.spanId);
+    expect(invocation.parentSpanContext).toEqual({ ...parent, isRemote: false });
+    expect(invocation.links).toEqual([]);
+    expect(invocation.attributes).toMatchObject({
+      "agent.parent_call.id": "call-child",
+      "agent.parent_run.id": "parent-session",
+      "agent.principal.current.id": "user-123",
+      "agent.principal.current.type": "user",
+      "agent.principal.initiator.type": "none",
+      "agent.run.id": "child-session",
+      "agent.run.type": "subagent",
+      "agent.trace.content.input": true,
+      "agent.trace.content.output": true,
+      "gen_ai.conversation.id": "root-session",
+      "gen_ai.operation.name": "invoke_agent",
+    });
+    expect(invocation.attributes).not.toHaveProperty("agent.channel.kind");
+    expect(invocation.attributes).not.toHaveProperty("agent.schedule.id");
+    expect(invocation.attributes).not.toHaveProperty("agent.session.origin");
+    expect(invocation.attributes).not.toHaveProperty("agent.session.title");
+    const step = byName(spans, "agent.step")[0]!;
+    expect(step.attributes).not.toHaveProperty("agent.channel.kind");
+    expect(step.attributes).not.toHaveProperty("agent.session.origin");
+    expect(invocation.attributes).not.toHaveProperty("agent.principal.initiator.id");
+    expect(invocation.attributes).not.toHaveProperty("agent.root_run.id");
+    expect(invocation.attributes).not.toHaveProperty("agent.session.id");
+    expect(invocation.attributes).not.toHaveProperty("vercel.session_id");
+  });
+
+  it("samples and exports preamble-prepared activation metadata consistently", async () => {
+    const store = new InMemoryAgentTraceStateStore();
+    const samplesTrace = vi.fn(() => true);
+    const runtime = createRuntime(
+      store,
+      () => ({ emit: true, recordInputs: true, recordOutputs: true }),
+      [],
+      samplesTrace,
+    );
+    const setSession = vi.spyOn(store, "setSession");
+    const sessionId = "session-early";
+    await runtime.prepareSessionTrace({
+      agentName: "weather",
+      channelAudience: "public",
+      channelKind: "http",
+      idempotencyKey: sessionIdempotencyKey(sessionId),
+      rootSessionId: sessionId,
+      scheduleId: "daily-report",
+      sessionId,
+      title: "Prepared before sampling",
+      type: "session.started",
+    });
+    await runtime.prepareTurnTrace({
+      idempotencyKey: turnIdempotencyKey(sessionId, "turn-1"),
+      rootSessionId: sessionId,
+      sequence: 0,
+      sessionId,
+      turnId: "turn-1",
+      type: "turn.started",
+    });
+
+    expect(samplesTrace).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          "agent.channel.kind": "http",
+          "agent.schedule.id": "daily-report",
+          "agent.session.origin": "schedule",
+          "agent.session.title": "Prepared before sampling",
+        }),
+      }),
+    );
+
+    await publishTurnStarted({
+      hooks: runtime.hooks,
+      scheduleId: "daily-report",
+      sessionId,
+      title: "Prepared before sampling",
+      turnId: "turn-1",
+      turnSequence: 0,
+    });
+    await completeTurn(runtime.hooks, sessionId, "turn-1");
+    await runtime.provider.forceFlush();
+
+    expect(
+      byName(runtime.exporter.getFinishedSpans(), "invoke_agent weather")[0]?.attributes,
+    ).toMatchObject({
+      "agent.channel.kind": "http",
+      "agent.schedule.id": "daily-report",
+      "agent.session.origin": "schedule",
+      "agent.session.title": "Prepared before sampling",
+    });
+    expect(setSession).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to fresh ids when no trace seed is present", async () => {
@@ -418,27 +912,42 @@ describe("createAgentOtelInstrumentation", () => {
       sessionId: "session-noseed",
       type: "session.started" as const,
     };
+    const turnEvent = {
+      idempotencyKey: turnIdempotencyKey("session-noseed", "turn-1"),
+      rootSessionId: "session-noseed",
+      sequence: 0,
+      sessionId: "session-noseed",
+      turnId: "turn-1",
+      type: "turn.started" as const,
+    };
 
     const trace = await runtime.prepareSessionTrace(sessionEvent);
+    const turnTrace = await runtime.prepareTurnTrace(turnEvent);
     await runtime.hooks.publish(sessionEvent);
+    await runtime.hooks.publish(turnEvent);
+    await completeTurn(runtime.hooks, "session-noseed", "turn-1");
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    const session = byName(spans, "agent.session")[0]!;
-    expect(session.spanContext().traceId).toBe(trace.traceId);
-    // Fresh span id is random, not derived — just verify it matches the returned context.
-    expect(session.spanContext().spanId).toBe(trace.spanId);
+    const turn = byName(spans, "invoke_agent weather")[0]!;
+    expect(turnTrace).toEqual(trace);
+    expect(turn.spanContext()).toMatchObject({
+      spanId: trace.spanId,
+      traceFlags: trace.traceFlags,
+      traceId: trace.traceId,
+    });
+    expect(turn.parentSpanContext).toBeUndefined();
   });
 
-  it("passes channelType to the policy on the seedless fallback path", async () => {
-    let captured: { channelType?: string } | undefined;
+  it("passes the channel to the policy on the seedless fallback path", async () => {
+    let captured: TraceCaptureContext | undefined;
     const runtime = createRuntime(undefined, (trace) => {
       captured = trace;
       return true;
     });
     const sessionEvent = {
       agentName: "weather",
-      channelType: "slack",
+      channelKind: "channel:slack",
       idempotencyKey: sessionIdempotencyKey("session-noseed-kind"),
       rootSessionId: "session-noseed-kind",
       sessionId: "session-noseed-kind",
@@ -447,10 +956,10 @@ describe("createAgentOtelInstrumentation", () => {
 
     await runtime.prepareSessionTrace(sessionEvent);
 
-    expect(captured?.channelType).toBe("slack");
+    expect(captured?.channel.kind).toBe("channel:slack");
   });
 
-  it("inherits parent trace context for delegated agents", async () => {
+  it("allocates a distinct span in the caller's trace for delegated agents", async () => {
     const runtime = createRuntime();
     const parentTrace: InstrumentationTraceContext = {
       spanId: "c".repeat(16),
@@ -468,7 +977,8 @@ describe("createAgentOtelInstrumentation", () => {
 
     const trace = await runtime.prepareSessionTrace(sessionEvent);
     expect(trace.traceId).toBe(parentTrace.traceId);
-    expect(trace.spanId).toBe(parentTrace.spanId);
+    expect(trace.spanId).not.toBe(parentTrace.spanId);
+    expect(trace.traceFlags).toBe(parentTrace.traceFlags);
   });
 
   it("treats the seed as authoritative when late policy would reject", async () => {
@@ -486,15 +996,26 @@ describe("createAgentOtelInstrumentation", () => {
       traceSeed: seed,
       type: "session.started" as const,
     };
+    const turnEvent = {
+      idempotencyKey: turnIdempotencyKey("session-seed-authoritative", "turn-1"),
+      rootSessionId: "session-seed-authoritative",
+      sequence: 0,
+      sessionId: "session-seed-authoritative",
+      turnId: "turn-1",
+      type: "turn.started" as const,
+    };
 
     await runtime.prepareSessionTrace(sessionEvent);
+    await runtime.prepareTurnTrace(turnEvent);
     await runtime.hooks.publish(sessionEvent);
+    await runtime.hooks.publish(turnEvent);
+    await completeTurn(runtime.hooks, "session-seed-authoritative", "turn-1");
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    const session = byName(spans, "agent.session")[0]!;
-    expect(session.spanContext().traceId).toBe(seed.traceId);
-    expect(session.spanContext().traceFlags).toBe(1);
+    const turn = byName(spans, "invoke_agent weather")[0]!;
+    expect(turn.spanContext().traceId).toBe(seed.traceId);
+    expect(turn.spanContext().traceFlags).toBe(1);
   });
 
   it("treats an unsampled seed as authoritative when late policy would accept", async () => {
@@ -512,58 +1033,63 @@ describe("createAgentOtelInstrumentation", () => {
       traceSeed: seed,
       type: "session.started" as const,
     };
+    const turnEvent = {
+      idempotencyKey: turnIdempotencyKey("session-seed-unsampled", "turn-1"),
+      rootSessionId: "session-seed-unsampled",
+      sequence: 0,
+      sessionId: "session-seed-unsampled",
+      turnId: "turn-1",
+      type: "turn.started" as const,
+    };
 
     await runtime.prepareSessionTrace(sessionEvent);
+    await runtime.prepareTurnTrace(turnEvent);
     await runtime.hooks.publish(sessionEvent);
+    await runtime.hooks.publish(turnEvent);
+    await completeTurn(runtime.hooks, "session-seed-unsampled", "turn-1");
     await runtime.provider.forceFlush();
 
-    const spans = runtime.exporter.getFinishedSpans();
-    expect(byName(spans, "agent.session")).toHaveLength(0);
+    expect(runtime.exporter.getFinishedSpans()).toEqual([]);
   });
 
-  it.each([
-    ["cancelled", SpanStatusCode.UNSET],
-    ["failed", SpanStatusCode.ERROR],
-  ] as const)("records a %s channel delivery with the expected status", async (outcome, status) => {
-    const runtime = createRuntime();
-    const ctx = new ContextContainer();
-    const delivery = {
-      channelKind: "channel:slack",
-      channelName: "slack",
-      deliveryId: `delivery-${outcome}`,
-    };
-    const idempotencyKey = `channel-delivery:session-1:${delivery.deliveryId}`;
+  it.each(["cancelled", "failed"] as const)(
+    "does not emit a standalone span for a %s delivery without a turn",
+    async (outcome) => {
+      const runtime = createRuntime();
+      const ctx = new ContextContainer();
+      const delivery = {
+        channelKind: "channel:slack",
+        channelName: "slack",
+        deliveryId: `delivery-${outcome}`,
+      };
+      const idempotencyKey = `channel-delivery:session-1:${delivery.deliveryId}`;
 
-    await contextStorage.run(ctx, async () => {
-      await runtime.hooks.publish({
-        delivery,
-        idempotencyKey,
-        rootSessionId: "session-1",
-        sessionId: "session-1",
-        type: "channel.delivery.started",
+      await contextStorage.run(ctx, async () => {
+        await runtime.hooks.publish({
+          agentName: "weather",
+          delivery,
+          idempotencyKey,
+          rootSessionId: "session-1",
+          sessionId: "session-1",
+          type: "channel.delivery.started",
+        });
+        await runtime.hooks.publish({
+          delivery,
+          error: outcome === "failed" ? new Error("failed") : undefined,
+          errorCode: outcome === "failed" ? "CHANNEL_DELIVERY_FAILED" : undefined,
+          idempotencyKey,
+          outcome,
+          rootSessionId: "session-1",
+          sessionId: "session-1",
+          type: `channel.delivery.${outcome}`,
+        });
       });
-      await runtime.hooks.publish({
-        delivery,
-        error: outcome === "failed" ? new Error("failed") : undefined,
-        errorCode: outcome === "failed" ? "CHANNEL_DELIVERY_FAILED" : undefined,
-        idempotencyKey,
-        outcome,
-        rootSessionId: "session-1",
-        sessionId: "session-1",
-        type: `channel.delivery.${outcome}`,
-      });
-    });
 
-    const span = runtime.exporter
-      .getFinishedSpans()
-      .find((candidate) => candidate.name === "agent.channel.delivery")!;
-    expect(span.status.code).toBe(status);
-    expect(span.attributes["error.type"]).toBe(
-      outcome === "failed" ? "CHANNEL_DELIVERY_FAILED" : undefined,
-    );
-  });
+      expect(runtime.exporter.getFinishedSpans()).toEqual([]);
+    },
+  );
 
-  it("maps channel delivery under the session trace with an HTTP request link", async () => {
+  it("maps one channel delivery onto its activation with an HTTP request link", async () => {
     const runtime = createRuntime();
     const ctx = new ContextContainer();
     const requestTraceContext = {
@@ -574,6 +1100,7 @@ describe("createAgentOtelInstrumentation", () => {
     const started = {
       agentName: "support",
       delivery: {
+        channelAudience: "public" as const,
         channelKind: "channel:slack",
         channelName: "slack",
         deliveryId: "delivery-1",
@@ -583,7 +1110,9 @@ describe("createAgentOtelInstrumentation", () => {
       idempotencyKey: "channel-delivery:session-1:delivery-1",
       input: { message: "private" },
       rootSessionId: "session-1",
+      sequence: 0,
       sessionId: "session-1",
+      turnId: "turn_0",
       type: "channel.delivery.started" as const,
     };
     const completed = {
@@ -597,55 +1126,69 @@ describe("createAgentOtelInstrumentation", () => {
       turnId: "turn_0",
       type: "channel.delivery.completed" as const,
     };
+    const sessionEvent = {
+      agentName: "support",
+      channelAudience: "public" as const,
+      channelKind: "channel:slack",
+      idempotencyKey: sessionIdempotencyKey("session-1"),
+      rootSessionId: "session-1",
+      sessionId: "session-1",
+      type: "session.started" as const,
+    };
+    const turnEvent = {
+      idempotencyKey: turnIdempotencyKey("session-1", "turn_0"),
+      rootSessionId: "session-1",
+      sequence: 0,
+      sessionId: "session-1",
+      turnId: "turn_0",
+      type: "turn.started" as const,
+    };
 
     await contextStorage.run(ctx, async () => {
-      await runtime.hooks.publish({
-        agentName: "support",
-        channelKind: "channel:slack",
-        idempotencyKey: sessionIdempotencyKey("session-1"),
-        rootSessionId: "session-1",
-        sessionId: "session-1",
-        type: "session.started",
-      });
+      await runtime.prepareSessionTrace(sessionEvent);
+      await runtime.prepareTurnTrace(turnEvent);
       await runtime.hooks.publish(started);
+      await runtime.hooks.publish(sessionEvent);
+      await runtime.hooks.publish(turnEvent);
+      ctx.set(ActiveChannelDeliveriesKey, [
+        {
+          agentName: started.agentName,
+          delivery: started.delivery,
+          policyAgentName: started.agentName,
+          rootSessionId: started.rootSessionId,
+          traceSessionId: started.rootSessionId,
+          sequence: 0,
+          sessionId: started.sessionId,
+          turnId: "turn_0",
+        },
+      ]);
       await runtime.hooks.publish(completed);
+      await completeTurn(runtime.hooks, "session-1", "turn_0");
     });
 
     const spans = runtime.exporter.getFinishedSpans();
-    const session = spans.find((span) => span.name === "agent.session")!;
-    const delivery = spans.find((span) => span.name === "agent.channel.delivery")!;
-    expect(delivery.kind).toBe(SpanKind.CONSUMER);
-    expect(delivery.parentSpanContext?.spanId).toBe(session.spanContext().spanId);
-    expect(delivery.links).toEqual([
+    const turn = spans.find((span) => span.name === "invoke_agent support")!;
+    expect(byName(spans, "agent.channel.delivery")).toHaveLength(0);
+    expect(turn.parentSpanContext).toBeUndefined();
+    expect(turn.links).toEqual([
       expect.objectContaining({
         attributes: { "eve.link.type": "channel.request" },
         context: expect.objectContaining(requestTraceContext),
       }),
     ]);
-    expect(delivery.attributes).toMatchObject({
+    expect(turn.attributes).toMatchObject({
       "agent.channel.delivery.id": "delivery-1",
       "agent.channel.delivery.input": JSON.stringify({ message: "private" }),
-      "agent.channel.delivery.outcome": "completed",
       "agent.channel.kind": "channel:slack",
       "agent.channel.name": "slack",
       "agent.channel.request.id": "iad1::request-1",
-      "agent.session.id": "session-1",
       "agent.turn.id": "turn_0",
       "agent.turn.sequence": 0,
+      "gen_ai.conversation.id": "session-1",
     });
-
-    await contextStorage.run(ctx, async () => {
-      await runtime.hooks.publish(started);
-      await runtime.hooks.publish(completed);
-    });
-    const replayed = runtime.exporter
-      .getFinishedSpans()
-      .filter((span) => span.name === "agent.channel.delivery");
-    expect(replayed).toHaveLength(2);
-    expect(replayed[1]!.spanContext().spanId).toBe(replayed[0]!.spanContext().spanId);
   });
 
-  it("preserves a remote parent when delivery starts before the session event", async () => {
+  it("does not emit delivery spans when remote deliveries fan in before the session event", async () => {
     const runtime = createRuntime();
     const ctx = new ContextContainer();
     const parentTraceContext = {
@@ -654,64 +1197,213 @@ describe("createAgentOtelInstrumentation", () => {
       traceFlags: 1,
       traceId: "11111111111111111111111111111111",
     };
-    const delivery = {
+    const deliveries = ["first", "second"].map((suffix) => ({
       channelKind: "http",
       channelName: "eve",
-      deliveryId: "delivery-remote",
+      deliveryId: `delivery-remote-${suffix}`,
+    }));
+    const sessionEvent = {
+      agentName: "weather",
+      channelKind: "http",
+      idempotencyKey: sessionIdempotencyKey("remote-session"),
+      parentTraceContext,
+      rootSessionId: "parent-session",
+      sessionId: "remote-session",
+      type: "session.started" as const,
     };
-    const idempotencyKey = `channel-delivery:remote-session:${delivery.deliveryId}`;
+    const turnEvent = {
+      idempotencyKey: turnIdempotencyKey("remote-session", "turn-remote"),
+      parentTraceContext,
+      rootSessionId: "parent-session",
+      sequence: 0,
+      sessionId: "remote-session",
+      turnId: "turn-remote",
+      type: "turn.started" as const,
+    };
 
     await contextStorage.run(ctx, async () => {
-      await runtime.hooks.publish({
-        delivery,
-        idempotencyKey,
-        parentTraceContext,
-        rootSessionId: "parent-session",
-        sessionId: "remote-session",
-        type: "channel.delivery.started",
-      });
-      await runtime.hooks.publish({
-        agentName: "weather",
-        channelKind: "http",
-        idempotencyKey: sessionIdempotencyKey("remote-session"),
-        parentTraceContext,
-        rootSessionId: "parent-session",
-        sessionId: "remote-session",
-        type: "session.started",
-      });
-      await runtime.hooks.publish({
-        idempotencyKey: turnIdempotencyKey("remote-session", "turn-remote"),
-        parentTraceContext,
-        rootSessionId: "parent-session",
-        sequence: 0,
-        sessionId: "remote-session",
-        turnId: "turn-remote",
-        type: "turn.started",
-      });
-      await runtime.hooks.publish({
-        delivery,
-        idempotencyKey,
-        outcome: "completed",
-        rootSessionId: "parent-session",
-        sequence: 0,
-        sessionId: "remote-session",
-        turnId: "turn-remote",
-        type: "channel.delivery.completed",
-      });
+      for (const delivery of deliveries) {
+        await runtime.hooks.publish({
+          delivery,
+          idempotencyKey: `channel-delivery:remote-session:${delivery.deliveryId}`,
+          parentTraceContext,
+          rootSessionId: "parent-session",
+          traceSessionId: "parent-session",
+          sequence: 0,
+          sessionId: "remote-session",
+          turnId: "turn-remote",
+          type: "channel.delivery.started",
+        });
+      }
+      await runtime.prepareSessionTrace(sessionEvent);
+      await runtime.prepareTurnTrace(turnEvent);
+      await runtime.hooks.publish(sessionEvent);
+      await runtime.hooks.publish(turnEvent);
+      ctx.set(
+        ActiveChannelDeliveriesKey,
+        deliveries.map((delivery) => ({
+          agentName: "weather",
+          delivery,
+          policyAgentName: "weather",
+          rootSessionId: "parent-session",
+          traceSessionId: "parent-session",
+          sequence: 0,
+          sessionId: "remote-session",
+          turnId: "turn-remote",
+        })),
+      );
+      for (const delivery of deliveries) {
+        await runtime.hooks.publish({
+          delivery,
+          idempotencyKey: `channel-delivery:remote-session:${delivery.deliveryId}`,
+          outcome: "completed",
+          rootSessionId: "parent-session",
+          sequence: 0,
+          sessionId: "remote-session",
+          turnId: "turn-remote",
+          type: "channel.delivery.completed",
+        });
+      }
       await completeTurn(runtime.hooks, "remote-session", "turn-remote");
     });
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    const channelDelivery = byName(spans, "agent.channel.delivery")[0]!;
-    const turn = byName(spans, "agent.turn")[0]!;
+    const turn = byName(spans, "invoke_agent weather")[0]!;
     expect(byName(spans, "agent.session")).toHaveLength(0);
-    expect(channelDelivery.parentSpanContext).toMatchObject(parentTraceContext);
-    expect(turn.parentSpanContext).toMatchObject(parentTraceContext);
-    expect(turn.spanContext().traceId).toBe(parentTraceContext.traceId);
+    expect(byName(spans, "agent.channel.delivery")).toHaveLength(0);
+    expect(turn.parentSpanContext).toBeUndefined();
+    expect(turn.links).toEqual([
+      { context: parentTraceContext, attributes: { "eve.link.type": "agent.dispatch" } },
+    ]);
+    expect(turn.spanContext().traceId).not.toBe(parentTraceContext.traceId);
+    expect(turn.attributes).toMatchObject({
+      "gen_ai.conversation.id": "parent-session",
+      "gen_ai.operation.name": "invoke_agent",
+    });
+    expect(turn.attributes).not.toHaveProperty("agent.channel.delivery.id");
   });
 
-  it("emits the agent hierarchy in one session trace", async () => {
+  it("uses canonical root session metadata after a delivery arrives first", async () => {
+    const stateStore = new InMemoryAgentTraceStateStore();
+    const runtime = createRuntime(stateStore);
+    const ctx = new ContextContainer();
+    const parentTraceContext = {
+      isRemote: true as const,
+      spanId: "2222222222222222",
+      traceFlags: 1,
+      traceId: "11111111111111111111111111111111",
+    };
+    const sessionId = "session-canonical-metadata";
+    const sessionEvent = {
+      agentName: "weather",
+      channelAudience: "public" as const,
+      channelType: "http",
+      idempotencyKey: sessionIdempotencyKey(sessionId),
+      parentTraceContext,
+      rootSessionId: sessionId,
+      scheduleId: "sched-1",
+      sessionId,
+      title: "Investigate the incident",
+      type: "session.started" as const,
+    };
+    const turnEvent = {
+      idempotencyKey: turnIdempotencyKey(sessionId, "turn_0"),
+      parentTraceContext,
+      rootSessionId: sessionId,
+      sequence: 0,
+      sessionId,
+      turnId: "turn_0",
+      type: "turn.started" as const,
+    };
+
+    await contextStorage.run(ctx, async () => {
+      await runtime.hooks.publish({
+        delivery: {
+          channelAudience: "public",
+          channelKind: "http",
+          channelName: "eve",
+          deliveryId: "delivery-first",
+        },
+        idempotencyKey: "channel-delivery:session-canonical-metadata:delivery-first",
+        parentTraceContext,
+        rootSessionId: sessionId,
+        sequence: 0,
+        sessionId,
+        turnId: "turn_0",
+        type: "channel.delivery.started",
+      });
+      expect(stateStore.getSession(sessionId)).toBeUndefined();
+
+      await runtime.prepareSessionTrace(sessionEvent);
+      await runtime.prepareTurnTrace(turnEvent);
+      expect(stateStore.getSession(sessionId)).toMatchObject({
+        channelType: "http",
+        scheduleId: "sched-1",
+        title: "Investigate the incident",
+      });
+
+      await runtime.hooks.publish(sessionEvent);
+      await runtime.hooks.publish(turnEvent);
+      await completeTurn(runtime.hooks, sessionId, "turn_0");
+    });
+    await runtime.provider.forceFlush();
+
+    const turn = byName(runtime.exporter.getFinishedSpans(), "invoke_agent weather")[0]!;
+    expect(turn.attributes).toMatchObject({
+      "agent.channel.kind": "http",
+      "agent.schedule.id": "sched-1",
+      "agent.session.title": "Investigate the incident",
+    });
+  });
+
+  it("stores canonical parent lineage after a delivery arrives first", async () => {
+    const stateStore = new InMemoryAgentTraceStateStore();
+    const runtime = createRuntime(stateStore);
+    const sessionId = "session-canonical-lineage";
+    const parentLineage = {
+      callId: "call-1",
+      sessionId: "parent-session",
+      subagentName: "reviewer",
+      turnId: "turn_0",
+    };
+    const sessionEvent = {
+      agentName: "reviewer",
+      channelAudience: "public" as const,
+      channelType: "http",
+      idempotencyKey: sessionIdempotencyKey(sessionId),
+      parentLineage,
+      rootSessionId: "parent-session",
+      sessionId,
+      type: "session.started" as const,
+    };
+
+    await runtime.hooks.publish({
+      delivery: {
+        channelAudience: "public",
+        channelKind: "http",
+        channelName: "eve",
+        deliveryId: "delivery-first",
+      },
+      idempotencyKey: "channel-delivery:session-canonical-lineage:delivery-first",
+      rootSessionId: "parent-session",
+      sequence: 0,
+      sessionId,
+      turnId: "turn_0",
+      type: "channel.delivery.started",
+    });
+    expect(stateStore.getSession(sessionId)).toBeUndefined();
+
+    await runtime.prepareSessionTrace(sessionEvent);
+    await runtime.hooks.publish(sessionEvent);
+
+    expect(stateStore.getSession(sessionId)).toMatchObject({
+      channelType: "http",
+      parentLineage,
+    });
+  });
+
+  it("emits one bounded activation trace rooted at invoke_agent", async () => {
     const runtime = createRuntime();
     const delivery = runtime.tracer.startSpan("workflow.delivery");
     const activeContext = runtimeTrace.setSpan(ROOT_CONTEXT, delivery);
@@ -734,42 +1426,41 @@ describe("createAgentOtelInstrumentation", () => {
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    const turn = byName(spans, "agent.turn")[0]!;
+    const turn = byName(spans, "invoke_agent weather")[0]!;
     const step = byName(spans, "agent.step")[0]!;
-    const operation = byName(spans, "ai.streamText")[0]!;
     const model = byName(spans, "chat claude-test")[0]!;
-    const action = byName(spans, "agent.action")[0]!;
-    const tool = byName(spans, "ai.toolCall")[0]!;
+    const tool = byName(spans, "execute_tool weather")[0]!;
 
-    const session = byName(spans, "agent.session")[0]!;
-    expect(session.parentSpanContext).toBeUndefined();
-    expect(session.events.map((event) => event.name)).toEqual(["session.started"]);
-    expect(session.attributes).toMatchObject({
-      "agent.channel.audience": "public",
-      "agent.session.id": "session-1",
-      "agent.trace.schema.version": 2,
-    });
-    expect(turn.parentSpanContext?.spanId).toBe(session.spanContext().spanId);
+    expect(byName(spans, "agent.session")).toHaveLength(0);
+    expect(turn.parentSpanContext).toBeUndefined();
     expect(step.parentSpanContext?.spanId).toBe(turn.spanContext().spanId);
-    expect(operation.parentSpanContext?.spanId).toBe(step.spanContext().spanId);
     expect(step.links).toEqual([
       expect.objectContaining({
         attributes: { "eve.link.type": "workflow.delivery" },
         context: delivery.spanContext(),
       }),
     ]);
-    expect(model.parentSpanContext?.spanId).toBe(operation.spanContext().spanId);
+    expect(model.parentSpanContext?.spanId).toBe(step.spanContext().spanId);
+    expect(model.kind).toBe(SpanKind.CLIENT);
     expect(
       executionParents.some(
         (parent) =>
           apiTrace.getSpan(parent as never)?.spanContext().spanId === model.spanContext().spanId,
       ),
     ).toBe(true);
-    expect(action.parentSpanContext?.spanId).toBe(step.spanContext().spanId);
-    expect(tool.parentSpanContext?.spanId).toBe(action.spanContext().spanId);
-    for (const span of [turn, step, operation, model, action, tool]) {
+    expect(tool.parentSpanContext?.spanId).toBe(step.spanContext().spanId);
+    expect(byName(spans, "agent.action")).toHaveLength(0);
+    expect(byName(spans, "execute_tool weather")).toHaveLength(1);
+    expect(turn.attributes["agent.channel.audience"]).toBe("public");
+    for (const span of [step, model, tool]) {
       expect(span.attributes).not.toHaveProperty("agent.channel.audience");
     }
+    for (const span of [turn, step, model, tool]) {
+      expect(span.attributes).toMatchObject({
+        "gen_ai.conversation.id": "session-1",
+      });
+    }
+    expect(byName(spans, "ai.streamText")).toHaveLength(0);
     expect(
       new Set(
         spans
@@ -780,27 +1471,186 @@ describe("createAgentOtelInstrumentation", () => {
     expect(turn.events.map((event) => event.name)).toEqual(["turn.started", "turn.completed"]);
     // Turn timestamps are millisecond-quantized (`Date.now`), so the end
     // comparison against the step's sub-millisecond clock gets 1ms of slack.
-    expect(turn.attributes).toMatchObject({ "agent.name": "weather" });
+    expect(turn.kind).toBe(SpanKind.INTERNAL);
+    expect(turn.attributes).toMatchObject({
+      "agent.name": "weather",
+      "gen_ai.usage.input_tokens": 10,
+      "gen_ai.usage.output_tokens": 5,
+      "gen_ai.agent.name": "weather",
+      "gen_ai.conversation.id": "session-1",
+      "gen_ai.operation.name": "invoke_agent",
+    });
     expect(nanos(turn.startTime)).toBeLessThanOrEqual(nanos(step.startTime));
     expect(nanos(turn.endTime)).toBeGreaterThanOrEqual(nanos(step.endTime) - 1_000_000n);
     expect(step.attributes).toMatchObject({
       "agent.framework.name": "eve",
       "agent.model.id": "claude-test",
-      "agent.model.provider": "anthropic",
+      "agent.usage.cache_read_tokens": 4,
+      "agent.usage.cache_write_tokens": 2,
       "agent.usage.input_tokens": 10,
       "agent.usage.output_tokens": 5,
-      "gen_ai.usage.cache_creation.input_tokens": 2,
-      "gen_ai.usage.cache_read.input_tokens": 4,
     });
-    expect(action.attributes).toMatchObject({
+    expect(step.attributes).not.toHaveProperty("agent.model.provider");
+    expect(model.attributes).toMatchObject({
+      "gen_ai.response.id": "response-1",
+      "gen_ai.response.model": "claude-response",
+      "gen_ai.usage.cache_write.input_tokens": 2,
+      "gen_ai.usage.cache_read.input_tokens": 4,
+      "gen_ai.usage.input_tokens": 10,
+      "gen_ai.usage.output_tokens": 5,
+    });
+    for (const span of [turn, model]) {
+      for (const key of [
+        "agent.usage.input_tokens",
+        "agent.usage.output_tokens",
+        "agent.usage.cache_read_tokens",
+        "agent.usage.cache_write_tokens",
+      ]) {
+        expect(span.attributes).not.toHaveProperty(key);
+      }
+    }
+    expect(tool.attributes).toMatchObject({
       "agent.action.kind": "tool-call",
       "agent.action.name": "weather",
       "agent.framework.name": "eve",
     });
+    expect(tool.kind).toBe(SpanKind.INTERNAL);
+    expect(tool.attributes).toMatchObject({
+      "gen_ai.agent.name": "weather",
+      "gen_ai.operation.name": "execute_tool",
+      "gen_ai.tool.call.id": "tool-1",
+      "agent.tool.is_framework": false,
+      "gen_ai.tool.name": "weather",
+      "gen_ai.tool.type": "function",
+    });
+  });
+
+  it("projects production workflow tool calls as tool spans", async () => {
+    const context = new ContextContainer();
+    let runtime: TestRuntime | undefined;
+
+    await contextStorage.run(context, async () => {
+      runtime = createRuntime(new ContextAgentTraceStateStore());
+      const scope: InstrumentationAttemptScope = {
+        attemptId: "session-workflow:turn-1:0:0",
+        attemptIndex: 0,
+        functionId: "weather",
+        sessionId: "session-workflow",
+        stepIndex: 0,
+        turnId: "turn-1",
+      };
+      await publishTurnStarted({
+        hooks: runtime.hooks,
+        sessionId: scope.sessionId,
+        turnId: scope.turnId,
+        turnSequence: 0,
+      });
+      await runtime.hooks.publish({
+        idempotencyKey: attemptIdempotencyKey(scope),
+        operation: { modelId: "model", operationId: "ai.streamText", provider: "test" },
+        scope,
+        type: "step.attempt.started",
+      });
+
+      const tools: HarnessToolMap = new Map([
+        [
+          "coordinate",
+          {
+            description: "Coordinate research.",
+            inputSchema: {} as never,
+            name: "coordinate",
+            workflowId: "workflow//./agent/tools/coordinate//execute",
+          },
+        ],
+        [
+          "wait",
+          {
+            description: "Wait durably.",
+            inputSchema: {} as never,
+            name: "wait",
+            workflowId: "workflow//./agent/tools/wait//execute",
+          },
+        ],
+      ]);
+      const projections = [
+        createPresentedRuntimeActionRequestFromToolCall({
+          toolCall: {
+            input: { query: "review" },
+            toolCallId: "workflow",
+            toolName: "coordinate",
+            type: "tool-call",
+          } as never,
+          tools,
+        }),
+        createPresentedRuntimeActionRequestFromToolCall({
+          toolCall: {
+            input: { delay: "1m" },
+            toolCallId: "wait",
+            toolName: "wait",
+            type: "tool-call",
+          } as never,
+          tools,
+        }),
+      ];
+      expect(projections.map(({ action }) => action.kind)).toEqual(["tool-call", "tool-call"]);
+      expect(projections.every(({ action }) => isRuntimeWorkflowToolAction(action))).toBe(true);
+
+      const handleEvent = createInstrumentationHandleEvent({
+        getAttemptScope: () => scope,
+        handleEvent: async () => {},
+        hooks: runtime.hooks,
+        sessionId: scope.sessionId,
+      })!;
+      await handleEvent(
+        createActionsRequestedEvent({
+          actions: projections.map(({ action }) => action),
+          sequence: 0,
+          stepIndex: 0,
+          turnId: scope.turnId,
+        }),
+      );
+
+      for (const [callId, toolName] of [
+        ["workflow", "coordinate"],
+        ["wait", "wait"],
+      ] as const) {
+        await handleEvent(
+          createActionResultEvent({
+            result: {
+              callId,
+              kind: "tool-result",
+              output: { done: true },
+              toolName,
+            },
+            sequence: 0,
+            stepIndex: 0,
+            turnId: scope.turnId,
+          }),
+        );
+      }
+      await runtime.hooks.publish({
+        idempotencyKey: attemptIdempotencyKey(scope),
+        scope,
+        type: "step.attempt.completed",
+      });
+      await completeTurn(runtime.hooks, scope.sessionId, scope.turnId);
+    });
+
+    await runtime!.provider.forceFlush();
+    const actions = runtime!.exporter
+      .getFinishedSpans()
+      .filter((span) => span.attributes["gen_ai.operation.name"] === "execute_tool");
+    expect(actions.map((span) => span.attributes["gen_ai.tool.call.id"]).sort()).toEqual([
+      "wait",
+      "workflow",
+    ]);
+    for (const action of actions) {
+      expect(action.attributes).toMatchObject({ "agent.action.kind": "tool-call" });
+    }
   });
 
   it.each(["private", "unknown"] as const)(
-    "does not record %s conversation traces by default",
+    "records %s conversation traces by default",
     async (audience) => {
       const runtime = createRuntime(new InMemoryAgentTraceStateStore(), null);
 
@@ -814,11 +1664,214 @@ describe("createAgentOtelInstrumentation", () => {
       });
       await runtime.provider.forceFlush();
 
+      const turn = byName(runtime.exporter.getFinishedSpans(), "invoke_agent weather")[0]!;
+      expect(turn.attributes).not.toHaveProperty("vercel.session_id");
+    },
+  );
+
+  it("uses the stored session decision when no event or context seed exists", async () => {
+    const stateStore = new InMemoryAgentTraceStateStore();
+    stateStore.setSession("session-policy", {
+      channelAudience: "public",
+      context: spanContext("1", "2"),
+      decision: { action: "record", recordInputs: false, recordOutputs: true },
+      rootSessionId: "session-policy",
+      traceSessionId: "session-policy",
+    });
+    const runtime = createRuntime(stateStore, null);
+
+    await expect(runtime.projectEvent(modelStartedEvent("session-policy"))).resolves.toMatchObject({
+      input: undefined,
+    });
+  });
+
+  it("preserves a private decision already intersected with a forwarded ceiling", async () => {
+    const stateStore = new InMemoryAgentTraceStateStore();
+    stateStore.setSession("session-forwarded-private", {
+      channelAudience: "private",
+      context: spanContext("1", "2"),
+      decision: { action: "record", recordInputs: true, recordOutputs: false },
+      rootSessionId: "session-forwarded-private",
+      traceSessionId: "session-forwarded-private",
+    });
+    const runtime = createRuntime(stateStore, null);
+    const ctx = new ContextContainer();
+    ctx.set(SessionTraceSeedKey, {
+      ...spanContext("1", "2"),
+      decision: { action: "record", recordInputs: true, recordOutputs: false },
+      forwardedTracePolicy: {
+        ceiling: { recordInputs: true, recordOutputs: false },
+        originAudience: "private",
+      },
+    });
+
+    await expect(
+      contextStorage.run(ctx, () =>
+        runtime.projectEvent(modelStartedEvent("session-forwarded-private")),
+      ),
+    ).resolves.toMatchObject({ input: { instructions: "private prompt" } });
+  });
+
+  it("applies a fail-closed forwarded ceiling to event-carried trace seeds", async () => {
+    const runtime = createRuntime(new InMemoryAgentTraceStateStore(), null);
+    const ctx = new ContextContainer();
+    const traceSeed = {
+      ...spanContext("1", "2"),
+      decision: { action: "record", recordInputs: true, recordOutputs: true },
+      forwardedTracePolicy: { originAudience: "public" },
+    } as never;
+    ctx.set(SessionTraceSeedKey, traceSeed);
+    const event = {
+      delivery: {
+        channelAudience: "public" as const,
+        channelKind: "channel:slack",
+        channelName: "slack",
+        deliveryId: "delivery-malformed-seed",
+      },
+      idempotencyKey: "channel-delivery:session-1:delivery-malformed-seed",
+      input: { message: "private" },
+      rootSessionId: "session-1",
+      sessionId: "session-1",
+      traceSeed,
+      type: "channel.delivery.started" as const,
+    };
+
+    await expect(contextStorage.run(ctx, () => runtime.projectEvent(event))).resolves.toMatchObject(
+      { input: undefined },
+    );
+  });
+
+  it("caps forwarded content for an explicitly private delivery", async () => {
+    const runtime = createRuntime(new InMemoryAgentTraceStateStore(), null);
+    const ctx = new ContextContainer();
+    const traceSeed = {
+      ...spanContext("1", "2"),
+      decision: { action: "record", recordInputs: true, recordOutputs: true },
+      forwardedTracePolicy: {
+        ceiling: { recordInputs: true, recordOutputs: true },
+        originAudience: "public",
+      },
+    } as const;
+    ctx.set(SessionTraceSeedKey, traceSeed);
+
+    await expect(
+      contextStorage.run(ctx, () =>
+        runtime.projectEvent({
+          delivery: {
+            channelAudience: "private",
+            channelKind: "channel:slack",
+            channelName: "slack",
+            deliveryId: "delivery-private",
+          },
+          idempotencyKey: "channel-delivery:session-1:delivery-private",
+          input: { message: "private" },
+          rootSessionId: "session-1",
+          sessionId: "session-1",
+          traceSeed,
+          type: "channel.delivery.started",
+        }),
+      ),
+    ).resolves.toMatchObject({ input: undefined });
+  });
+
+  it("normalizes an event-carried drop before preparing its activation trace", async () => {
+    const runtime = createRuntime(new InMemoryAgentTraceStateStore(), null);
+    const ctx = new ContextContainer();
+    const traceSeed = {
+      ...spanContext("1", "2"),
+      decision: { action: "record", recordInputs: "yes", recordOutputs: true },
+      forwardedTracePolicy: {
+        ceiling: { recordInputs: true, recordOutputs: true },
+        originAudience: "public",
+      },
+    } as never;
+    ctx.set(SessionTraceSeedKey, traceSeed);
+
+    await contextStorage.run(ctx, () =>
+      runtime.hooks.publish({
+        delivery: {
+          channelAudience: "public",
+          channelKind: "channel:slack",
+          channelName: "slack",
+          deliveryId: "delivery-malformed-decision",
+        },
+        idempotencyKey: "channel-delivery:session-1:delivery-malformed-decision",
+        input: { message: "private" },
+        rootSessionId: "session-1",
+        sessionId: "session-1",
+        traceSeed,
+        type: "channel.delivery.started",
+      }),
+    );
+    await runtime.provider.forceFlush();
+    expect(runtime.exporter.getFinishedSpans()).toEqual([]);
+  });
+
+  it("reconstructs a sampled public session decision when persisted policy is absent", async () => {
+    const stateStore = new InMemoryAgentTraceStateStore();
+    stateStore.setSession("session-sampled", {
+      channelAudience: "public",
+      context: spanContext("1", "2"),
+      rootSessionId: "session-sampled",
+      traceSessionId: "session-sampled",
+    });
+    const runtime = createRuntime(stateStore, null);
+
+    await expect(runtime.projectEvent(modelStartedEvent("session-sampled"))).resolves.toMatchObject(
+      {
+        input: { instructions: "private prompt" },
+      },
+    );
+  });
+
+  it("reconstructs an unsampled session as content-redacted", async () => {
+    const stateStore = new InMemoryAgentTraceStateStore();
+    stateStore.setSession("session-unsampled", {
+      channelAudience: "public",
+      context: { ...spanContext("1", "2"), traceFlags: 0 },
+      rootSessionId: "session-unsampled",
+      traceSessionId: "session-unsampled",
+    });
+    const runtime = createRuntime(stateStore, null);
+
+    await expect(
+      runtime.projectEvent(modelStartedEvent("session-unsampled")),
+    ).resolves.toMatchObject({ input: undefined });
+  });
+
+  it("fails closed when no trace decision source exists", async () => {
+    const runtime = createRuntime(new InMemoryAgentTraceStateStore(), null);
+
+    await expect(runtime.projectEvent(modelStartedEvent("session-missing"))).resolves.toMatchObject(
+      {
+        input: undefined,
+      },
+    );
+  });
+
+  it.each([
+    ["legacy false", (): boolean => false],
+    ["explicit emit false", (): { readonly emit: false } => ({ emit: false })],
+  ] as const)(
+    "does not emit a trace when the policy overrides the default with %s",
+    async (_name, tracePolicy) => {
+      const runtime = createRuntime(new InMemoryAgentTraceStateStore(), tracePolicy);
+
+      await emitAttempt({
+        channelAudience: "public",
+        hooks: runtime.hooks,
+        runInContext: runtime.runInContext,
+        sessionId: "session-rejected",
+        turnId: "turn-rejected",
+        turnSequence: 0,
+      });
+      await runtime.provider.forceFlush();
+
       expect(runtime.exporter.getFinishedSpans()).toEqual([]);
     },
   );
 
-  it("preserves the parent's sampling decision for adopted traces", async () => {
+  it("inherits recording eligibility and the parent's trace", async () => {
     const runtime = createRuntime(new InMemoryAgentTraceStateStore(), null);
 
     await emitAttempt({
@@ -836,7 +1889,6 @@ describe("createAgentOtelInstrumentation", () => {
     });
     await runtime.provider.forceFlush();
 
-    // The parent's traceFlags are authoritative — the child does not re-evaluate.
     const spans = runtime.exporter.getFinishedSpans();
     expect(spans.length).toBeGreaterThan(0);
     for (const span of spans) {
@@ -857,17 +1909,17 @@ describe("createAgentOtelInstrumentation", () => {
     });
     await runtime.provider.forceFlush();
 
-    expect(byName(runtime.exporter.getFinishedSpans(), "agent.session")).toHaveLength(1);
+    expect(byName(runtime.exporter.getFinishedSpans(), "invoke_agent weather")).toHaveLength(1);
   });
 
-  it("writes merged runtime context onto the step, operation, and chat spans", async () => {
+  it("writes merged runtime context onto the step and chat spans", async () => {
     const runtime = createRuntime();
 
     await emitAttempt({
       hooks: runtime.hooks,
       runInContext: runtime.runInContext,
       runtimeContext: {
-        "eve.session.id": "session-1",
+        "eve.environment": "production",
         "posthog.distinct_id": "user-123",
         nested: { ignored: undefined, team: "platform" },
         tags: ["a", "b"],
@@ -880,11 +1932,10 @@ describe("createAgentOtelInstrumentation", () => {
 
     const spans = runtime.exporter.getFinishedSpans();
     const step = byName(spans, "agent.step")[0]!;
-    const operation = byName(spans, "ai.streamText")[0]!;
     const model = byName(spans, "chat claude-test")[0]!;
-    for (const span of [step, operation, model]) {
+    for (const span of [step, model]) {
       expect(span.attributes).toMatchObject({
-        "ai.settings.context.eve.session.id": "session-1",
+        "ai.settings.context.eve.environment": "production",
         "ai.settings.context.posthog.distinct_id": "user-123",
         "ai.settings.context.nested.team": "platform",
         "ai.settings.context.tags": ["a", "b"],
@@ -906,9 +1957,8 @@ describe("createAgentOtelInstrumentation", () => {
 
     const spans = runtime.exporter.getFinishedSpans();
     const step = byName(spans, "agent.step")[0]!;
-    const operation = byName(spans, "ai.streamText")[0]!;
     const model = byName(spans, "chat claude-test")[0]!;
-    for (const span of [step, operation, model]) {
+    for (const span of [step, model]) {
       expect(
         Object.keys(span.attributes).some((key) => key.startsWith("ai.settings.context.")),
       ).toBe(false);
@@ -938,23 +1988,25 @@ describe("createAgentOtelInstrumentation", () => {
 
     const firstSpans = first.exporter.getFinishedSpans();
     const redeliverySpans = redelivery.exporter.getFinishedSpans();
-    for (const name of ["agent.turn", "agent.step", "agent.action", "ai.toolCall"]) {
+    for (const name of ["invoke_agent weather", "agent.step", "execute_tool weather"]) {
       expect(byName(redeliverySpans, name)[0]!.spanContext().spanId).toBe(
         byName(firstSpans, name)[0]!.spanContext().spanId,
       );
-    }
-    for (const name of ["ai.streamText", "chat claude-test"]) {
-      expect(byName(redeliverySpans, name)[0]!.spanContext().spanId).not.toBe(
-        byName(firstSpans, name)[0]!.spanContext().spanId,
+      expect(byName(redeliverySpans, name)[0]!.spanContext().traceId).toBe(
+        byName(firstSpans, name)[0]!.spanContext().traceId,
       );
     }
+    expect(byName(redeliverySpans, "chat claude-test")[0]!.spanContext().spanId).not.toBe(
+      byName(firstSpans, "chat claude-test")[0]!.spanContext().spanId,
+    );
   });
 
-  it("parents a tool to its action when SDK telemetry arrives first", async () => {
+  it("merges early SDK telemetry into one durable tool span", async () => {
     const runtime = createRuntime();
     const scope: InstrumentationAttemptScope = {
       attemptId: "session-1:turn-1:0:0",
       attemptIndex: 0,
+      channelAudience: "public",
       sessionId: "session-1",
       stepIndex: 0,
       turnId: "turn-1",
@@ -974,51 +2026,51 @@ describe("createAgentOtelInstrumentation", () => {
       scope,
       type: "step.attempt.started",
     });
-    await runtime.hooks.publish({
-      callId: "tool-1",
-      idempotencyKey: toolKey,
-      input: { secret: "value" },
-      scope,
-      toolName: "weather",
-      type: "tool.call.started",
-    });
-    await runtime.hooks.publish({
-      idempotencyKey: toolKey,
-      output: { output: "sunny", type: "result" },
-      scope,
-      type: "tool.call.completed",
-    });
+    const executionStart = Date.now();
+    await runtime.runInContext(
+      {
+        callId: "tool-1",
+        idempotencyKey: toolKey,
+        input: { secret: "value" },
+        scope,
+        toolName: "weather",
+        type: "tool.call",
+        startedAtMs: executionStart,
+        completedAtMs: executionStart + 1500,
+      },
+      () => Promise.resolve("sunny"),
+    );
+    const later = Date.now() + 100;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(later);
     await runtime.hooks.publish({
       callId: "tool-1",
       idempotencyKey: actionKey,
       input: { secret: "value" },
       kind: "tool-call",
-      name: "weather",
+      toolName: "weather",
       scope,
-      type: "action.started",
+      type: "tool.call.started",
     });
+    clock.mockRestore();
     await runtime.hooks.publish({
       idempotencyKey: actionKey,
       outcome: "completed",
       output: { output: "sunny", type: "result" },
       scope,
-      type: "action.completed",
-    });
-    const uncorrelatedToolKey = `tool:${scope.attemptId}:tool-2:0`;
-    await runtime.hooks.publish({
-      callId: "tool-2",
-      idempotencyKey: uncorrelatedToolKey,
-      input: {},
-      scope,
-      toolName: "final_output",
-      type: "tool.call.started",
-    });
-    await runtime.hooks.publish({
-      idempotencyKey: uncorrelatedToolKey,
-      output: { output: "done", type: "result" },
-      scope,
       type: "tool.call.completed",
     });
+    const uncorrelatedToolKey = `tool:${scope.attemptId}:tool-2:0`;
+    await runtime.runInContext(
+      {
+        callId: "tool-2",
+        idempotencyKey: uncorrelatedToolKey,
+        input: {},
+        scope,
+        toolName: "final_output",
+        type: "tool.call",
+      },
+      () => Promise.resolve("done"),
+    );
     await runtime.hooks.publish({
       idempotencyKey: attemptIdempotencyKey(scope),
       scope,
@@ -1027,10 +2079,18 @@ describe("createAgentOtelInstrumentation", () => {
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    const action = byName(spans, "agent.action")[0]!;
-    const [tool, uncorrelatedTool] = byName(spans, "ai.toolCall");
-    expect(tool!.parentSpanContext?.spanId).toBe(action.spanContext().spanId);
-    expect(uncorrelatedTool!.parentSpanContext?.spanId).toBe(
+    const tool = byName(spans, "execute_tool weather")[0]!;
+    const uncorrelatedTool = byName(spans, "execute_tool final_output")[0]!;
+    expect(tool.parentSpanContext?.spanId).toBe(
+      byName(spans, "agent.step")[0]!.spanContext().spanId,
+    );
+    expect(byName(spans, "execute_tool weather")).toHaveLength(1);
+    expect(byName(spans, "agent.action")).toHaveLength(0);
+    expect(nanos(tool.startTime)).toBeLessThan(BigInt(later) * 1_000_000n);
+    // Seconds, as `@ai-sdk/otel` records it; a publisher that measured nothing sets none.
+    expect(tool.attributes["gen_ai.execute_tool.duration"]).toBe(1.5);
+    expect(uncorrelatedTool.attributes["gen_ai.execute_tool.duration"]).toEqual(expect.any(Number));
+    expect(uncorrelatedTool.parentSpanContext?.spanId).toBe(
       byName(spans, "agent.step")[0]!.spanContext().spanId,
     );
   });
@@ -1066,9 +2126,9 @@ describe("createAgentOtelInstrumentation", () => {
         idempotencyKey: actionKey,
         input: { secret: "value" },
         kind: "tool-call",
-        name: "weather",
+        toolName: "weather",
         scope,
-        type: "action.started",
+        type: "tool.call.started",
       });
       await first.hooks.publish({
         idempotencyKey: attemptIdempotencyKey(scope),
@@ -1092,35 +2152,31 @@ describe("createAgentOtelInstrumentation", () => {
     await contextStorage.run(restored, async () => {
       // Approval-resumed tools can execute before the replacement AI SDK emits
       // a new step start. The persisted action context is still their parent.
-      await replacement.hooks.publish({
-        callId: "tool-1",
-        idempotencyKey: toolKey,
-        input: {},
-        scope: replacementScope,
-        toolName: "weather",
-        type: "tool.call.started",
-      });
-      await replacement.hooks.publish({
-        idempotencyKey: toolKey,
-        output: { output: "ok", type: "result" },
-        scope: replacementScope,
-        type: "tool.call.completed",
-      });
+      await replacement.runInContext(
+        {
+          callId: "tool-1",
+          idempotencyKey: toolKey,
+          input: {},
+          scope: replacementScope,
+          toolName: "weather",
+          type: "tool.call",
+        },
+        () => Promise.resolve("ok"),
+      );
       await replacement.hooks.publish({
         acceptedAtMs,
         idempotencyKey: actionKey,
         outcome: "completed",
         output: { output: { temperature: 72 }, type: "result" },
         scope,
-        type: "action.completed",
+        type: "tool.call.completed",
       });
     });
     await replacement.provider.forceFlush();
 
     const replacementSpans = replacement.exporter.getFinishedSpans();
-    const action = byName(replacementSpans, "agent.action")[0]!;
-    const tool = byName(replacementSpans, "ai.toolCall")[0]!;
-    expect(action.spanContext().spanId).toBe(tool.parentSpanContext?.spanId);
+    const action = byName(replacementSpans, "execute_tool weather")[0]!;
+    expect(byName(replacementSpans, "execute_tool weather")).toHaveLength(1);
     expect(action.parentSpanContext?.spanId).toBe(step.spanContext().spanId);
     expect(action.attributes).toMatchObject({
       "agent.action.kind": "tool-call",
@@ -1157,9 +2213,9 @@ describe("createAgentOtelInstrumentation", () => {
         idempotencyKey: actionKey,
         input: { city: "SF" },
         kind: "tool-call",
-        name: "weather",
+        toolName: "weather",
         scope,
-        type: "action.started",
+        type: "tool.call.started",
       });
       await first.hooks.publish({
         action: { callId: "tool-1", name: "weather" },
@@ -1190,29 +2246,278 @@ describe("createAgentOtelInstrumentation", () => {
         outcome: "completed",
         output: { output: { temperature: 72 }, type: "result" },
         scope,
-        type: "action.completed",
+        type: "tool.call.completed",
       });
     });
     await replacement.provider.forceFlush();
 
     const spans = replacement.exporter.getFinishedSpans();
     const approval = byName(spans, "agent.approval")[0]!;
-    const action = byName(spans, "agent.action")[0]!;
+    const action = byName(spans, "execute_tool weather")[0]!;
+    expect(approval.attributes).not.toHaveProperty("agent.action.call_id");
+    expect(action.attributes).not.toHaveProperty("agent.action.call_id");
     expect(approval.parentSpanContext?.spanId).toBe(action.spanContext().spanId);
     expect(approval.status.code).toBe(SpanStatusCode.UNSET);
     expect(approval.attributes).toMatchObject({
-      "agent.action.call_id": "tool-1",
+      "gen_ai.tool.call.id": "tool-1",
       "agent.action.name": "weather",
       "agent.approval.kind": "tool-approval",
       "agent.approval.outcome": "approved",
       "agent.approval.request": expect.stringContaining("Approve weather?"),
       "agent.approval.request_id": "approval-1",
       "agent.approval.response": expect.stringContaining("approve"),
-      "agent.session.id": "session-1",
+      "operation.name": "agent.approval",
+      "resource.name": "agent.approval",
+      "gen_ai.conversation.id": "session-1",
       "agent.step.index": 0,
       "agent.turn.id": "turn-1",
     });
     expect(nanos(approval.duration)).toBeGreaterThan(0n);
+  });
+
+  it("carries the channel audience on reconstructed durable span contexts", async () => {
+    // Destination export policies read the audience from the parent context at
+    // onStart; a bare wrapped span context would surface "unknown" and let a
+    // policy apply the wrong export or redaction decision.
+    const audiences = new Map<string, ChannelAudience>();
+    const recorder: SpanProcessor = {
+      forceFlush: async () => {},
+      onEnd: () => {},
+      onStart: (span, parentContext) => {
+        audiences.set(span.name, channelAudienceFromContext(parentContext));
+      },
+      shutdown: async () => {},
+    };
+    const runtime = createRuntime(new InMemoryAgentTraceStateStore(), undefined, [recorder]);
+    const ctx = new ContextContainer();
+    const scope: InstrumentationAttemptScope = {
+      attemptId: "session-1:turn-1:0:0",
+      attemptIndex: 0,
+      channelAudience: "private",
+      functionId: "weather",
+      sessionId: "session-1",
+      stepIndex: 0,
+      turnId: "turn-1",
+    };
+    const actionKey = actionIdempotencyKey("session-1", "turn-1", "tool-1");
+    const inputKey = inputIdempotencyKey("session-1", "turn-1", "approval-1");
+    const delivery = {
+      channelAudience: "private" as const,
+      channelKind: "channel:slack",
+      channelName: "slack",
+      deliveryId: "delivery-1",
+      requestId: "iad1::request-1",
+    };
+
+    await contextStorage.run(ctx, async () => {
+      await publishTurnStarted({
+        channelAudience: "private",
+        hooks: runtime.hooks,
+        sessionId: "session-1",
+        turnId: "turn-1",
+        turnSequence: 0,
+      });
+      await runtime.hooks.publish({
+        agentName: "weather",
+        delivery,
+        idempotencyKey: "channel-delivery:session-1:delivery-1",
+        input: { message: "hi" },
+        rootSessionId: "session-1",
+        sessionId: "session-1",
+        type: "channel.delivery.started",
+      });
+      await runtime.hooks.publish({
+        callId: "tool-1",
+        idempotencyKey: actionKey,
+        input: { city: "SF" },
+        kind: "tool-call",
+        toolName: "weather",
+        scope,
+        type: "tool.call.started",
+      });
+      await runtime.hooks.publish({
+        action: { callId: "tool-1", name: "weather" },
+        idempotencyKey: inputKey,
+        kind: "tool-approval",
+        request: { prompt: "Approve weather?" },
+        requestId: "approval-1",
+        scope,
+        type: "input.requested",
+      });
+      await runtime.hooks.publish({
+        idempotencyKey: inputKey,
+        kind: "tool-approval",
+        outcome: "approved",
+        requestId: "approval-1",
+        scope,
+        type: "input.resolved",
+      });
+      await runtime.hooks.publish({
+        idempotencyKey: actionKey,
+        outcome: "completed",
+        output: { output: { temperature: 72 }, type: "result" },
+        scope,
+        type: "tool.call.completed",
+      });
+      await runtime.hooks.publish({
+        agentName: "weather",
+        delivery,
+        idempotencyKey: "channel-delivery:session-1:delivery-1",
+        outcome: "completed",
+        rootSessionId: "session-1",
+        sequence: 0,
+        sessionId: "session-1",
+        turnId: "turn-1",
+        type: "channel.delivery.completed",
+      });
+      await completeTurn(runtime.hooks, "session-1", "turn-1");
+    });
+
+    expect(audiences.get("agent.approval")).toBe("private");
+    expect(audiences.has("agent.channel.delivery")).toBe(false);
+    expect(audiences.get("invoke_agent weather")).toBe("private");
+  });
+
+  it("carries the channel audience on the tool execution context", async () => {
+    const runtime = createRuntime();
+    const scope: InstrumentationAttemptScope = {
+      attemptId: "session-1:turn-1:0:0",
+      attemptIndex: 0,
+      channelAudience: "private",
+      functionId: "weather",
+      sessionId: "session-1",
+      stepIndex: 0,
+      turnId: "turn-1",
+    };
+    await publishTurnStarted({
+      channelAudience: "private",
+      hooks: runtime.hooks,
+      sessionId: "session-1",
+      turnId: "turn-1",
+      turnSequence: 0,
+    });
+    await runtime.hooks.publish({
+      idempotencyKey: attemptIdempotencyKey(scope),
+      operation: { modelId: "model", operationId: "ai.streamText", provider: "test" },
+      scope,
+      type: "step.attempt.started",
+    });
+    const withSpy = vi.spyOn(context, "with");
+    await runtime.runInContext(
+      {
+        idempotencyKey: "tool:session-1:turn-1:tool-1",
+        scope,
+        type: "tool.call",
+        callId: "tool-1",
+        toolName: "weather",
+        input: { city: "SF" },
+      },
+      async () => undefined,
+    );
+
+    expect(withSpy).toHaveBeenCalledOnce();
+    expect(channelAudienceFromContext(withSpy.mock.calls[0]![0])).toBe("private");
+    withSpy.mockRestore();
+  });
+
+  it("enriches the existing tool span with MCP attributes under its content policy", async () => {
+    const runtime = createRuntime(new InMemoryAgentTraceStateStore(), () => ({
+      emit: true,
+      recordInputs: false,
+      recordOutputs: false,
+    }));
+    const scope: InstrumentationAttemptScope = {
+      attemptId: "session-1:turn-1:0:0",
+      attemptIndex: 0,
+      channelAudience: "private",
+      functionId: "weather",
+      sessionId: "session-1",
+      stepIndex: 0,
+      turnId: "turn-1",
+    };
+    const actionKey = actionIdempotencyKey(scope.sessionId, scope.turnId, "tool-1");
+    const toolKey = "tool:session-1:turn-1:tool-1:0";
+
+    await publishTurnStarted({
+      channelAudience: "private",
+      hooks: runtime.hooks,
+      sessionId: scope.sessionId,
+      turnId: scope.turnId,
+      turnSequence: 0,
+    });
+    await runtime.hooks.publish({
+      idempotencyKey: attemptIdempotencyKey(scope),
+      operation: { modelId: "model", operationId: "ai.streamText", provider: "test" },
+      scope,
+      type: "step.attempt.started",
+    });
+    await runtime.hooks.publish({
+      callId: "tool-1",
+      idempotencyKey: actionKey,
+      input: { issue: "ISSUE-1" },
+      kind: "tool-call",
+      toolName: "linear__get_issue",
+      scope,
+      type: "tool.call.started",
+    });
+    const withSpy = vi.spyOn(context, "with");
+    await runtime.runInContext(
+      {
+        idempotencyKey: toolKey,
+        scope,
+        type: "tool.call",
+        callId: "tool-1",
+        toolName: "linear__get_issue",
+        input: { issue: "ISSUE-1" },
+      },
+      async () => {
+        const active = withSpy.mock.calls[0]?.[0];
+        expect(active).toBeDefined();
+        expect(agentToolContentPolicy(active!)).toEqual({
+          recordInputs: false,
+          recordOutputs: false,
+        });
+        annotateAgentToolSpan(
+          {
+            "eve.connection.name": "linear",
+            "gen_ai.operation.name": "execute_tool",
+            "gen_ai.tool.name": "get_issue",
+            "jsonrpc.request.id": "7",
+            "mcp.method.name": "tools/call",
+          },
+          active!,
+        );
+      },
+    );
+    withSpy.mockRestore();
+
+    await runtime.hooks.publish({
+      idempotencyKey: actionKey,
+      outcome: "completed",
+      output: { output: { title: "private issue" }, type: "result" },
+      scope,
+      type: "tool.call.completed",
+    });
+    await runtime.hooks.publish({
+      idempotencyKey: attemptIdempotencyKey(scope),
+      scope,
+      type: "step.attempt.completed",
+    });
+    await completeTurn(runtime.hooks, scope.sessionId, scope.turnId);
+    await runtime.provider.forceFlush();
+
+    const spans = runtime.exporter.getFinishedSpans();
+    const tool = byName(spans, "execute_tool linear__get_issue")[0]!;
+    expect(tool.attributes).toMatchObject({
+      "eve.connection.name": "linear",
+      "gen_ai.operation.name": "execute_tool",
+      "gen_ai.tool.name": "get_issue",
+      "jsonrpc.request.id": "7",
+      "mcp.method.name": "tools/call",
+    });
+    expect(tool.attributes).not.toHaveProperty("gen_ai.tool.call.arguments");
+    expect(tool.attributes).not.toHaveProperty("gen_ai.tool.call.result");
+    expect(spans.filter((span) => span.name.startsWith("tools/call "))).toHaveLength(0);
   });
 
   it("does not create approval spans for other input requests", async () => {
@@ -1247,7 +2552,7 @@ describe("createAgentOtelInstrumentation", () => {
     expect(byName(runtime.exporter.getFinishedSpans(), "agent.approval")).toHaveLength(0);
   });
 
-  it("ends SDK spans but leaves durable actions for their own terminal", async () => {
+  it("ends model spans but leaves durable tools for their own terminal", async () => {
     const runtime = createRuntime();
     await emitAttempt({
       hooks: runtime.hooks,
@@ -1263,8 +2568,94 @@ describe("createAgentOtelInstrumentation", () => {
     const spans = runtime.exporter.getFinishedSpans();
     expect(byName(spans, "chat claude-test")).toHaveLength(1);
     expect(byName(spans, "agent.action")).toHaveLength(0);
-    expect(byName(spans, "ai.toolCall")).toHaveLength(1);
+    expect(byName(spans, "execute_tool weather")).toHaveLength(0);
     expect(byName(spans, "agent.step")).toHaveLength(1);
+  });
+
+  it("records serialized action error detail only when output content is admitted", async () => {
+    const publishError = {
+      code: "PUBLISH_FAILED",
+      detail: "x".repeat(CONTENT_ATTRIBUTE_LIMIT * 2),
+      message: "private publish failure",
+    };
+    const run = async (runtime: TestRuntime, sessionId: string): Promise<ReadableSpan> => {
+      const scope: InstrumentationAttemptScope = {
+        attemptId: `${sessionId}:turn-1:0:0`,
+        attemptIndex: 0,
+        sessionId,
+        stepIndex: 0,
+        turnId: "turn-1",
+      };
+      await publishTurnStarted({
+        hooks: runtime.hooks,
+        sessionId,
+        turnId: scope.turnId,
+        turnSequence: 0,
+      });
+      await runtime.hooks.publish({
+        callId: "tool-1",
+        idempotencyKey: actionIdempotencyKey(sessionId, scope.turnId, "tool-1"),
+        input: {},
+        kind: "tool-call",
+        toolName: "publish",
+        scope,
+        type: "tool.call.started",
+      });
+      await runtime.hooks.publish({
+        error: publishError,
+        errorCode: "PUBLISH_FAILED",
+        idempotencyKey: actionIdempotencyKey(sessionId, scope.turnId, "tool-1"),
+        outcome: "failed",
+        scope,
+        type: "tool.call.failed",
+      });
+      await runtime.provider.forceFlush();
+      return runtime.exporter
+        .getFinishedSpans()
+        .find((span) => span.attributes["gen_ai.tool.call.id"] !== undefined)!;
+    };
+
+    const recorded = await run(createRuntime(), "recorded");
+    expect(recorded.attributes).not.toHaveProperty("agent.action.error.code");
+    expect(recorded.attributes).toMatchObject({
+      "agent.action.outcome": "failed",
+      "error.type": "PUBLISH_FAILED",
+    });
+    expect(recorded.status.code).toBe(SpanStatusCode.ERROR);
+    expect(recorded.status.message).toContain("private publish failure");
+    expect(recorded.status.message).toContain("... [truncated]");
+    expect(recorded.status.message!.length).toBeLessThan(CONTENT_ATTRIBUTE_LIMIT + 32);
+    expect(recorded.events).toContainEqual(
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          "exception.message": recorded.status.message,
+          "exception.type": "PUBLISH_FAILED",
+        }),
+        name: "exception",
+      }),
+    );
+
+    const redacted = await run(
+      createRuntime(new InMemoryAgentTraceStateStore(), () => ({
+        emit: true,
+        recordInputs: true,
+        recordOutputs: false,
+      })),
+      "redacted",
+    );
+    expect(redacted.attributes).toMatchObject({
+      "agent.action.outcome": "failed",
+      "error.type": "PUBLISH_FAILED",
+    });
+    expect(redacted.status).toEqual({ code: SpanStatusCode.ERROR });
+    expect(redacted.events.filter((event) => event.name === "exception")).toEqual([]);
+    expect(
+      JSON.stringify({
+        attributes: redacted.attributes,
+        events: redacted.events,
+        status: redacted.status,
+      }),
+    ).not.toContain("private publish failure");
   });
 
   it("records a failed attempt on model, tool, and action spans still open", async () => {
@@ -1283,9 +2674,10 @@ describe("createAgentOtelInstrumentation", () => {
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    for (const name of ["chat claude-test", "agent.action", "ai.toolCall"]) {
+    for (const name of ["chat claude-test", "execute_tool weather"]) {
       const span = byName(spans, name)[0]!;
       expect(span.status).toEqual({ code: SpanStatusCode.ERROR, message: error.message });
+      expect(span.attributes["error.type"]).toBe("Error");
       expect(span.events).toContainEqual(
         expect.objectContaining({
           attributes: expect.objectContaining({ "exception.message": error.message }),
@@ -1299,6 +2691,7 @@ describe("createAgentOtelInstrumentation", () => {
     const runtime = createRuntime();
     await emitAttempt({
       actionUsage: {
+        costUsd: 0.012,
         inputTokenDetails: { cacheReadTokens: 3, cacheWriteTokens: 4 },
         inputTokens: 10,
         outputTokens: 5,
@@ -1312,22 +2705,42 @@ describe("createAgentOtelInstrumentation", () => {
     });
     await runtime.provider.forceFlush();
 
-    const action = runtime.exporter.getFinishedSpans().find((span) => span.name === "agent.action");
+    const spans = runtime.exporter.getFinishedSpans();
+    const action = byName(spans, "execute_tool weather")[0];
     expect(action?.attributes).toMatchObject({
       "agent.action.kind": "subagent-call",
       "agent.action.name": "weather",
       "agent.action.outcome": "completed",
+      "agent.usage.cost_usd": 0.012,
+      "agent.usage.cache_read_tokens": 3,
+      "agent.usage.cache_write_tokens": 4,
       "agent.usage.input_tokens": 10,
       "agent.usage.output_tokens": 5,
-      "gen_ai.usage.cache_creation.input_tokens": 4,
-      "gen_ai.usage.cache_read.input_tokens": 3,
     });
+    expect(
+      Object.keys(action?.attributes ?? {}).some((key) => key.startsWith("gen_ai.usage.")),
+    ).toBe(false);
+    expect(action?.attributes["gen_ai.tool.call.arguments"]).toContain("secret");
+    expect(action?.attributes["gen_ai.operation.name"]).toBe("execute_tool");
+    expect(byName(spans, "invoke_agent weather")).toHaveLength(1);
+    expect(byName(spans, "execute_tool weather")).toHaveLength(1);
   });
 
   it("captures model and tool inputs/outputs on the operation spans", async () => {
     const runtime = createRuntime();
     await emitAttempt({
       hooks: runtime.hooks,
+      modelTools: [
+        {
+          description: "Get the current weather.",
+          inputSchema: {
+            properties: { city: { type: "string" } },
+            required: ["city"],
+            type: "object",
+          },
+          name: "get_weather",
+        },
+      ],
       runInContext: runtime.runInContext,
       sessionId: "session-1",
       turnId: "turn-1",
@@ -1337,14 +2750,7 @@ describe("createAgentOtelInstrumentation", () => {
 
     const spans = runtime.exporter.getFinishedSpans();
     const model = byName(spans, "chat claude-test")[0]!;
-    const tool = byName(spans, "ai.toolCall")[0]!;
-    // Provider transport noise (signatures et al.) is stripped at capture time.
-    expect(model.attributes["ai.prompt.messages"]).toBe(
-      '[{"content":"real user text","role":"user"}]',
-    );
-    expect(model.attributes["ai.prompt.system"]).toBe(
-      "You are a weather assistant (system prompt).",
-    );
+    const tool = byName(spans, "execute_tool weather")[0]!;
     expect(model.attributes["ai.response.finish_reason"]).toBe("tool-calls");
     expect(model.attributes["ai.response.reasoning"]).toBe("thinking about weather");
     expect(model.attributes["ai.response.text"]).toBe("Checking the weather.");
@@ -1357,7 +2763,10 @@ describe("createAgentOtelInstrumentation", () => {
       "gen_ai.response.finish_reasons": ["tool-calls"],
       "gen_ai.system_instructions":
         '[{"content":"You are a weather assistant (system prompt).","type":"text"}]',
+      "gen_ai.tool.definitions":
+        '[{"name":"get_weather","description":"Get the current weather.","parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"}}]',
     });
+    expect(model.attributes).not.toHaveProperty("ai.prompt.system");
     expect(model.attributes["agent.input.messages.delta"]).toBeUndefined();
     // Provider-executed tools never reach the tool loop; their calls and
     // results are captured off the model response content.
@@ -1369,10 +2778,49 @@ describe("createAgentOtelInstrumentation", () => {
     );
     expect(tool.attributes["gen_ai.tool.call.arguments"]).toBe('{"secret":"value"}');
     expect(tool.attributes["gen_ai.tool.call.result"]).toBe('{"temperature":72}');
-    // Runtime action spans carry content for dispatches that have no SDK tool boundary.
-    const action = byName(spans, "agent.action")[0]!;
-    expect(action.attributes["gen_ai.tool.call.arguments"]).toContain("secret");
-    expect(action.attributes["gen_ai.tool.call.result"]).toContain("temperature");
+  });
+
+  it("applies trace content policy only to OTel spans", async () => {
+    const runtime = createRuntime(new InMemoryAgentTraceStateStore(), () => ({
+      emit: true,
+      recordInputs: false,
+      recordOutputs: false,
+    }));
+    await emitAttempt({
+      channelAudience: "public",
+      hooks: runtime.hooks,
+      modelTools: [
+        {
+          inputSchema: { type: "object" },
+          name: "get_weather",
+        },
+      ],
+      runInContext: runtime.runInContext,
+      sessionId: "session-redacted",
+      turnId: "turn-redacted",
+      turnSequence: 0,
+    });
+    await runtime.provider.forceFlush();
+
+    const spans = runtime.exporter.getFinishedSpans();
+    expect(byName(spans, "chat claude-test")[0]?.attributes).not.toHaveProperty(
+      "gen_ai.input.messages",
+    );
+    expect(byName(spans, "chat claude-test")[0]?.attributes).not.toHaveProperty(
+      "gen_ai.system_instructions",
+    );
+    expect(byName(spans, "chat claude-test")[0]?.attributes).not.toHaveProperty(
+      "gen_ai.tool.definitions",
+    );
+    expect(byName(spans, "chat claude-test")[0]?.attributes).not.toHaveProperty(
+      "gen_ai.output.messages",
+    );
+    expect(byName(spans, "execute_tool weather")[0]?.attributes).not.toHaveProperty(
+      "gen_ai.tool.call.arguments",
+    );
+    expect(byName(spans, "execute_tool weather")[0]?.attributes).not.toHaveProperty(
+      "gen_ai.tool.call.result",
+    );
   });
 
   it("caps full model input while keeping valid message JSON", async () => {
@@ -1389,15 +2837,17 @@ describe("createAgentOtelInstrumentation", () => {
       stepIndex: 0,
       turnId: "turn-1",
     };
-    await runtime.hooks.publish({
+    const hooks = runtime.hooks.forTrace!(traceContext("public"));
+    await hooks.publish({
       agentName: "weather",
+      channelAudience: "public",
       channelKind: "http",
       idempotencyKey: sessionIdempotencyKey("session-1"),
       rootSessionId: "session-1",
       sessionId: "session-1",
       type: "session.started",
     });
-    await runtime.hooks.publish({
+    await hooks.publish({
       idempotencyKey: turnIdempotencyKey("session-1", "turn-1"),
       rootSessionId: "session-1",
       sequence: 0,
@@ -1405,7 +2855,7 @@ describe("createAgentOtelInstrumentation", () => {
       turnId: "turn-1",
       type: "turn.started",
     });
-    const bridge = createAiSdkHookBridge(scope, runtime.hooks, runtime.runInContext);
+    const bridge = createAiSdkHookBridge(scope, hooks, runtime.runInContext);
     Reflect.apply(bridge.onStart!, bridge, [
       {
         callId: "call-1",
@@ -1433,14 +2883,11 @@ describe("createAgentOtelInstrumentation", () => {
     await runtime.provider.forceFlush();
 
     const model = byName(runtime.exporter.getFinishedSpans(), "chat claude-test")[0]!;
-    const raw = model.attributes["ai.prompt.messages"];
+    const raw = model.attributes["gen_ai.input.messages"];
     expect(typeof raw).toBe("string");
     expect((raw as string).length).toBeLessThanOrEqual(32 * 1024);
     const parsed = JSON.parse(raw as string) as Array<Record<string, unknown>>;
     expect(parsed.length).toBeGreaterThan(1);
-    expect(parsed[0]).toMatchObject({
-      "eve.truncated": { omittedMessages: expect.any(Number) },
-    });
     expect(JSON.stringify(parsed)).toContain("message 199");
     expect(JSON.stringify(parsed)).not.toContain("message 0 ");
     expect(model.attributes["agent.input.messages.delta"]).toBeUndefined();
@@ -1459,7 +2906,7 @@ describe("createAgentOtelInstrumentation", () => {
       stateStore: new InMemoryAgentTraceStateStore(),
       tracer: provider.getTracer("eve.agent"),
     });
-    const hooks = createInstrumentationHooks([agentOtel.hook]);
+    const hooks = createInstrumentationHooks([agentOtel.hook]).forTrace!(traceContext("public"));
     await emitAttempt({
       hooks,
       runInContext: agentOtel.runInContext,
@@ -1508,7 +2955,7 @@ describe("createAgentOtelInstrumentation", () => {
       scope,
       type: "step.attempt.started",
     });
-    const idempotencyKey = modelCallIdempotencyKey(scope, 0);
+    const idempotencyKey = modelCallIdempotencyKey(scope, 0, 0);
     await runtime.hooks.publish({
       idempotencyKey,
       input: { messages: [] },
@@ -1524,6 +2971,9 @@ describe("createAgentOtelInstrumentation", () => {
     );
 
     expect(withSpy).toHaveBeenCalledOnce();
+    const active = withSpy.mock.calls[0]?.[0];
+    expect(active).toBeDefined();
+    expect(agentToolSpanContext(active!)).toBeUndefined();
     withSpy.mockRestore();
   });
 
@@ -1576,7 +3026,7 @@ describe("createAgentOtelInstrumentation", () => {
     }
   });
 
-  it("reuses one trace id across turns", async () => {
+  it("opens a fresh trace for each resumed turn", async () => {
     const stateStore = new InMemoryAgentTraceStateStore();
     const firstRuntime = createRuntime(stateStore);
     await emitAttempt({
@@ -1600,30 +3050,33 @@ describe("createAgentOtelInstrumentation", () => {
     await secondRuntime.provider.forceFlush();
 
     const turns = [
-      ...byName(firstRuntime.exporter.getFinishedSpans(), "agent.turn"),
-      ...byName(secondRuntime.exporter.getFinishedSpans(), "agent.turn"),
+      ...byName(firstRuntime.exporter.getFinishedSpans(), "invoke_agent weather"),
+      ...byName(secondRuntime.exporter.getFinishedSpans(), "invoke_agent weather"),
     ];
     expect(turns).toHaveLength(2);
-    expect(turns[0]!.spanContext().traceId).toBe(turns[1]!.spanContext().traceId);
+    expect(turns[0]!.spanContext().traceId).not.toBe(turns[1]!.spanContext().traceId);
+    for (const turn of turns) {
+      expect(turn.parentSpanContext).toBeUndefined();
+      expect(turn.attributes).toMatchObject({
+        "gen_ai.conversation.id": "session-1",
+      });
+    }
     const firstModel = byName(firstRuntime.exporter.getFinishedSpans(), "chat claude-test")[0]!;
     const secondModel = byName(secondRuntime.exporter.getFinishedSpans(), "chat claude-test")[0]!;
-    expect(firstModel.attributes["ai.prompt.system"]).toBe(
-      "You are a weather assistant (system prompt).",
-    );
-    expect(secondModel.attributes["ai.prompt.system"]).toBe(
-      "You are a weather assistant (system prompt).",
+    expect(firstModel.attributes["gen_ai.system_instructions"]).toBe(
+      '[{"content":"You are a weather assistant (system prompt).","type":"text"}]',
     );
     expect(secondModel.attributes["gen_ai.system_instructions"]).toBe(
       '[{"content":"You are a weather assistant (system prompt).","type":"text"}]',
     );
     expect(secondModel.attributes["agent.input.messages.delta"]).toBeUndefined();
-    expect(secondModel.attributes["ai.prompt.messages"]).toBe(
-      '[{"content":"real user text","role":"user"}]',
+    expect(secondModel.attributes["gen_ai.input.messages"]).toBe(
+      '[{"parts":[{"content":"real user text","type":"text"}],"role":"user"}]',
     );
     expect([
       ...byName(firstRuntime.exporter.getFinishedSpans(), "agent.session"),
       ...byName(secondRuntime.exporter.getFinishedSpans(), "agent.session"),
-    ]).toHaveLength(1);
+    ]).toHaveLength(0);
   });
 
   it("restores durable turn context when a replacement worker runs the attempt", async () => {
@@ -1650,18 +3103,20 @@ describe("createAgentOtelInstrumentation", () => {
 
     // The replacement's session transition emits the turn span with the span
     // id the first worker allocated, so descendants from both workers attach.
-    expect(byName(firstRuntime.exporter.getFinishedSpans(), "agent.turn")).toHaveLength(0);
+    expect(byName(firstRuntime.exporter.getFinishedSpans(), "invoke_agent weather")).toHaveLength(
+      0,
+    );
     const replacementSpans = replacementRuntime.exporter.getFinishedSpans();
-    const turn = byName(replacementSpans, "agent.turn")[0]!;
+    const turn = byName(replacementSpans, "invoke_agent weather")[0]!;
     const step = byName(replacementSpans, "agent.step")[0]!;
-    const action = byName(replacementSpans, "agent.action")[0]!;
+    const action = byName(replacementSpans, "execute_tool weather")[0]!;
 
     expect(step.parentSpanContext?.spanId).toBe(turn.spanContext().spanId);
     expect(action.parentSpanContext?.spanId).toBe(step.spanContext().spanId);
     expect(step.spanContext().traceId).toBe(turn.spanContext().traceId);
   });
 
-  it("opens a fresh trace when a durable attempt replays before its state checkpoints", async () => {
+  it.each([0, 1])("reuses activation identity before turn %s checkpoints", async (turnSequence) => {
     const firstRuntime = createRuntime();
     const replayRuntime = createRuntime();
     await emitAttempt({
@@ -1669,28 +3124,27 @@ describe("createAgentOtelInstrumentation", () => {
       runInContext: firstRuntime.runInContext,
       sessionId: "session-1",
       turnId: "turn-1",
-      turnSequence: 0,
+      turnSequence,
     });
     await emitAttempt({
       hooks: replayRuntime.hooks,
       runInContext: replayRuntime.runInContext,
       sessionId: "session-1",
       turnId: "turn-1",
-      turnSequence: 0,
+      turnSequence,
     });
 
-    const firstTurn = byName(firstRuntime.exporter.getFinishedSpans(), "agent.turn")[0]!;
-    const replayTurn = byName(replayRuntime.exporter.getFinishedSpans(), "agent.turn")[0]!;
-    // The abandoned attempt keeps its own trace rather than interleaving with
-    // the retry. Both carry `agent.session.id`, so the session view still
-    // resolves to every trace the session produced.
-    expect(replayTurn.spanContext().traceId).not.toBe(firstTurn.spanContext().traceId);
-    expect(replayTurn.attributes["agent.session.id"]).toBe(
-      firstTurn.attributes["agent.session.id"],
-    );
+    const firstTurn = byName(firstRuntime.exporter.getFinishedSpans(), "invoke_agent weather")[0]!;
+    const replayTurn = byName(
+      replayRuntime.exporter.getFinishedSpans(),
+      "invoke_agent weather",
+    )[0]!;
+    expect(replayTurn.spanContext()).toEqual(firstTurn.spanContext());
+    expect(replayTurn.attributes).not.toHaveProperty("vercel.session_id");
+    expect(firstTurn.attributes).not.toHaveProperty("vercel.session_id");
   });
 
-  it("keeps a long session on one persisted trace", async () => {
+  it("bounds a long session to one trace per turn", async () => {
     const runtime = createRuntime();
     const turnCount = 201;
     for (let sequence = 0; sequence < turnCount; sequence += 1) {
@@ -1705,26 +3159,20 @@ describe("createAgentOtelInstrumentation", () => {
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    const sessions = byName(spans, "agent.session");
-    const turns = byName(spans, "agent.turn");
+    const turns = byName(spans, "invoke_agent weather");
 
-    expect(sessions).toHaveLength(1);
+    expect(byName(spans, "agent.session")).toHaveLength(0);
     expect(turns).toHaveLength(turnCount);
-    expect(
-      turns.every((turn) => turn.spanContext().traceId === sessions[0]!.spanContext().traceId),
-    ).toBe(true);
+    expect(new Set(turns.map((turn) => turn.spanContext().traceId))).toHaveLength(turnCount);
+    for (const turn of turns) {
+      expect(turn.parentSpanContext).toBeUndefined();
+      expect(turn.attributes).not.toHaveProperty("vercel.session_id");
+    }
   });
 
-  it("records a subagent child into its parent's trace", async () => {
+  it("nests a subagent invocation beneath its caller in the same trace", async () => {
     const runtime = createRuntime();
-    await publishTurnStarted({
-      hooks: runtime.hooks,
-      sessionId: "session-1",
-      turnId: "turn-1",
-      turnSequence: 0,
-    });
-    await runtime.provider.forceFlush();
-    const parentSession = byName(runtime.exporter.getFinishedSpans(), "agent.session")[0]!;
+    const caller = spanContext("1", "2");
 
     await publishTurnStarted({
       hooks: runtime.hooks,
@@ -1734,7 +3182,7 @@ describe("createAgentOtelInstrumentation", () => {
         subagentName: "researcher",
         turnId: "turn-1",
       },
-      parentTraceContext: parentSession.spanContext(),
+      parentTraceContext: caller,
       rootSessionId: "session-1",
       sessionId: "child-1",
       turnId: "child-turn-1",
@@ -1744,21 +3192,71 @@ describe("createAgentOtelInstrumentation", () => {
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    const childTurn = byName(spans, "agent.turn").find(
-      (span) => span.attributes["agent.session.id"] === "child-1",
+    const childTurn = byName(spans, "invoke_agent weather").find(
+      (span) => span.attributes["agent.subagent.name"] === "researcher",
     )!;
 
-    expect(childTurn.spanContext().traceId).toBe(parentSession.spanContext().traceId);
-    expect(childTurn.parentSpanContext?.spanId).toBe(parentSession.spanContext().spanId);
+    expect(childTurn.spanContext().traceId).toBe(caller.traceId);
+    expect(childTurn.parentSpanContext).toEqual({ ...caller, isRemote: false });
+    expect(childTurn.links).toEqual([]);
     expect(childTurn.attributes["agent.subagent.name"]).toBe("researcher");
-    expect(childTurn.attributes).not.toHaveProperty("agent.parent.call_id");
-    expect(childTurn.attributes).not.toHaveProperty("agent.parent.session.id");
-    expect(childTurn.attributes).not.toHaveProperty("agent.parent.turn.id");
-    expect(byName(spans, "agent.session")).toHaveLength(1);
+    expect(childTurn.attributes["agent.parent_call.id"]).toBe("call-1");
+    expect(childTurn.attributes["agent.parent_run.id"]).toBe("session-1");
+    expect(childTurn.attributes["agent.run.id"]).toBe("child-1");
+    expect(childTurn.attributes["gen_ai.conversation.id"]).toBe("session-1");
+    expect(childTurn.attributes).not.toHaveProperty("agent.root_run.id");
+    expect(childTurn.attributes).not.toHaveProperty("agent.session.id");
+    expect(childTurn.attributes).not.toHaveProperty("vercel.session_id");
+    expect(byName(spans, "agent.session")).toHaveLength(0);
   });
 
-  it("preserves a remote action as the parent of a remote child turn", async () => {
-    const runtime = createRuntime();
+  it("exports a local child when its durable dispatch never terminates", async () => {
+    const store = new InMemoryAgentTraceStateStore();
+    const runtime = createRuntime(store);
+    await publishTurnStarted({
+      hooks: runtime.hooks,
+      sessionId: "parent",
+      turnId: "turn_0",
+      turnSequence: 0,
+    });
+    const scope: InstrumentationAttemptScope = {
+      attemptId: "parent:turn_0:0:0",
+      attemptIndex: 0,
+      sessionId: "parent",
+      turnId: "turn_0",
+      stepIndex: 0,
+    };
+    const key = actionIdempotencyKey("parent", "turn_0", "dispatch");
+    await runtime.hooks.publish({
+      type: "tool.call.started",
+      idempotencyKey: key,
+      scope,
+      callId: "dispatch",
+      toolName: "child",
+      input: undefined,
+      kind: "subagent-call",
+    });
+    const action = (await store.getAction(key))!;
+    await publishTurnStarted({
+      hooks: runtime.hooks,
+      sessionId: "child",
+      rootSessionId: "parent",
+      turnId: "turn_0",
+      turnSequence: 0,
+      parentTraceContext: { ...action.parent, spanId: action.spanId },
+    });
+    await completeTurn(runtime.hooks, "child", "turn_0");
+    await runtime.provider.forceFlush();
+    const spans = runtime.exporter.getFinishedSpans();
+    expect(byName(spans, "agent.action")).toHaveLength(0);
+    const child = byName(spans, "invoke_agent weather")[0]!;
+    expect(child.parentSpanContext?.spanId).toBe(action.spanId);
+    expect(child.spanContext().traceId).toBe(action.parent.traceId);
+  });
+
+  it("starts a remote root with a dispatch link and receiver sampling", async () => {
+    const samplesTrace = vi.fn(() => true);
+    const runtime = createRuntime(undefined, undefined, [], samplesTrace);
     const parentTraceContext: InstrumentationTraceContext & { readonly isRemote: true } = {
       isRemote: true,
       spanId: "2".repeat(16),
@@ -1776,9 +3274,13 @@ describe("createAgentOtelInstrumentation", () => {
     await completeTurn(runtime.hooks, "remote-child", "child-turn-1");
     await runtime.provider.forceFlush();
 
-    const childTurn = byName(runtime.exporter.getFinishedSpans(), "agent.turn")[0]!;
-    expect(childTurn.spanContext().traceId).toBe(parentTraceContext.traceId);
-    expect(childTurn.parentSpanContext).toMatchObject(parentTraceContext);
+    const childTurn = byName(runtime.exporter.getFinishedSpans(), "invoke_agent weather")[0]!;
+    expect(childTurn.spanContext().traceId).not.toBe(parentTraceContext.traceId);
+    expect(childTurn.parentSpanContext).toBeUndefined();
+    expect(childTurn.links).toEqual([
+      { context: parentTraceContext, attributes: { "eve.link.type": "agent.dispatch" } },
+    ]);
+    expect(samplesTrace).toHaveBeenCalled();
   });
 
   it("opens its own root when a child session is handed no parent trace", async () => {
@@ -1790,29 +3292,28 @@ describe("createAgentOtelInstrumentation", () => {
       turnId: "child-turn-1",
       turnSequence: 0,
     });
+    await completeTurn(runtime.hooks, "child-1", "child-turn-1");
     await runtime.provider.forceFlush();
 
-    const sessions = byName(runtime.exporter.getFinishedSpans(), "agent.session");
-    expect(sessions).toHaveLength(1);
-    expect(sessions[0]!.attributes["agent.session.id"]).toBe("child-1");
-    expect(sessions[0]!.parentSpanContext).toBeUndefined();
+    const turn = byName(runtime.exporter.getFinishedSpans(), "invoke_agent weather")[0]!;
+    expect(byName(runtime.exporter.getFinishedSpans(), "agent.session")).toHaveLength(0);
+    expect(turn.attributes).toMatchObject({
+      "agent.run.id": "child-1",
+      "gen_ai.conversation.id": "session-1",
+    });
+    expect(turn.attributes).not.toHaveProperty("agent.session.id");
+    expect(turn.attributes).not.toHaveProperty("vercel.session_id");
+    expect(turn.parentSpanContext).toBeUndefined();
   });
 
-  it("keeps a long subagent child in its adopted trace", async () => {
+  it("nests the first child turn and starts fresh traces for persistent follow-ups", async () => {
     const runtime = createRuntime();
-    await publishTurnStarted({
-      hooks: runtime.hooks,
-      sessionId: "session-1",
-      turnId: "turn-1",
-      turnSequence: 0,
-    });
-    await runtime.provider.forceFlush();
-    const parentSession = byName(runtime.exporter.getFinishedSpans(), "agent.session")[0]!;
+    const caller = spanContext("1", "2");
 
     for (let sequence = 0; sequence < 201; sequence += 1) {
       await publishTurnStarted({
         hooks: runtime.hooks,
-        parentTraceContext: parentSession.spanContext(),
+        parentTraceContext: caller,
         rootSessionId: "session-1",
         sessionId: "child-1",
         turnId: `child-turn-${sequence}`,
@@ -1823,13 +3324,25 @@ describe("createAgentOtelInstrumentation", () => {
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    expect(byName(spans, "agent.session")).toHaveLength(1);
-    expect(byName(spans, "agent.turn")).toHaveLength(201);
-    expect(
-      byName(spans, "agent.turn").every(
-        (turn) => turn.spanContext().traceId === parentSession.spanContext().traceId,
-      ),
-    ).toBe(true);
+    const turns = byName(spans, "invoke_agent weather");
+    expect(byName(spans, "agent.session")).toHaveLength(0);
+    expect(turns).toHaveLength(201);
+    expect(turns[0]!.spanContext().traceId).toBe(caller.traceId);
+    expect(turns[0]!.parentSpanContext).toEqual({ ...caller, isRemote: false });
+    expect(turns[0]!.links).toEqual([]);
+    expect(new Set(turns.map((turn) => turn.spanContext().traceId))).toHaveLength(201);
+    expect(new Set(turns.map((turn) => turn.spanContext().spanId))).toHaveLength(201);
+    for (const turn of turns.slice(1)) {
+      expect(turn.spanContext().traceId).not.toBe(caller.traceId);
+      expect(turn.parentSpanContext).toBeUndefined();
+      expect(turn.links).toEqual([]);
+    }
+    for (const turn of turns) {
+      expect(turn.attributes).toMatchObject({
+        "gen_ai.conversation.id": "session-1",
+      });
+      expect(turn.attributes).not.toHaveProperty("vercel.session_id");
+    }
   });
 
   it("marks a failed action without failing its turn", async () => {
@@ -1845,16 +3358,92 @@ describe("createAgentOtelInstrumentation", () => {
     await runtime.provider.forceFlush();
 
     const spans = runtime.exporter.getFinishedSpans();
-    const action = byName(spans, "agent.action")[0]!;
+    const action = byName(spans, "execute_tool weather")[0]!;
     expect(action.status.code).toBe(SpanStatusCode.ERROR);
     expect(action.attributes).toMatchObject({
-      "agent.action.error.code": "TOOL_CALL_FAILED",
       "agent.action.outcome": "failed",
       "error.type": "TOOL_CALL_FAILED",
     });
-    expect(byName(spans, "agent.turn")[0]!.status.code).toBe(SpanStatusCode.UNSET);
+    expect(byName(spans, "invoke_agent weather")[0]!.status.code).toBe(SpanStatusCode.UNSET);
+  });
+
+  it("records error.type on a failed agent invocation", async () => {
+    const runtime = createRuntime();
+    const error = new TypeError("turn failed");
+    await publishTurnStarted({
+      hooks: runtime.hooks,
+      sessionId: "session-1",
+      turnId: "turn-1",
+      turnSequence: 0,
+    });
+    await runtime.hooks.publish({
+      error,
+      idempotencyKey: turnIdempotencyKey("session-1", "turn-1"),
+      sessionId: "session-1",
+      turnId: "turn-1",
+      type: "turn.failed",
+    });
+    await runtime.hooks.publish({
+      error,
+      idempotencyKey: sessionIdempotencyKey("session-1"),
+      sessionId: "session-1",
+      turnId: "turn-1",
+      type: "session.failed",
+    });
+    await runtime.provider.forceFlush();
+
+    const turn = byName(runtime.exporter.getFinishedSpans(), "invoke_agent weather")[0]!;
+    expect(turn.status).toEqual({ code: SpanStatusCode.ERROR, message: error.message });
+    expect(turn.attributes["error.type"]).toBe("TypeError");
+  });
+
+  it("marks an active invocation failed from the terminal session event", async () => {
+    const runtime = createRuntime();
+    const error = new TypeError("workflow failed");
+    await publishTurnStarted({
+      hooks: runtime.hooks,
+      sessionId: "session-1",
+      turnId: "turn-1",
+      turnSequence: 0,
+    });
+    await runtime.hooks.publish({
+      error,
+      idempotencyKey: sessionIdempotencyKey("session-1"),
+      sessionId: "session-1",
+      turnId: "turn-1",
+      type: "session.failed",
+    });
+    await runtime.provider.forceFlush();
+
+    const turn = byName(runtime.exporter.getFinishedSpans(), "invoke_agent weather")[0]!;
+    expect(turn.status).toEqual({ code: SpanStatusCode.ERROR, message: error.message });
+    expect(turn.attributes["error.type"]).toBe("TypeError");
+    expect(turn.events.map((event) => event.name)).toContain("turn.failed");
   });
 });
+
+function spanContext(traceId: string, spanId: string) {
+  return { spanId: spanId.repeat(16), traceFlags: 1, traceId: traceId.repeat(32) };
+}
+
+function modelStartedEvent(
+  sessionId: string,
+): Extract<InstrumentationEvent, { type: "model.call.started" }> {
+  return {
+    idempotencyKey: `model:${sessionId}:turn-1:0:0:0`,
+    input: { instructions: "private prompt", messages: [] },
+    model: { modelId: "test-model", provider: "test-provider" },
+    scope: {
+      attemptId: `${sessionId}:turn-1:0:0`,
+      attemptIndex: 0,
+      channelAudience: "public",
+      sessionId,
+      stepIndex: 0,
+      turnId: "turn-1",
+    },
+    type: "model.call.started",
+  };
+}
 
 describe("AgentSpanIdGenerator.withTraceId", () => {
   it("primes the next generateTraceId call", () => {

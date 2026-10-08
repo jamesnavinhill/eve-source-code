@@ -1,12 +1,15 @@
 import type { LanguageModel } from "ai";
-import { MockLanguageModelV3 } from "ai/test";
+import { MockLanguageModelV4 } from "ai/test";
 
-import { AGENTS_SNIPPET_LABEL } from "#harness/handles/prompt.js";
+import { markMockModel } from "#internal/mock-model-identity.js";
+import { TASK_RESULT_TAG, TASKS_NOTE_LABEL } from "#execution/tasks/render.js";
 import { isPendingApprovalsSnippet } from "#harness/hitl/approval-prompt.js";
 
-type GenerateOptions = Parameters<MockLanguageModelV3["doGenerate"]>[0];
-type GenerateResult = Awaited<ReturnType<MockLanguageModelV3["doGenerate"]>>;
-type StreamResult = Awaited<ReturnType<MockLanguageModelV3["doStream"]>>;
+// A V4 model receives the prompt as the AI SDK builds it; a V3 model gets a
+// downgraded copy where tool-result files become legacy `file-data` parts.
+type GenerateOptions = Parameters<MockLanguageModelV4["doGenerate"]>[0];
+type GenerateResult = Awaited<ReturnType<MockLanguageModelV4["doGenerate"]>>;
+type StreamResult = Awaited<ReturnType<MockLanguageModelV4["doStream"]>>;
 type StreamPart = StreamResult["stream"] extends ReadableStream<infer Part> ? Part : never;
 type PromptPart = Exclude<GenerateOptions["prompt"][number]["content"], string>[number];
 type ToolResultOutput = Extract<PromptPart, { type: "tool-result" }>["output"];
@@ -125,16 +128,18 @@ export function mockModel(
   const respond = normalizeResponder(options.respond);
   const modelId = options.modelId ?? DEFAULT_MODEL_ID;
 
-  return new MockLanguageModelV3({
-    modelId,
-    provider: options.provider ?? DEFAULT_PROVIDER,
-    doGenerate: async (callOptions) =>
-      createGenerateResult(await respond(createRequest(callOptions)), callOptions, modelId),
-    doStream: async (callOptions) =>
-      createStreamResult(
+  return markMockModel(
+    new MockLanguageModelV4({
+      modelId,
+      provider: options.provider ?? DEFAULT_PROVIDER,
+      doGenerate: async (callOptions) =>
         createGenerateResult(await respond(createRequest(callOptions)), callOptions, modelId),
-      ),
-  });
+      doStream: async (callOptions) =>
+        createStreamResult(
+          createGenerateResult(await respond(createRequest(callOptions)), callOptions, modelId),
+        ),
+    }),
+  );
 }
 
 function normalizeOptions(input: MockModelOptions | MockModelResponder | string): MockModelOptions {
@@ -174,9 +179,14 @@ function createRequest(options: GenerateOptions): MockModelRequest {
   };
 }
 
+/** Framework-injected listings and task results, which no one authored. */
 function isFrameworkScaffolding(message: string): boolean {
   const text = message.trim();
-  return text.startsWith(AGENTS_SNIPPET_LABEL) || isPendingApprovalsSnippet(text);
+  return (
+    text.startsWith(TASKS_NOTE_LABEL) ||
+    text.startsWith(TASK_RESULT_TAG) ||
+    isPendingApprovalsSnippet(text)
+  );
 }
 
 function extractMessageText(message: GenerateOptions["prompt"][number]): string {

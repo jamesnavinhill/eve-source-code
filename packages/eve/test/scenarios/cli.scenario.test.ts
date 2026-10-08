@@ -1,7 +1,8 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { access, mkdir, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -9,6 +10,7 @@ import { runCli } from "../../src/cli/run.js";
 import { resolveInstalledPackageInfo } from "../../src/internal/application/package.js";
 import { useScenarioApp } from "../../src/internal/testing/scenario-app.js";
 import { WEATHER_AGENT_DESCRIPTOR } from "../../src/internal/testing/scenario-apps/weather-agent.js";
+import { COMPOSED_TOOL_SCHEMAS_DESCRIPTOR } from "../../src/internal/testing/scenario-apps/composed-tool-schemas.js";
 import { resolveLocalWorkflowWorldDataDirectory } from "../../src/internal/workflow/local-world-data-directory.js";
 import {
   EVE_HEALTH_ROUTE_PATH,
@@ -57,6 +59,7 @@ async function createMinimalAppRoot(prefix: string): Promise<string> {
     join(appRoot, "package.json"),
     `${JSON.stringify(
       {
+        dependencies: { eve: "*" },
         name: "eve-cli-start-health-test",
         private: true,
         type: "module",
@@ -204,13 +207,20 @@ describe("runCli", () => {
   });
 
   it("prints the installed package version when running a CLI command", async () => {
+    const appRoot = await createMinimalAppRoot("eve-cli-version-");
+    const previousCwd = process.cwd();
     const logger = {
       error: vi.fn(),
       log: vi.fn(),
     };
     const evePackage = resolveInstalledPackageInfo();
 
-    await runCli(["info"], logger);
+    process.chdir(appRoot);
+    try {
+      await runCli(["info"], logger);
+    } finally {
+      process.chdir(previousCwd);
+    }
 
     const output = getLogOutput(logger);
     expect(output).toContain("eve");
@@ -218,6 +228,8 @@ describe("runCli", () => {
   });
 
   it("does not print the startup banner before JSON eval output", async () => {
+    const appRoot = await createMinimalAppRoot("eve-cli-eval-json-");
+    const previousCwd = process.cwd();
     const logger = {
       error: vi.fn(),
       log: vi.fn(),
@@ -226,23 +238,35 @@ describe("runCli", () => {
       logger.log("{}");
     });
 
-    await runCli(["eval", "--json"], logger, {
-      runEvalCommand,
-    });
+    process.chdir(appRoot);
+    try {
+      await runCli(["eval", "--json"], logger, {
+        runEvalCommand,
+      });
+    } finally {
+      process.chdir(previousCwd);
+    }
 
     expect(getLogOutput(logger)).toBe("{}");
   });
 
   it("prints fixture information", async () => {
+    const appRoot = await createMinimalAppRoot("eve-cli-info-");
+    const previousCwd = process.cwd();
     const logger = {
       error: vi.fn(),
       log: vi.fn(),
     };
 
-    await runCli(["info"], logger);
+    process.chdir(appRoot);
+    try {
+      await runCli(["info"], logger);
+    } finally {
+      process.chdir(previousCwd);
+    }
 
     expect(logger.log).toHaveBeenCalled();
-    expect(getLogOutput(logger)).toContain("eve Info");
+    expect(getLogOutput(logger)).not.toContain("eve Info");
     expect(getLogOutput(logger)).toContain("Application");
     expect(getLogOutput(logger)).toContain("Workflow ID");
     expect(getLogOutput(logger)).toContain(`POST ${EVE_SESSION_ROUTE_PATH}`);
@@ -278,7 +302,48 @@ describe("runCli", () => {
     expect(output).toContain("0 errors, 0 warnings");
   });
 
+  it("writes all of a large `eve info --json` document before the bin exits", async () => {
+    const appRoot = await createMinimalAppRoot("eve-cli-info-json-pipe-");
+    // Far larger than a pipe or socket buffer, so most of it is still queued
+    // when the command resolves.
+    const descriptionLength = 1024 * 1024;
+    await mkdir(join(appRoot, "agent", "tools"), { recursive: true });
+    await writeFile(
+      join(appRoot, "agent", "tools", "file_report.mjs"),
+      [
+        "export default {",
+        '  description: "File a report.",',
+        "  inputSchema: {",
+        '    type: "object",',
+        `    properties: { body: { type: "string", description: "x".repeat(${descriptionLength}) } },`,
+        "  },",
+        "  execute: () => null,",
+        "};",
+        "",
+      ].join("\n"),
+    );
+
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      [EVE_BIN_PATH, "info", "--json"],
+      {
+        cwd: appRoot,
+        // A telemetry flush yields to the event loop, which would drain stdout
+        // and hide an early exit.
+        env: { ...process.env, EVE_TELEMETRY_DISABLED: "1" },
+        maxBuffer: 16 * 1024 * 1024,
+      },
+    );
+
+    const info = JSON.parse(stdout);
+    expect(info.toolInputSchemas.root.file_report.properties.body.description).toHaveLength(
+      descriptionLength,
+    );
+  }, 60_000);
+
   it("defaults to dev when no command is provided in an eve project", async () => {
+    const appRoot = await createMinimalAppRoot("eve-cli-default-dev-");
+    const previousCwd = process.cwd();
     const logger = {
       error: vi.fn(),
       log: vi.fn(),
@@ -291,12 +356,17 @@ describe("runCli", () => {
       close: async () => {},
     }));
 
-    await expect(
-      runCli([], logger, {
-        findApplicationRoot,
-        startHost,
-      }),
-    ).rejects.toThrow("dev started");
+    process.chdir(appRoot);
+    try {
+      await expect(
+        runCli([], logger, {
+          findApplicationRoot,
+          startHost,
+        }),
+      ).rejects.toThrow("dev started");
+    } finally {
+      process.chdir(previousCwd);
+    }
 
     expect(findApplicationRoot).toHaveBeenCalledOnce();
     expect(startHost).toHaveBeenCalledOnce();
@@ -400,12 +470,34 @@ describe("runCli", () => {
     }
   });
 
+  it("preserves imported tool schema composition in the built server", async () => {
+    const { buildApplication } = await import("../../src/internal/nitro/host.js");
+    const { appRoot } = await scenarioApp(COMPOSED_TOOL_SCHEMAS_DESCRIPTOR);
+    await buildApplication(appRoot, { skipSandboxPrewarm: true });
+    const server = await startPackagedEveStart(appRoot);
+
+    try {
+      const response = await fetch(new URL("/schema-composition", server.url), {
+        signal: AbortSignal.timeout(10_000),
+      });
+      const body = await response.text();
+      expect(response.status, `${body}\n${server.stderr()}`).toBe(200);
+      expect(JSON.parse(body)).toEqual({
+        parsed: { action: "echo", input: { value: "hello" } },
+        invalidAccepted: false,
+        output: { result: { value: "hello" } },
+      });
+    } finally {
+      await server.stop();
+    }
+  }, 120_000);
+
   it("starts an existing built app with local Workflow data under .eve", async () => {
     const { buildApplication } = await import("../../src/internal/nitro/host.js");
     const appRoot = await createMinimalAppRoot("eve-cli-start-health-");
 
     await buildApplication(appRoot, {
-      skipVercelSandboxPrewarm: false,
+      skipSandboxPrewarm: false,
     });
 
     const server = await startPackagedEveStart(appRoot);
@@ -442,7 +534,7 @@ describe("runCli", () => {
     });
     await writeFile(
       join(workspaceRoot, "package.json"),
-      `${JSON.stringify({ name: "build-diagnostics" }, null, 2)}\n`,
+      `${JSON.stringify({ dependencies: { eve: "*" }, name: "build-diagnostics" }, null, 2)}\n`,
     );
     await writeFile(
       join(workspaceRoot, "agent", "agent.mjs"),
@@ -529,7 +621,10 @@ describe("runCli", () => {
     }
 
     expect(buildHost).toHaveBeenCalledWith(resolvedWorkspaceRoot, {
-      skipVercelSandboxPrewarm: false,
+      publicRoutePrefix: undefined,
+      skipSandboxPrewarm: false,
+      vercelServiceOutput: undefined,
+      workspaceMember: false,
     });
     expect(observedEnvironment).toEqual({
       EVE_BUILD_DEFAULT_ONLY: "from-env",
@@ -562,7 +657,10 @@ describe("runCli", () => {
     }
 
     expect(buildHost).toHaveBeenCalledWith(resolvedWorkspaceRoot, {
-      skipVercelSandboxPrewarm: true,
+      publicRoutePrefix: undefined,
+      skipSandboxPrewarm: true,
+      vercelServiceOutput: undefined,
+      workspaceMember: false,
     });
   });
 });

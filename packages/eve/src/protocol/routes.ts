@@ -76,10 +76,10 @@ export const EVE_DEV_RUNTIME_ARTIFACTS_ROUTE_PATH = `${EVE_ROUTE_PREFIX}/dev/run
  */
 export const EVE_DEV_RUNTIME_ARTIFACTS_REBUILD_ROUTE_PATH = `${EVE_DEV_RUNTIME_ARTIFACTS_ROUTE_PATH}/rebuild`;
 
-/** Dev-only route that pauses authored-source rebuilding while a setup subprocess owns the terminal. */
+/** Dev-only route that acquires an idempotent authored-source suspension lease. */
 export const EVE_DEV_RUNTIME_ARTIFACTS_SUSPEND_ROUTE_PATH = `${EVE_DEV_RUNTIME_ARTIFACTS_ROUTE_PATH}/suspend`;
 
-/** Dev-only route that resumes authored-source rebuilding after setup subprocess completion. */
+/** Dev-only route that idempotently releases one authored-source suspension lease. */
 export const EVE_DEV_RUNTIME_ARTIFACTS_RESUME_ROUTE_PATH = `${EVE_DEV_RUNTIME_ARTIFACTS_ROUTE_PATH}/resume`;
 
 /**
@@ -107,9 +107,6 @@ export function createEveDevDispatchSchedulePath(scheduleId: string): string {
  */
 export const EVE_CONNECTION_CALLBACK_ROUTE_PATTERN = `${EVE_ROUTE_PREFIX}/connections/:name/callback/:attemptId/:token`;
 
-/** Callback shape minted by deployments before authorization attempt IDs. */
-export const EVE_LEGACY_CONNECTION_CALLBACK_ROUTE_PATTERN = `${EVE_ROUTE_PREFIX}/connections/:name/callback/:token`;
-
 /**
  * Stable framework-owned route pattern for terminal session callbacks.
  *
@@ -117,9 +114,6 @@ export const EVE_LEGACY_CONNECTION_CALLBACK_ROUTE_PATTERN = `${EVE_ROUTE_PREFIX}
  * is unauthenticated by design and resumes the matching parked runtime action.
  */
 export const EVE_CALLBACK_ROUTE_PATTERN = `${EVE_ROUTE_PREFIX}/callback/:token`;
-
-/** Capability route used by a parent task to answer a remote child HITL batch. */
-export const EVE_TASK_INPUT_ROUTE_PATTERN = `${EVE_ROUTE_PREFIX}/task-input/:token`;
 
 /** Builds the ID-addressed message route for one session. */
 export function createEveSessionRoutePath(sessionId: string): string {

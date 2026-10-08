@@ -17,7 +17,7 @@ import {
   type ConnectionProtocol,
   connectionEntries,
   connectionProtocols,
-} from "@eve/catalog";
+} from "#compiled/@eve/catalog/index.js";
 
 /** Wire protocol a connection speaks at runtime. */
 export type { ConnectionProtocol };
@@ -107,6 +107,10 @@ export const CUSTOM_CONNECTION_SLUG = "custom";
 // URL. Keep these provider-owned keys explicit instead of deriving them from
 // the endpoint path.
 const CONNECTION_AUTH: Readonly<Record<string, ConnectionAuthSpec>> = {
+  "browser-use": {
+    kind: "header",
+    headers: [{ header: "x-browser-use-api-key", envVar: "BROWSER_USE_API_KEY" }],
+  },
   linear: { kind: "connect", connector: "linear", service: "mcp.linear.app" },
   notion: { kind: "connect", connector: "notion", service: "mcp.notion.com" },
   datadog: { kind: "connect", connector: "datadog", service: "mcp.datadoghq.com" },
@@ -185,39 +189,6 @@ const CONNECTION_SLUG_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
 /** True when a slug is a valid filesystem-derived connection name. */
 export function isValidConnectionSlug(slug: string): boolean {
   return CONNECTION_SLUG_PATTERN.test(slug);
-}
-
-/**
- * The `vercel connect create <service>` identifier for a Connect-backed
- * connection: the explicit `auth.service` when set, otherwise the MCP host.
- * Returns `undefined` when neither is available, in which case the connector
- * must be provisioned out of band.
- */
-export function connectorServiceForEntry(
-  entry: Pick<ConnectionCatalogEntry, "mcp" | "auth">,
-): string | undefined {
-  if (entry.auth.kind !== "connect") return undefined;
-  if (entry.auth.service) return entry.auth.service;
-  return mcpServiceHost(entry.mcp?.url);
-}
-
-/** Canonical connector name attempted before offering discovery or creation. */
-export function canonicalConnectorNameForEntry(entry: {
-  auth?: ConnectionAuthSpec;
-}): string | undefined {
-  if (entry.auth?.kind !== "connect") return undefined;
-  const name = entry.auth.connector.trim();
-  return name.length > 0 ? name : undefined;
-}
-
-/** Extracts the bare host from an MCP URL, or `undefined` when unparseable. */
-export function mcpServiceHost(url: string | undefined): string | undefined {
-  if (!url) return undefined;
-  try {
-    return new URL(url).host || undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /** Returns the endpoint block required for a protocol, or `null` when missing. */

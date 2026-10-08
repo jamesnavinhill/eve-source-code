@@ -1,13 +1,40 @@
-import { isAbsolute, posix } from "node:path";
+import { posix } from "node:path";
 
+import { normalizeLogicalPath, stripLogicalPathExtension } from "#discover/filesystem.js";
 import {
-  getSupportedModuleBaseName,
-  normalizeLogicalPath,
-  stripLogicalPathExtension,
-} from "#discover/filesystem.js";
+  validateProgrammaticLogicalPath,
+  validateProgrammaticLogicalPathInternal,
+} from "#compiler/source-graph-paths.js";
+export { validateProgrammaticLogicalPath } from "#compiler/source-graph-paths.js";
 import { parseJsonObject, type JsonObject } from "#shared/json.js";
 
 export type ProgrammaticModuleNamespace = Readonly<Record<string, unknown>>;
+
+/** Shares zero-argument definition-factory results within one module-map load. */
+export function memoizeModuleNamespaceFactories(
+  namespace: ProgrammaticModuleNamespace,
+): ProgrammaticModuleNamespace {
+  return Object.freeze(
+    Object.fromEntries(
+      Object.entries(namespace).map(([exportName, exportValue]) => {
+        if (typeof exportValue !== "function") return [exportName, exportValue];
+        let invocation: Promise<unknown> | undefined;
+        const memoized = new Proxy(exportValue, {
+          apply(target, thisArgument, argumentsList) {
+            if (argumentsList.length > 0) {
+              return Reflect.apply(target, thisArgument, argumentsList);
+            }
+            invocation ??= Promise.resolve().then(() =>
+              Reflect.apply(target, thisArgument, argumentsList),
+            );
+            return invocation;
+          },
+        });
+        return [exportName, memoized];
+      }),
+    ),
+  );
+}
 
 export interface ProgrammaticModuleLoadContext {
   readonly dependencies: Readonly<Record<string, ProgrammaticModuleNamespace>>;
@@ -34,7 +61,9 @@ export interface AgentSourceRegistration {
   readonly source: ProgrammaticAgentSource;
 }
 
-export interface AgentSourceRegistryOptions {
+interface AgentSourceRegistryOptions {
+  /** Programmatic extension declarations loaded by compiled virtual mounts. */
+  readonly extensionDeclarations?: readonly ProgrammaticAgentSource[];
   readonly templates?: readonly ProgrammaticAgentSource[];
 }
 
@@ -102,9 +131,14 @@ export type AgentSourceOwner =
   | { readonly feature: string; readonly kind: "framework" }
   | {
       readonly kind: "extension";
+      readonly mountId: string;
       readonly namespace: string;
       readonly packageName: string;
     };
+
+export function extensionMountId(nodePath: string, namespace: string): string {
+  return posix.join(nodePath, "extensions", namespace);
+}
 
 export type AgentSourceLayer =
   | "framework-default"
@@ -117,6 +151,7 @@ export type AgentSourceForm = "derived" | "direct";
 export type AgentModuleBacking =
   | {
       readonly externalDependencies: readonly string[];
+      readonly mountId?: string;
       readonly extensionScope?: {
         readonly namespace: string;
         readonly sourceRoot: string;
@@ -126,6 +161,7 @@ export type AgentModuleBacking =
     }
   | {
       readonly dependencies?: Readonly<Record<string, string>>;
+      readonly mountId?: string;
       readonly kind: "programmatic";
       readonly moduleId: string;
       readonly parameters?: JsonObject;
@@ -152,10 +188,28 @@ export interface AgentModuleCandidate {
   readonly sourceId: string;
 }
 
-export interface CompiledModuleBinding {
+export function bindingMountId(binding: AgentModuleBinding): string | undefined {
+  return binding.backing.kind === "filesystem" && binding.backing.mountId !== undefined
+    ? binding.backing.mountId
+    : binding.owner.kind === "extension"
+      ? binding.owner.mountId
+      : undefined;
+}
+
+export interface AgentModuleBinding {
   readonly backing: AgentModuleBacking;
   readonly logicalPath: string;
   readonly owner: AgentSourceOwner;
+}
+
+export interface CompiledModuleBinding extends AgentModuleBinding {
+  /** Compiler-owned namespace usage for this selected binding. */
+  readonly usage: {
+    /** The compiler evaluated this namespace while normalizing the node. */
+    readonly compile: boolean;
+    /** The namespace is an entry in the runtime module map. */
+    readonly runtimeEntry: boolean;
+  };
 }
 
 export interface AgentSourceDescriptor {
@@ -178,6 +232,12 @@ export interface AgentResourceCandidate {
 }
 
 export type AgentSourceCandidate = AgentModuleCandidate | AgentResourceCandidate;
+
+export function isAgentModuleCandidate(
+  candidate: AgentSourceCandidate,
+): candidate is AgentModuleCandidate {
+  return candidate.backing.kind !== "resource";
+}
 
 export type AgentSourceCompositionEntry =
   | {
@@ -216,11 +276,21 @@ const registeredProgrammaticTemplates = new WeakSet<RegisteredProgrammaticTempla
 export function defineProgrammaticAgentSource(
   input: ProgrammaticAgentSource,
 ): ProgrammaticAgentSource {
+  return defineProgrammaticAgentSourceInternal(input, false);
+}
+
+function defineProgrammaticAgentSourceInternal(
+  input: ProgrammaticAgentSource,
+  allowExtensionMount: boolean,
+): ProgrammaticAgentSource {
   const id = expectNonEmpty(input.id, "Programmatic agent source id");
   const revision = expectNonEmpty(input.revision, `Programmatic agent source "${id}" revision`);
   const logicalPaths = new Set<string>();
   const modules = input.modules.map((module) => {
-    const logicalPath = validateProgrammaticLogicalPath(module.logicalPath);
+    const logicalPath = validateProgrammaticLogicalPathInternal(
+      module.logicalPath,
+      allowExtensionMount,
+    );
     if (logicalPaths.has(logicalPath)) {
       throw new Error(
         `Programmatic agent source "${id}" declares "${logicalPath}" more than once.`,
@@ -245,14 +315,23 @@ export function defineProgrammaticAgentSource(
   return Object.freeze({ id, modules: Object.freeze(modules), revision });
 }
 
+export function defineProgrammaticExtensionMountDeclaration(
+  input: ProgrammaticAgentSource,
+): ProgrammaticAgentSource {
+  return defineProgrammaticAgentSourceInternal(input, true);
+}
+
 export function createAgentSourceRegistry(
   registrations: readonly AgentSourceRegistration[],
   options: AgentSourceRegistryOptions = {},
 ): AgentSourceRegistry {
   const sources = new Map<string, ProgrammaticAgentSource>();
   const templates = new Map<string, RegisteredProgrammaticTemplate>();
-  const addSource = (inputSource: ProgrammaticAgentSource): ProgrammaticAgentSource => {
-    const source = defineProgrammaticAgentSource(inputSource);
+  const addSource = (
+    inputSource: ProgrammaticAgentSource,
+    allowExtensionMount = false,
+  ): ProgrammaticAgentSource => {
+    const source = defineProgrammaticAgentSourceInternal(inputSource, allowExtensionMount);
     if (sources.has(source.id)) {
       throw new Error(`Programmatic agent source id "${source.id}" is registered more than once.`);
     }
@@ -263,6 +342,9 @@ export function createAgentSourceRegistry(
     const source = addSource(registration.source);
     return Object.freeze({ applyTo: registration.applyTo, source });
   });
+  for (const declaration of options.extensionDeclarations ?? []) {
+    addSource(declaration, true);
+  }
   for (const inputTemplate of options.templates ?? []) {
     const source = addSource(inputTemplate);
     if (source.modules.length !== 1) {
@@ -430,6 +512,7 @@ export function composeAgentModuleCandidates(
 }
 
 export function disableComposedCandidate(input: {
+  readonly allowUnmatched?: boolean;
   readonly candidate: AgentSourceCandidate;
   readonly composed: ComposedAgentModuleCandidates;
 }): ComposedAgentModuleCandidates {
@@ -441,7 +524,7 @@ export function disableComposedCandidate(input: {
   const replaced = input.composed.composition.entries.some(
     (entry) => entry.kind === "shadowed" && entry.winnerSourceId === input.candidate.sourceId,
   );
-  if (!replaced) {
+  if (!replaced && input.allowUnmatched !== true) {
     throw new Error(
       `Source "${input.candidate.logicalPath}" disables a slot with no lower-precedence source.`,
     );
@@ -458,9 +541,7 @@ export function disableComposedCandidate(input: {
   };
 }
 
-export function createCompiledModuleBinding(
-  candidate: AgentModuleCandidate,
-): CompiledModuleBinding {
+export function createAgentModuleBinding(candidate: AgentModuleCandidate): AgentModuleBinding {
   return Object.freeze({
     backing: candidate.backing,
     logicalPath: candidate.logicalPath,
@@ -523,11 +604,6 @@ export async function loadProgrammaticModuleNamespace(input: {
   return namespace;
 }
 
-export function canonicalModuleSlot(logicalPath: string): string {
-  validateProgrammaticLogicalPath(logicalPath);
-  return canonicalSourceSlot(logicalPath);
-}
-
 /**
  * Canonical composition slot for one logical path. Module extensions, folder
  * forms, and skill packages collapse onto the same authored primitive identity.
@@ -555,45 +631,6 @@ export function canonicalSourceSlot(logicalPath: string): string {
   if (skillPackageMatch !== null) return `skills/${skillPackageMatch[1]!}`;
 
   return withoutExtension;
-}
-
-export function validateProgrammaticLogicalPath(input: string): string {
-  if (input.length === 0 || isAbsolute(input) || input.includes("\\")) {
-    throw new Error(`Programmatic module logical path "${input}" must be a relative POSIX path.`);
-  }
-  const logicalPath = normalizeLogicalPath(input);
-  if (
-    logicalPath === "." ||
-    logicalPath.startsWith("../") ||
-    logicalPath.includes("/../") ||
-    posix.normalize(logicalPath) !== logicalPath
-  ) {
-    throw new Error(`Programmatic module logical path "${input}" may not traverse directories.`);
-  }
-  const segments = logicalPath.split("/");
-  const fileName = segments.at(-1)!;
-  if (getSupportedModuleBaseName(fileName) === null) {
-    throw new Error(
-      `Programmatic module logical path "${input}" must use a supported JavaScript or TypeScript extension.`,
-    );
-  }
-  const root = segments[0];
-  const extensionless = stripLogicalPathExtension(logicalPath);
-  const supported =
-    (segments.length === 1 && ["agent", "sandbox", "instrumentation"].includes(extensionless)) ||
-    (root === "sandbox" &&
-      segments.length === 2 &&
-      getSupportedModuleBaseName(fileName) === "sandbox") ||
-    (["channels", "connections", "hooks", "instructions", "schedules", "skills", "tools"].includes(
-      root!,
-    ) &&
-      segments.length >= 2);
-  if (!supported) {
-    throw new Error(
-      `Programmatic module logical path "${input}" does not select an eve module slot.`,
-    );
-  }
-  return logicalPath;
 }
 
 export function describeAgentSourceCandidate(

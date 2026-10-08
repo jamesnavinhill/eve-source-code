@@ -1,7 +1,7 @@
 import { z } from "#compiled/zod/index.js";
 
 import type { JsonValue } from "#shared/json.js";
-import { tokenUsageSchema, type TokenUsage } from "#shared/token-usage.js";
+import { tokenUsageWithCostSchema, type TokenUsage } from "#shared/token-usage.js";
 
 /**
  * What one delegated child turn produced, independent of whether the child
@@ -26,7 +26,7 @@ export type AgentTurnResult =
  * `parked` means the child session survived the turn and can accept another
  * delivery; `terminal` means the child session ended with this turn. The
  * lifecycle is carried explicitly: a failed turn can leave the child parked,
- * and a succeeded turn can be terminal (task mode). Consumers must never
+ * and a succeeded turn can be terminal. Consumers must never
  * infer lifecycle from success or error codes.
  *
  * `usageDelta` is the provider-reported usage this turn added to the child's
@@ -65,20 +65,23 @@ const agentTurnResultSchema: z.ZodType<AgentTurnResult> = z.discriminatedUnion("
 ]);
 
 /**
- * Zod schema for {@link AgentTurnOutcome}.
+ * Zod schema for {@link AgentTurnOutcome}, including optional model token cost.
  *
  * Validates outcomes crossing the process boundary (remote session
  * callbacks). Local notification paths construct the type directly.
  */
-export const agentTurnOutcomeSchema: z.ZodType<AgentTurnOutcome> = z.discriminatedUnion("kind", [
-  z.strictObject({
-    kind: z.literal("parked"),
-    result: agentTurnResultSchema,
-    usageDelta: tokenUsageSchema,
-  }),
-  z.strictObject({
-    kind: z.literal("terminal"),
-    result: agentTurnResultSchema,
-    usageDelta: tokenUsageSchema,
-  }),
-]);
+export const agentTurnOutcomeWithCostSchema: z.ZodType<AgentTurnOutcome> = z.discriminatedUnion(
+  "kind",
+  [
+    z.strictObject({
+      kind: z.literal("parked"),
+      result: agentTurnResultSchema,
+      usageDelta: tokenUsageWithCostSchema,
+    }),
+    z.strictObject({
+      kind: z.literal("terminal"),
+      result: agentTurnResultSchema,
+      usageDelta: tokenUsageWithCostSchema,
+    }),
+  ],
+);

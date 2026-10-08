@@ -2,19 +2,47 @@
  * Stamps callbacks passed to authored `defineTool()` calls with durable replay
  * descriptors. Each callback body is hoisted into a module-suffix function and
  * the live callback is stamped with that function plus the lexical values its
- * body references; identity `(toolName, phase)` is assigned at resolve time.
+ * body references; the session, scope, and resolver bind its identity at resolve time.
  */
 
 import { parseWithNitroRolldownAst } from "#internal/bundler/nitro-rolldown.js";
 import {
+  collectPatternNames,
   collectReferencedIdentifierNames,
+  extractParamNames,
+  findEveImportAliases,
   findProperty,
+  isAstNode,
+  isFunction,
+  readDefinerName,
   type DynamicToolAstNode as AstNode,
   walkNode,
 } from "#internal/workflow-bundle/dynamic-tool-ast-references.js";
 
-type CallbackPhase = "approvalRequest" | "approvalResponse" | "execute" | "toModelOutput";
-type CallbackPropertyName = "approval" | "execute" | "request" | "response" | "toModelOutput";
+type CallbackPhase =
+  | "labelComplete"
+  | "labelDelta"
+  | "labelStart"
+  | "approvalKey"
+  | "approvalRequest"
+  | "approvalResponse"
+  | "execute"
+  | "toModelOutput"
+  | "inputSchema"
+  | "outputSchema";
+type CallbackPropertyName =
+  | "approvalKey"
+  | "label"
+  | "approval"
+  | "execute"
+  | "start"
+  | "request"
+  | "response"
+  | "complete"
+  | "delta"
+  | "toModelOutput"
+  | "inputSchema"
+  | "outputSchema";
 
 interface CallbackInfo {
   readonly body: string;
@@ -43,41 +71,34 @@ interface ScopeEntry {
 export async function transformDynamicToolExecute(
   filename: string,
   source: string,
+  workflowFunctions: ReadonlySet<string> = NO_WORKFLOW_FUNCTIONS,
 ): Promise<{ code: string } | null> {
-  if (!source.includes("defineTool")) return null;
+  if (!source.includes("defineTool") && !source.includes("defineWorkflowTool")) return null;
 
   const ast = (await parseWithNitroRolldownAst(filename, source)) as AstNode;
-  const defineToolAliases = findDefineToolAliases(ast);
+  const defineToolAliases = findEveImportAliases(ast, ["defineTool", "defineWorkflowTool"]);
   if (defineToolAliases.size === 0) return null;
 
   const callbacks: CallbackInfo[] = [];
-  walkForCallbacks(source, ast, callbacks, [], defineToolAliases);
+  walkForCallbacks(source, ast, callbacks, [], {
+    defineToolAliases,
+    workflowFunctions,
+    durableSchemaAliases: findEveImportAliases(ast, ["defineDurableSchema"]),
+  });
   return callbacks.length === 0 ? null : applyTransform(source, callbacks);
 }
 
-// Keep the old export name for backward compatibility with the plugin.
-export { transformDynamicToolExecute as transformDynamicToolAwait };
+const NO_WORKFLOW_FUNCTIONS: ReadonlySet<string> = new Set();
 
-function findDefineToolAliases(ast: AstNode): ReadonlySet<string> {
-  const aliases = new Set<string>();
-  walkNode(ast, (node) => {
-    if (node.type !== "ImportDeclaration") return true;
-    const source = node.source?.value;
-    if (typeof source !== "string" || (source !== "eve" && !source.startsWith("eve/"))) {
-      return false;
-    }
-    for (const specifier of node.specifiers ?? []) {
-      if (
-        specifier.type === "ImportSpecifier" &&
-        (specifier.imported?.name ?? specifier.imported?.value) === "defineTool" &&
-        specifier.local?.name
-      ) {
-        aliases.add(specifier.local.name);
-      }
-    }
-    return false;
-  });
-  return aliases;
+interface WalkContext {
+  readonly defineToolAliases: ReadonlySet<string>;
+  readonly durableSchemaAliases: ReadonlySet<string>;
+  /**
+   * Top-level `"use workflow"` functions the directive transform already
+   * hoisted and stubbed. A tool whose `execute` is one never runs as a
+   * callback, so it keeps its identity and is not stamped.
+   */
+  readonly workflowFunctions: ReadonlySet<string>;
 }
 
 function walkForCallbacks(
@@ -85,7 +106,7 @@ function walkForCallbacks(
   node: AstNode | null | undefined,
   results: CallbackInfo[],
   nestedScopes: readonly ScopeEntry[],
-  defineToolAliases: ReadonlySet<string>,
+  context: WalkContext,
 ): void {
   if (!node) return;
 
@@ -99,19 +120,17 @@ function walkForCallbacks(
         vars: collectScopeVarDeclarations(bodyNode),
       },
     ];
-    walkForCallbacks(source, bodyNode, results, extended, defineToolAliases);
+    walkForCallbacks(source, bodyNode, results, extended, context);
     return;
   }
 
   if (
     node.type === "CallExpression" &&
-    node.callee?.type === "Identifier" &&
-    node.callee.name !== undefined &&
-    defineToolAliases.has(node.callee.name) &&
+    context.defineToolAliases.has(readDefinerName(node.callee) ?? "") &&
     node.arguments?.length === 1 &&
     node.arguments[0]?.type === "ObjectExpression"
   ) {
-    collectToolCallbacks(source, node.arguments[0], results, nestedScopes);
+    collectToolCallbacks(source, node.arguments[0], results, nestedScopes, context);
     return;
   }
 
@@ -119,13 +138,22 @@ function walkForCallbacks(
     if (Array.isArray(value)) {
       for (const child of value) {
         if (isAstNode(child)) {
-          walkForCallbacks(source, child, results, nestedScopes, defineToolAliases);
+          walkForCallbacks(source, child, results, nestedScopes, context);
         }
       }
     } else if (isAstNode(value)) {
-      walkForCallbacks(source, value, results, nestedScopes, defineToolAliases);
+      walkForCallbacks(source, value, results, nestedScopes, context);
     }
   }
+}
+
+function isWorkflowExecute(property: AstNode | undefined, context: WalkContext): boolean {
+  const value = property?.value as AstNode | undefined;
+  return (
+    value?.type === "Identifier" &&
+    value.name !== undefined &&
+    context.workflowFunctions.has(value.name)
+  );
 }
 
 function collectToolCallbacks(
@@ -133,15 +161,48 @@ function collectToolCallbacks(
   tool: AstNode,
   results: CallbackInfo[],
   nestedScopes: readonly ScopeEntry[],
+  context: WalkContext,
 ): void {
+  const execute = findProperty(tool, "execute");
+  if (!isWorkflowExecute(execute, context)) {
+    collectCallbackProperty(source, execute, "execute", "execute", results, nestedScopes);
+  }
   collectCallbackProperty(
     source,
-    findProperty(tool, "execute"),
-    "execute",
-    "execute",
+    findProperty(tool, "approvalKey"),
+    "approvalKey",
+    "approvalKey",
     results,
     nestedScopes,
   );
+  const label = findProperty(tool, "label");
+  const labelValue = label?.value as AstNode | undefined;
+  if (labelValue?.type === "ObjectExpression") {
+    collectCallbackProperty(
+      source,
+      findProperty(labelValue, "start"),
+      "labelStart",
+      "start",
+      results,
+      nestedScopes,
+    );
+    collectCallbackProperty(
+      source,
+      findProperty(labelValue, "complete"),
+      "labelComplete",
+      "complete",
+      results,
+      nestedScopes,
+    );
+    collectCallbackProperty(
+      source,
+      findProperty(labelValue, "delta"),
+      "labelDelta",
+      "delta",
+      results,
+      nestedScopes,
+    );
+  }
   collectCallbackProperty(
     source,
     findProperty(tool, "toModelOutput"),
@@ -150,6 +211,39 @@ function collectToolCallbacks(
     results,
     nestedScopes,
   );
+
+  for (const propertyName of ["inputSchema", "outputSchema"] as const) {
+    const property = findProperty(tool, propertyName);
+    const value = property?.value as AstNode | undefined;
+    if (
+      property?.start === undefined ||
+      property.end === undefined ||
+      value?.start === undefined ||
+      value.end === undefined
+    )
+      continue;
+    // JSON Schema literals are already durable data and need no factory.
+    if (value.type === "ObjectExpression" && !findProperty(value, "~standard")) continue;
+    if (
+      value.type === "CallExpression" &&
+      (value.callee?.name === "__eveDefineDurableSchema" ||
+        context.durableSchemaAliases.has(readDefinerName(value.callee) ?? ""))
+    )
+      continue;
+    results.push({
+      body: `{ return ${source.slice(value.start, value.end)}; }`,
+      bodyNode: value,
+      isAsync: false,
+      isGenerator: false,
+      isReference: false,
+      nestedScopes,
+      params: "",
+      phase: propertyName,
+      propertyName,
+      propEnd: property.end,
+      propStart: property.start,
+    });
+  }
 
   const approval = findProperty(tool, "approval");
   const approvalValue = approval?.value as AstNode | undefined;
@@ -259,7 +353,10 @@ function applyTransform(source: string, callbacks: readonly CallbackInfo[]): { c
     );
 
     const wrapper = createLiveWrapper(callback, hoistedName, closure);
-    const stamped = `__eveStampDynamicCallback(${wrapper}, ${hoistedName}, ${closure})`;
+    const stamped =
+      callback.phase === "inputSchema" || callback.phase === "outputSchema"
+        ? `__eveDefineDurableSchema({ schema: ${hoistedName}, closure: ${closure} })`
+        : `__eveStampDynamicCallback(${wrapper}, ${hoistedName}, ${closure})`;
     replacements.push({
       end: callback.propEnd,
       start: callback.propStart,
@@ -273,6 +370,11 @@ function applyTransform(source: string, callbacks: readonly CallbackInfo[]): { c
   }
 
   const registrySetup = [
+    ...(callbacks.some(
+      (callback) => callback.phase === "inputSchema" || callback.phase === "outputSchema",
+    )
+      ? ['import { defineDurableSchema as __eveDefineDurableSchema } from "eve/tools";']
+      : []),
     `var __eveDurableCallbackSym = Symbol.for("eve:durable-dynamic-callback");`,
     `function __eveStampDynamicCallback(callback, impl, closure) {`,
     `  Object.defineProperty(callback, __eveDurableCallbackSym, { configurable: true, value: { callback: impl, closure } });`,
@@ -314,36 +416,6 @@ function collectScopeVarDeclarations(bodyNode: AstNode): string[] {
     if (node.type === "FunctionDeclaration" && node.id?.name) names.push(node.id.name);
     return true;
   });
-  return names;
-}
-
-function collectPatternNames(pattern: AstNode | null, names: string[]): void {
-  if (!pattern) return;
-  if (pattern.type === "Identifier" && pattern.name) {
-    names.push(pattern.name);
-    return;
-  }
-  if (pattern.type === "ObjectPattern") {
-    for (const property of pattern.properties ?? []) {
-      collectPatternNames(
-        property.type === "RestElement"
-          ? (property.argument as AstNode | null)
-          : (property.value as AstNode | null),
-        names,
-      );
-    }
-  }
-  if (pattern.type === "ArrayPattern") {
-    for (const element of pattern.elements ?? []) collectPatternNames(element, names);
-  }
-  if (pattern.type === "AssignmentPattern") {
-    collectPatternNames(pattern.left as AstNode | null, names);
-  }
-}
-
-function extractParamNames(fn: AstNode): string[] {
-  const names: string[] = [];
-  for (const parameter of fn.params ?? []) collectPatternNames(parameter, names);
   return names;
 }
 
@@ -409,16 +481,4 @@ function extractCallbackParamNames(params: string): Set<string> {
     else names.push(binding);
   }
   return new Set(names);
-}
-
-function isFunction(node: AstNode): boolean {
-  return (
-    node.type === "ArrowFunctionExpression" ||
-    node.type === "FunctionDeclaration" ||
-    node.type === "FunctionExpression"
-  );
-}
-
-function isAstNode(value: unknown): value is AstNode {
-  return value !== null && typeof value === "object" && typeof (value as AstNode).type === "string";
 }

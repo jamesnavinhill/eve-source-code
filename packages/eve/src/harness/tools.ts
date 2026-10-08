@@ -1,10 +1,6 @@
 import { type ToolApprovalConfiguration, type ToolApprovalStatus, type ToolSet, tool } from "ai";
 
-import type { SessionCapabilities } from "#channel/types.js";
 import type { RuntimeModelReference } from "#runtime/agent/bootstrap.js";
-import type { WebSearchProvider } from "#shared/web-search.js";
-import { ASK_QUESTION_TOOL_NAME } from "#harness/request-input-tool.js";
-import { WEB_SEARCH_TOOL_NAME } from "#harness/provider-tool-schemas.js";
 import { isObject } from "#shared/guards.js";
 import type { HarnessToolDefinition } from "#harness/execute-tool.js";
 import { resolveApprovalPolicy, type ApprovalStatus } from "#approval/definition.js";
@@ -12,40 +8,32 @@ import { resolveWebSearchBackend, resolveWebSearchProviderTool } from "#harness/
 import type { HarnessToolMap } from "#harness/types.js";
 import { buildCallbackContext } from "#context/build-callback-context.js";
 import { loadContext } from "#context/container.js";
-import {
-  authorizationPendingModelText,
-  isAuthorizationPendingModelOutput,
-  isAuthorizationSignal,
-  modelFacingAuthorizationOutput,
-} from "#harness/authorization.js";
+import { isAuthorizationSignal, modelFacingAuthorizationOutput } from "#harness/authorization.js";
 import { stashToolInterrupt } from "#harness/tool-interrupts.js";
-import { normalizeToolJsonOutput, normalizeToolModelOutput } from "#harness/tool-model-output.js";
+import { isApprovedToolCall, markApprovalRecheck } from "#harness/approval-recheck.js";
+import { toModelSchema } from "#tools/schema.js";
+import { normalizeToolJsonOutput } from "#harness/tool-model-output.js";
+import { toolCallModelOutput } from "#harness/tool-call-io.js";
 import type { ToolExecuteOptions } from "#tools/definition.js";
 import { isAsyncIterable } from "#shared/async-iterable.js";
-import {
-  createBackgroundToolCallBatch,
-  executeBackgroundToolCall,
-  type BackgroundExecutableTool,
-  type BackgroundToolCallBatch,
-} from "#harness/background-tools.js";
+import { iterateAsApprover, runAsApprover } from "#harness/hitl/approved-call-callers.js";
 
 type NativeApprovalStatus = Exclude<ApprovalStatus, boolean>;
 
-const toolApprovals = new WeakMap<
-  object,
-  (toolInput: unknown, callId: string) => Promise<NativeApprovalStatus>
->();
+type ApprovalFn = (
+  toolInput: unknown,
+  callId: string,
+  abortSignal: AbortSignal | undefined,
+  recheck: boolean,
+) => Promise<NativeApprovalStatus>;
+
+const toolApprovals = new WeakMap<object, ApprovalFn>();
 
 /**
  * Builds an AI SDK `ToolSet` from unified harness tool definitions.
  *
  * Tools without `execute` are surfaced to the model as client-side tools
  * (no server execution).
- *
- * The framework's `ask_question` tool is only exposed to the model when
- * {@link SessionCapabilities.requestInput} is `true`. Sessions without
- * the HITL capability (scheduled task roots and any subagent chain
- * descending from one) never see the tool.
  *
  * Entries listed in `disabledProviderTools` are skipped entirely. Used
  * by the harness recovery path when a gateway fallback provider has
@@ -54,106 +42,36 @@ const toolApprovals = new WeakMap<
  */
 export function buildToolSet(input: {
   readonly approvedTools?: ReadonlySet<string>;
-  readonly backgroundBatch?: BackgroundToolCallBatch;
-  readonly capabilities?: SessionCapabilities;
   readonly disabledProviderTools?: ReadonlySet<string>;
   readonly tools: HarnessToolMap;
 }): ToolSet {
   const tools: Record<string, ToolSet[string]> = {};
-  const backgroundBatch = input.backgroundBatch ?? createBackgroundToolCallBatch();
-  const canRequestInput = input.capabilities?.requestInput === true;
   const disabled = input.disabledProviderTools;
 
   for (const definition of input.tools.values()) {
-    if (definition.name === ASK_QUESTION_TOOL_NAME && !canRequestInput) {
-      continue;
-    }
-
     if (disabled?.has(definition.name)) {
       continue;
     }
 
-    backgroundBatch.setTool(
-      definition.name,
-      definition.execution === "background" && definition.execute !== undefined
-        ? (definition as BackgroundExecutableTool)
-        : undefined,
-    );
     const authorToModelOutput = definition.toModelOutput;
     const approval = buildApprovalFn(definition, input);
     const aiTool = tool({
       description: definition.description,
-      execute: wrapToolExecute(definition, backgroundBatch),
-      inputSchema: definition.inputSchema,
-      ...(definition.execution === "background"
+      execute: wrapToolExecute(definition),
+      inputSchema: toModelSchema(definition.inputSchema, "input"),
+      strict: false,
+      outputSchema: toModelSchema(definition.outputSchema, "output"),
+      ...(definition.execute !== undefined || authorToModelOutput !== undefined
         ? {
-            onInputAvailable: ({
-              input: toolInput,
-              toolCallId,
-            }: {
-              readonly input: unknown;
-              readonly toolCallId: string;
-            }) => {
-              if (definition.execute === undefined) {
-                throw new Error(`Background tool "${definition.name}" has no execute function.`);
-              }
-              backgroundBatch.register({
-                callId: toolCallId,
-                input: toolInput,
-                toolName: definition.name,
-              });
-            },
-          }
-        : {}),
-      outputSchema: definition.outputSchema,
-      ...(definition.execute !== undefined
-        ? {
-            toModelOutput: async ({
+            toModelOutput: ({
               output,
               toolCallId,
             }: {
               readonly output: unknown;
               readonly toolCallId?: string;
-            }) => {
-              if (isAuthorizationPendingModelOutput(output)) {
-                return {
-                  type: "text" as const,
-                  value: authorizationPendingModelText(output.connections),
-                };
-              }
-              if (authorToModelOutput !== undefined) {
-                return normalizeToolModelOutput({
-                  output: await authorToModelOutput(output),
-                  toolCallId,
-                  toolName: definition.name,
-                });
-              }
-              if (typeof output === "string") {
-                return { type: "text" as const, value: output };
-              }
-              return normalizeToolModelOutput({
-                output: { type: "json" as const, value: output ?? null },
-                toolCallId,
-                toolName: definition.name,
-              });
-            },
+            }) => toolCallModelOutput(definition, output, toolCallId),
           }
-        : authorToModelOutput !== undefined
-          ? {
-              toModelOutput: async ({
-                output,
-                toolCallId,
-              }: {
-                readonly output: unknown;
-                readonly toolCallId?: string;
-              }) =>
-                normalizeToolModelOutput({
-                  output: await authorToModelOutput(output),
-                  toolCallId,
-                  toolName: definition.name,
-                }),
-            }
-          : {}),
+        : {}),
     });
     tools[definition.name] = aiTool;
     if (definition.approval !== undefined) {
@@ -172,8 +90,6 @@ export function buildToolSet(input: {
  */
 export function buildToolSetFromDefinitions(input: {
   readonly approvedTools?: ReadonlySet<string>;
-  readonly backgroundBatch?: BackgroundToolCallBatch;
-  readonly capabilities?: SessionCapabilities;
   readonly disabledProviderTools?: ReadonlySet<string>;
   readonly tools: readonly HarnessToolDefinition[];
 }): ToolSet {
@@ -185,8 +101,6 @@ export function buildToolSetFromDefinitions(input: {
   }
   return buildToolSet({
     approvedTools: input.approvedTools,
-    backgroundBatch: input.backgroundBatch,
-    capabilities: input.capabilities,
     disabledProviderTools: input.disabledProviderTools,
     tools,
   });
@@ -201,7 +115,6 @@ export function buildToolSetFromDefinitions(input: {
  */
 export function wrapToolExecute(
   definition: HarnessToolDefinition,
-  backgroundBatch: BackgroundToolCallBatch = createBackgroundToolCallBatch(),
 ): ((input: any, options: ToolExecuteOptions) => Promise<any> | AsyncIterable<any>) | undefined {
   const execute = definition.execute;
   if (execute === undefined) return undefined;
@@ -209,21 +122,17 @@ export function wrapToolExecute(
   return (input, options) => {
     let output: unknown;
     try {
-      output =
-        definition.execution === "background"
-          ? executeBackgroundToolCall({
-              batch: backgroundBatch,
-              definition: definition as BackgroundExecutableTool,
-              options,
-              toolInput: input,
-            })
-          : execute(input, options);
+      output = runAsApprover(options.toolCallId, () => execute(input, options));
     } catch (error) {
       return Promise.reject(error);
     }
 
     if (isAsyncIterable(output)) {
-      return normalizeToolExecuteIterable(output, definition.name, options);
+      return normalizeToolExecuteIterable(
+        iterateAsApprover(options.toolCallId, output),
+        definition.name,
+        options,
+      );
     }
 
     return Promise.resolve(output).then((value) =>
@@ -280,34 +189,36 @@ function normalizeToolExecuteOutput(
  */
 export async function buildToolSetWithProviderTools(input: {
   readonly approvedTools?: ReadonlySet<string>;
-  readonly backgroundBatch?: BackgroundToolCallBatch;
-  readonly capabilities?: SessionCapabilities;
   readonly disabledProviderTools?: ReadonlySet<string>;
   readonly modelReference: RuntimeModelReference;
+  readonly modelProvider?: string;
   readonly tools: HarnessToolMap;
-  readonly webSearchProvider?: WebSearchProvider;
 }): Promise<ToolSet> {
   const disabled = input.disabledProviderTools;
   const tools: ToolSet = {
     ...buildToolSet({
       approvedTools: input.approvedTools,
-      backgroundBatch: input.backgroundBatch,
-      capabilities: input.capabilities,
       disabledProviderTools: disabled,
       tools: input.tools,
     }),
   };
 
-  // Inject the real provider tool for web_search when the definition has
-  // no local execute (i.e. the framework definition uses the provider sentinel).
-  if (!disabled?.has(WEB_SEARCH_TOOL_NAME)) {
-    const webSearchTool = input.tools.get(WEB_SEARCH_TOOL_NAME);
-    if (webSearchTool !== undefined && webSearchTool.execute === undefined) {
-      const backend = resolveWebSearchBackend(input.modelReference, input.webSearchProvider);
+  for (const definition of input.tools.values()) {
+    const handling = definition.behavior?.handling;
+    if (
+      handling?.kind === "provider-tool" &&
+      definition.execute === undefined &&
+      !disabled?.has(definition.name)
+    ) {
+      const backend = resolveWebSearchBackend(
+        input.modelReference,
+        handling.provider,
+        input.modelProvider,
+      );
       if (backend === null) {
-        delete tools[WEB_SEARCH_TOOL_NAME];
+        delete tools[definition.name];
       } else {
-        tools[WEB_SEARCH_TOOL_NAME] = await resolveWebSearchProviderTool(backend);
+        tools[definition.name] = await resolveWebSearchProviderTool(backend);
       }
     }
   }
@@ -318,32 +229,68 @@ export async function buildToolSetWithProviderTools(input: {
 function buildApprovalFn(
   definition: HarnessToolDefinition,
   input: { readonly approvedTools?: ReadonlySet<string> },
-): (toolInput: unknown, callId: string) => Promise<NativeApprovalStatus> {
-  return async (toolInput: unknown, callId: string) => {
+): ApprovalFn {
+  return async (toolInput, callId, abortSignal, recheck) => {
     if (definition.approval === undefined) return undefined;
 
     const toolInputRecord = isObject(toolInput) ? toolInput : undefined;
-
-    const status = await resolveApprovalPolicy(definition.approval)({
+    const context = {
       ...buildCallbackContext(),
-      approvedTools: input.approvedTools ?? new Set(),
+      abortSignal: abortSignal ?? new AbortController().signal,
+      approvedTools: input.approvedTools ?? new Set<string>(),
       callId,
       toolInput: toolInputRecord,
       toolName: definition.name,
-    });
+    };
+
+    const status = await resolveApprovalPolicy(definition.approval)(
+      recheck ? markApprovalRecheck(context) : context,
+    );
     return typeof status === "boolean" ? (status ? "user-approval" : "not-applicable") : status;
   };
+}
+
+/**
+ * Re-runs a tool's approval policy for a call a person approved, just before eve runs it, so the
+ * policy can still refuse it, as when the connection it was approved against changed.
+ */
+export async function recheckApprovedCall(
+  definition: HarnessToolDefinition,
+  call: {
+    readonly callId: string;
+    readonly input: unknown;
+    readonly abortSignal?: AbortSignal;
+    readonly approvedTools?: ReadonlySet<string>;
+  },
+): Promise<{ readonly denied: boolean; readonly reason?: string }> {
+  const status = await buildApprovalFn(definition, { approvedTools: call.approvedTools })(
+    call.input,
+    call.callId,
+    call.abortSignal,
+    true,
+  );
+  if (status === "denied") return { denied: true };
+  if (typeof status === "object" && status !== null && status.type === "denied") {
+    return { denied: true, reason: status.reason };
+  }
+  return { denied: false };
 }
 
 /** Builds the AI SDK 7 call-level approval policy for an assembled tool set. */
 export function buildToolApproval(
   tools: ToolSet,
+  abortSignal?: AbortSignal,
 ): ToolApprovalConfiguration<ToolSet, Record<string, unknown>> {
-  return async ({ toolCall }) => {
+  return async ({ toolCall, messages }) => {
     const toolDefinition = tools[toolCall.toolName];
     if (toolDefinition === undefined) return undefined;
 
     const approval = toolApprovals.get(toolDefinition);
-    return (await approval?.(toolCall.input, toolCall.toolCallId)) as ToolApprovalStatus;
+    return (await approval?.(
+      toolCall.input,
+      toolCall.toolCallId,
+      abortSignal,
+      isApprovedToolCall(messages, toolCall.toolCallId),
+    )) as ToolApprovalStatus;
   };
 }

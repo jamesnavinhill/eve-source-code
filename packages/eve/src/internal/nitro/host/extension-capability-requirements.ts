@@ -1,5 +1,7 @@
 import { join } from "node:path";
 
+import { extensionMountId } from "#compiler/source-graph.js";
+
 import {
   EXTENSION_CAPABILITY_VERSIONS,
   type ExtensionCapability,
@@ -21,6 +23,8 @@ export async function deriveExtensionCapabilityRequirements(input: {
   readonly manifest: AgentSourceManifest;
   readonly packageName: string;
   readonly runtimeDependencies: readonly string[];
+  readonly runtimeImports: readonly string[];
+  readonly runtimeRoot: string;
   readonly shortName: string;
   readonly sourceRoot: string;
 }): Promise<ExtensionCapabilityRequirements> {
@@ -63,7 +67,7 @@ export async function deriveExtensionCapabilityRequirements(input: {
     loadAuthoredModuleNamespace(join(input.sourceRoot, input.declarationModule.logicalPath), {
       externalDependencies: input.runtimeDependencies,
     }),
-    extensionUsesState(input.sourceRoot),
+    extensionUsesState(input.runtimeRoot),
   ]);
 
   if (tools.length > 0) required.add("tool");
@@ -89,6 +93,9 @@ export async function deriveExtensionCapabilityRequirements(input: {
     required.add("config");
   }
   if (usesState) required.add("state");
+  // Runtime imports can use these capabilities outside manifest-declared tools.
+  if (input.runtimeImports.includes("eve/ai")) required.add("tool");
+  if (input.runtimeImports.includes("eve/models")) required.add("dynamicTool");
 
   return Object.fromEntries(
     (Object.keys(EXTENSION_CAPABILITY_VERSIONS) as ExtensionCapability[])
@@ -112,6 +119,7 @@ function createLoadOptions(
 } {
   const owner = {
     kind: "extension" as const,
+    mountId: extensionMountId("", input.shortName),
     namespace: input.shortName,
     packageName: input.packageName,
   };
@@ -128,6 +136,8 @@ function createLoadOptions(
   return {
     binding,
     loadNamespace: createCompiledBindingNamespaceLoader({
+      // An extension package build has no application to own Workflow ids.
+      appRoot: undefined,
       bindings: { [source.sourceId]: binding },
       registries: [],
     }),

@@ -18,7 +18,8 @@ import { isBuiltin } from "node:module";
 import { join, parse, relative } from "node:path";
 
 import { buildWithNitroRolldown } from "./nitro-rolldown.mjs";
-import { createVendoredDependencyWarningFilter } from "./vendor-warning-log.mjs";
+import vendoredZod from "./vendor-compiled/zod.mjs";
+import { onVendoredDependencyLog } from "../src/internal/bundler/vendored-dependency-log.ts";
 
 /**
  * Names of the CJS-interop helpers that rolldown injects into its
@@ -103,6 +104,28 @@ function createDynamicToolTransformPlugin() {
   };
 }
 
+/**
+ * Keeps framework workflow bodies available to the downstream driver builder
+ * while stamping the same callback metadata that application modules receive
+ * from their client transform.
+ */
+function createWorkflowMetadataTransformPlugin() {
+  let transformPromise;
+  return {
+    name: "eve:workflow-metadata-transform",
+    async transform(code, id) {
+      if (!code.includes("use workflow")) return null;
+      transformPromise ??= import("../src/internal/workflow-bundle/workflow-builders.ts").then(
+        (mod) => mod.applyWorkflowTransform,
+      );
+      const transformFn = await transformPromise;
+      const filename = relative(process.cwd(), id).replaceAll("\\", "/");
+      const result = await transformFn(filename, code, "metadata", id, process.cwd());
+      return result.code === code ? null : { code: result.code, map: null };
+    },
+  };
+}
+
 const SRC_ROOT = "src";
 const OUTPUT_DIR = "dist/src";
 
@@ -155,6 +178,13 @@ const EXTERNAL_PACKAGES = new Set([
 ]);
 
 function isExternalPackageSpecifier(source) {
+  // Public self-imports must remain bare in the published package. Resolving
+  // them during a clean build would target output that does not exist yet;
+  // resolving them during an incremental build could consume stale output.
+  if (source === "eve" || source.startsWith("eve/")) {
+    return true;
+  }
+
   // All `#*` subpath imports stay external so the published dist keeps
   // the bare-specifier shape the runtime resolves at load time. Source
   // files routinely depend on a 1:1 mapping (workflow
@@ -176,6 +206,57 @@ function isExternalPackageSpecifier(source) {
   }
 
   return false;
+}
+
+const VENDORED_ZOD_IMPORTS = new Map(
+  Object.entries(vendoredZod.sharedSpecifiers).map(([specifier, outputPath]) => [
+    specifier,
+    `#compiled/zod/${outputPath}.js`,
+  ]),
+);
+
+/**
+ * eve ships one Zod. Every Zod import that reaches the build, from eve's
+ * sources or a bundled dependency, resolves to the vendored copy instead of
+ * copying Zod's sources into `dist/src/node_modules`.
+ */
+function createVendoredZodPlugin() {
+  return {
+    name: "eve:vendored-zod",
+    resolveId(source, importer) {
+      if (source !== "zod" && !source.startsWith("zod/")) return null;
+      const id = VENDORED_ZOD_IMPORTS.get(source);
+      if (id === undefined) {
+        throw new Error(
+          `${importer ?? "eve"} imports "${source}", which eve's vendored Zod does not export. ` +
+            `Add it to sharedSpecifiers in scripts/vendor-compiled/zod.mjs.`,
+        );
+      }
+      return { id, external: true };
+    },
+  };
+}
+
+/**
+ * The code extension imports `@vercel/connect`, whose `@vercel/oidc` tree is
+ * CommonJS. Resolve it to the standalone vendored bundle instead of inlining
+ * that CommonJS into `dist/src/node_modules`, where `polyfillRequire: false`
+ * would leave its `require` calls undefined.
+ */
+function createVendoredConnectPlugin() {
+  return {
+    name: "eve:vendored-connect",
+    resolveId(source, importer) {
+      if (source !== "@vercel/connect" && !source.startsWith("@vercel/connect/")) return null;
+      if (source !== "@vercel/connect") {
+        throw new Error(
+          `${importer ?? "eve"} imports "${source}", but eve vendors only the root ` +
+            `"@vercel/connect" entry. See scripts/vendor-compiled/@vercel/connect.mjs.`,
+        );
+      }
+      return { id: "#compiled/@vercel/connect/index.js", external: true };
+    },
+  };
 }
 
 async function collectSourceFiles(directory, relativeRoot = "") {
@@ -227,13 +308,17 @@ const input = Object.fromEntries(
   }),
 );
 
-const warningFilter = createVendoredDependencyWarningFilter();
-
 await buildWithNitroRolldown({
   input,
   external: isExternalPackageSpecifier,
   platform: "node",
-  plugins: [createStripUnusedRolldownRuntimeImportPlugin(), createDynamicToolTransformPlugin()],
+  plugins: [
+    createVendoredZodPlugin(),
+    createVendoredConnectPlugin(),
+    createStripUnusedRolldownRuntimeImportPlugin(),
+    createDynamicToolTransformPlugin(),
+    createWorkflowMetadataTransformPlugin(),
+  ],
   resolve: {
     // `eve-source` makes `#*.js` resolve to `./src/*.ts` at build time so
     // sibling source files become part of the graph instead of bare
@@ -264,7 +349,8 @@ await buildWithNitroRolldown({
     // every dist file would carry an `import "../_virtual/_rolldown/runtime.js"`
     // side-effect import, and the workflow bundler (which runs under
     // `platform: "neutral"`) would warn about the unresolved Node
-    // builtin every time it pulled an eve file into its graph.
+    // builtin every time it pulled an eve file into its graph. Dependencies
+    // with CommonJS code are vendored under `#compiled/*` instead.
     polyfillRequire: false,
     preserveModules: true,
     preserveModulesRoot: SRC_ROOT,
@@ -274,7 +360,7 @@ await buildWithNitroRolldown({
     // silent `undefined` reads deep inside the runtime.
     topLevelVar: false,
   },
-  onLog: warningFilter.onLog,
+  onLog: onVendoredDependencyLog,
 });
 
 // Vue integration — separate build that resolves `#` subpath imports so the
@@ -331,7 +417,7 @@ if (vueSourceFiles.length > 0) {
       minify: false,
       sourcemap: false,
     },
-    onLog: warningFilter.onLog,
+    onLog: onVendoredDependencyLog,
   });
 }
 
@@ -388,6 +474,6 @@ if (svelteSourceFiles.length > 0) {
       minify: false,
       sourcemap: false,
     },
-    onLog: warningFilter.onLog,
+    onLog: onVendoredDependencyLog,
   });
 }

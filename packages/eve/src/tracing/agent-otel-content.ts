@@ -1,3 +1,5 @@
+import { isUserMessageKind } from "#harness/messages.js";
+
 /**
  * Serializes model and tool payloads into span content attributes for the
  * local trace viewer: prompt messages, the system prompt, responses, and
@@ -9,48 +11,17 @@
 /** Content attributes are capped so a giant payload cannot bloat a span segment. */
 export const CONTENT_ATTRIBUTE_LIMIT = 32 * 1024;
 
-/** Provider transport noise stripped from messages (not tool data). */
-const CONTENT_NOISE_KEYS = new Set(["providerOptions", "providerMetadata"]);
-
-/** Marker prepended when oldest messages are dropped to fit the content cap. */
-const TRUNCATED_MESSAGES_KEY = "eve.truncated";
-
-/**
- * Serializes one payload value. `strip` removes {@link CONTENT_NOISE_KEYS};
- * pass `false` for tool data, where those keys may be legitimate domain
- * fields the user authored or the tool returned.
- */
-export function contentAttribute(value: unknown, strip = true): string | undefined {
+/** Serializes one payload value as capped JSON. */
+export function contentAttribute(value: unknown): string | undefined {
   if (value === undefined) return undefined;
-  const prepared = strip ? stripContentNoise(value, 0) : value;
   let json: string | undefined;
   try {
-    json = JSON.stringify(prepared);
+    json = JSON.stringify(value);
   } catch {
     return undefined;
   }
   if (json === undefined) return undefined;
   return textContentAttribute(json);
-}
-
-/**
- * Serializes the prompt messages, keeping the result parseable: oldest
- * messages drop first behind an omission marker, and a single message over
- * the cap is truncated at the text level rather than the JSON level.
- */
-export function messagesContentAttribute(messages: unknown): string | undefined {
-  if (!Array.isArray(messages)) return contentAttribute(messages);
-  const stripped = stripContentNoise(messages, 0) as unknown[];
-  const full = stringifyContent(stripped);
-  if (full !== undefined && full.length <= CONTENT_ATTRIBUTE_LIMIT) return full;
-  for (let omitted = 1; omitted < stripped.length; omitted += 1) {
-    const json = stringifyContent([
-      { [TRUNCATED_MESSAGES_KEY]: { omittedMessages: omitted } },
-      ...stripped.slice(omitted),
-    ]);
-    if (json !== undefined && json.length <= CONTENT_ATTRIBUTE_LIMIT) return json;
-  }
-  return truncateSingleMessage(stripped);
 }
 
 /** Serializes model messages using the OpenTelemetry GenAI message schema. */
@@ -61,19 +32,50 @@ export function genAiInputMessagesAttribute(messages: unknown): string | undefin
       return [];
     }
     const parts = semanticParts(message.content);
-    return parts.length === 0 ? [] : [{ parts, role: message.role }];
+    if (parts.length === 0) return [];
+    const kind =
+      message.role === "user" && isUserMessageKind(message.kind) ? message.kind : undefined;
+    return [
+      kind === undefined ? { parts, role: message.role } : { kind, parts, role: message.role },
+    ];
   });
   for (let start = 0; start < formatted.length; start += 1) {
     const json = semanticJsonAttribute(formatted.slice(start));
     if (json !== undefined) return json;
   }
-  return semanticJsonAttribute([]);
+  return truncateSingleSemanticMessage(formatted) ?? semanticJsonAttribute([]);
 }
 
 /** Serializes the system prompt using the OpenTelemetry GenAI instruction schema. */
 export function genAiSystemInstructionsAttribute(instructions: unknown): string | undefined {
-  const text = systemPromptAttribute(instructions);
-  return text === undefined ? undefined : semanticJsonAttribute([{ content: text, type: "text" }]);
+  const text = systemPromptText(instructions);
+  if (text === undefined) return undefined;
+  return fitSemanticText(text, (content) => [{ content, type: "text" }]);
+}
+
+/** Serializes tool definitions, dropping trailing entries to keep the JSON whole. */
+export function genAiToolDefinitionsAttribute(tools: unknown): string | undefined {
+  if (!Array.isArray(tools)) return undefined;
+  const definitions = tools.flatMap((tool): Record<string, unknown>[] => {
+    if (!isRecord(tool) || typeof tool.name !== "string") return [];
+    const definition: Record<string, unknown> = { name: tool.name };
+    if (typeof tool.description === "string") definition.description = tool.description;
+    if (tool.inputSchema !== undefined) definition.parameters = tool.inputSchema;
+    return [definition];
+  });
+  if (definitions.length === 0) return undefined;
+
+  const serialized: string[] = [];
+  let length = 2;
+  for (const definition of definitions) {
+    const json = stringifyContent(definition);
+    if (json === undefined) break;
+    const nextLength = length + (serialized.length === 0 ? 0 : 1) + json.length;
+    if (nextLength > CONTENT_ATTRIBUTE_LIMIT) break;
+    serialized.push(json);
+    length = nextLength;
+  }
+  return `[${serialized.join(",")}]`;
 }
 
 /** Serializes one model response using the OpenTelemetry GenAI message schema. */
@@ -89,6 +91,11 @@ export function genAiOutputMessagesAttribute(
       role: "assistant",
     },
   ]);
+}
+
+/** Serializes memory records using the OpenTelemetry GenAI memory-records schema. */
+export function genAiMemoryRecordsAttribute(records: readonly unknown[]): string | undefined {
+  return semanticJsonAttribute(records);
 }
 
 /**
@@ -121,9 +128,9 @@ function cappedToolResult(entry: Record<string, unknown>, cap: number): Record<s
   return out;
 }
 
-/** Normalizes the AI SDK's `instructions` prompt to plain text for `ai.prompt.system`. */
-export function systemPromptAttribute(instructions: unknown): string | undefined {
-  if (typeof instructions === "string") return textContentAttribute(instructions);
+/** Normalizes the AI SDK's `instructions` prompt to plain text. */
+function systemPromptText(instructions: unknown): string | undefined {
+  if (typeof instructions === "string") return instructions.length === 0 ? undefined : instructions;
   if (!isRecord(instructions) && !Array.isArray(instructions)) return undefined;
   const messages = Array.isArray(instructions) ? instructions : [instructions];
   const texts: string[] = [];
@@ -136,7 +143,7 @@ export function systemPromptAttribute(instructions: unknown): string | undefined
           texts.push(part.text);
   }
   const joined = texts.join("\n\n").trim();
-  return joined.length === 0 ? undefined : textContentAttribute(joined);
+  return joined.length === 0 ? undefined : joined;
 }
 
 /** Caps plain text, marking the cut. */
@@ -145,35 +152,6 @@ export function textContentAttribute(text: string): string | undefined {
   return text.length <= CONTENT_ATTRIBUTE_LIMIT
     ? text
     : `${text.slice(0, CONTENT_ATTRIBUTE_LIMIT)}… [truncated]`;
-}
-
-function stripContentNoise(value: unknown, depth: number): unknown {
-  if (depth > 32 || value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((e) => stripContentNoise(e, depth + 1));
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value))
-    if (!CONTENT_NOISE_KEYS.has(k)) out[k] = stripContentNoise(v, depth + 1);
-  return out;
-}
-
-function truncateSingleMessage(messages: unknown[]): string | undefined {
-  if (messages.length === 0) return undefined;
-  const last = messages[messages.length - 1];
-  if (!isRecord(last)) return undefined;
-  const marker = { [TRUNCATED_MESSAGES_KEY]: { omittedMessages: messages.length - 1 } };
-  const role = typeof last.role === "string" ? last.role : "user";
-  let text = "";
-  if (typeof last.content === "string") text = last.content;
-  else if (Array.isArray(last.content))
-    for (const part of last.content)
-      if (isRecord(part) && part.type === "text" && typeof part.text === "string")
-        text += (text ? "\n" : "") + part.text;
-  for (let len = Math.min(text.length, CONTENT_ATTRIBUTE_LIMIT); len > 0; len -= 256) {
-    const cut = len >= text.length ? text : `${text.slice(0, len)}… [truncated]`;
-    const json = stringifyContent([marker, { role, content: cut }]);
-    if (json !== undefined && json.length <= CONTENT_ATTRIBUTE_LIMIT) return json;
-  }
-  return stringifyContent([marker, { role, content: "" }]);
 }
 
 function stringifyContent(value: unknown): string | undefined {
@@ -187,6 +165,52 @@ function stringifyContent(value: unknown): string | undefined {
 function semanticJsonAttribute(value: unknown): string | undefined {
   const json = stringifyContent(value);
   return json !== undefined && json.length <= CONTENT_ATTRIBUTE_LIMIT ? json : undefined;
+}
+
+function truncateSingleSemanticMessage(
+  messages: readonly Record<string, unknown>[],
+): string | undefined {
+  const message = messages.at(-1);
+  if (message === undefined || typeof message.role !== "string") return undefined;
+  const text = semanticMessageText(message.parts);
+  const base =
+    typeof message.kind === "string"
+      ? { kind: message.kind, role: message.role }
+      : { role: message.role };
+  return fitSemanticText(
+    text,
+    (content) => [{ ...base, parts: [{ content, type: "text" }] }],
+    true,
+  );
+}
+
+function fitSemanticText(
+  text: string,
+  wrap: (content: string) => unknown,
+  alwaysMark = false,
+): string | undefined {
+  if (!alwaysMark && text.length <= CONTENT_ATTRIBUTE_LIMIT) {
+    const full = semanticJsonAttribute(wrap(text));
+    if (full !== undefined) return full;
+  }
+  for (let length = Math.min(text.length, CONTENT_ATTRIBUTE_LIMIT); length > 0; length -= 256) {
+    const json = semanticJsonAttribute(wrap(`${text.slice(0, length)}… [truncated]`));
+    if (json !== undefined) return json;
+  }
+  return semanticJsonAttribute(wrap("… [truncated]"));
+}
+
+function semanticMessageText(parts: unknown): string {
+  if (!Array.isArray(parts)) return "";
+  let text = "";
+  for (const part of parts) {
+    if (!isRecord(part) || part.type !== "text" || typeof part.content !== "string") continue;
+    const separator = text.length === 0 ? "" : "\n";
+    const remaining = CONTENT_ATTRIBUTE_LIMIT + 1 - text.length - separator.length;
+    if (remaining <= 0) break;
+    text += separator + part.content.slice(0, remaining);
+  }
+  return text;
 }
 
 function semanticParts(content: unknown): Record<string, unknown>[] {

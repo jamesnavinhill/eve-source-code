@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { buildApprovalResponseAuth } from "#execution/tool-auth.js";
+import {
+  buildApprovalResponseAuth,
+  handleApprovalResponsePolicyError,
+} from "#execution/tool-auth.js";
 import { evictScopedToken, resolveScopedToken } from "#runtime/connections/scoped-authorization.js";
 import { loadContext } from "#context/container.js";
 import { AuthKey, SessionIdKey } from "#context/keys.js";
@@ -158,6 +161,44 @@ describe("approval response authorization", () => {
       type: "user",
     });
   });
+
+  it("binds a responder's sign-in attempt to the responder instead of ambient auth", async () => {
+    const provider: AuthorizationDefinition = {
+      principalType: "user",
+      async getToken(): Promise<TokenResult> {
+        throw requiredError();
+      },
+      async startAuthorization() {
+        return { challenge: { url: "https://idp.example/auth" } };
+      },
+      async completeAuthorization(): Promise<TokenResult> {
+        return { token: "after-signin" };
+      },
+    };
+    const runtime = await createTestRuntime({ tools: [] });
+
+    const signal = await runtime.runAsSession({ sessionId: "session_responder_auth" }, async () => {
+      seedUserPrincipal();
+      loadContext().set(CallbackBaseUrlKey, "https://app.example");
+      try {
+        await buildApprovalResponseAuth({
+          responder: {
+            attributes: {},
+            authenticator: "test-idp",
+            principalId: "bound-U1",
+            principalType: "user",
+          },
+          scope: "candidate-1",
+        }).getToken(provider);
+      } catch (error) {
+        return await handleApprovalResponsePolicyError(error);
+      }
+      throw new Error("expected authorization to be required");
+    });
+
+    if (!isAuthorizationSignal(signal)) throw new Error("expected signal");
+    expect(signal.challenges[0]?.principalId).toBe("bound-U1");
+  });
 });
 
 describe("tool-hosted authorization", () => {
@@ -204,8 +245,8 @@ describe("tool-hosted authorization", () => {
 
   it("resolves and caches an inline provider on a plain tool", async () => {
     let calls = 0;
-    const inlineAuth: AuthorizationDefinition = {
-      principalType: "app",
+    const inlineAuth = {
+      credentialOwner: "app" as const,
       async getToken(): Promise<TokenResult> {
         calls += 1;
         return { token: `inline-${calls}` };
@@ -372,7 +413,7 @@ describe("tool-hosted authorization", () => {
     expect(isAuthorizationSignal(result)).toBe(true);
     if (!isAuthorizationSignal(result)) throw new Error("expected signal");
     expect(receivedCallbackUrl).toBe(
-      `http://localhost:2000/eve/v1/connections/search_notion__mcp.notion.com_notion/callback/${result.challenges[0]?.attemptId}/session_auth%3Aauth`,
+      `http://localhost:2000/eve/v1/connections/search_notion__mcp.notion.com_notion/callback/${result.challenges[0]?.attemptId}/eve%3Ainbox%3Av1%3Aeve%3Asession%3Asession_auth%3Ainbox`,
     );
     expect(result.challenges[0]?.hookUrl).toBe(receivedCallbackUrl);
   });

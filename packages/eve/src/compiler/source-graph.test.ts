@@ -7,6 +7,7 @@ import {
   defineProgrammaticAgentSource,
   instantiateProgrammaticTemplate,
   loadProgrammaticModuleNamespace,
+  memoizeModuleNamespaceFactories,
   type AgentModuleBacking,
   type AgentModuleCandidate,
   type AgentSourceLayer,
@@ -16,6 +17,7 @@ import {
   type ProgrammaticAgentSource,
   type ProgrammaticModuleLoadContext,
 } from "#compiler/source-graph.js";
+import { materializeAuthoredModuleExport } from "#internal/authored-module.js";
 
 function source(
   id: string,
@@ -43,6 +45,34 @@ function candidate(
 }
 
 describe("derived programmatic sources", () => {
+  it("memoizes definition factories within one module namespace", async () => {
+    const factory = vi.fn(() => ({ instance: Symbol("definition") }));
+    const firstNamespace = memoizeModuleNamespaceFactories({ default: factory });
+    const secondNamespace = memoizeModuleNamespaceFactories({ default: factory });
+
+    const first = await materializeAuthoredModuleExport(firstNamespace.default as () => unknown);
+    const repeated = await materializeAuthoredModuleExport(firstNamespace.default as () => unknown);
+    const second = await materializeAuthoredModuleExport(secondNamespace.default as () => unknown);
+
+    expect(repeated).toBe(first);
+    expect(second).not.toBe(first);
+    expect(factory).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not memoize calls that pass arguments", async () => {
+    const exported = vi.fn((value?: string) => value ?? { instance: Symbol("definition") });
+    const namespace = memoizeModuleNamespaceFactories({ default: exported });
+    const callable = namespace.default as (value?: string) => unknown;
+
+    const first = await materializeAuthoredModuleExport(callable);
+    const repeated = await materializeAuthoredModuleExport(callable);
+
+    expect(repeated).toBe(first);
+    expect(callable("first")).toBe("first");
+    expect(callable("second")).toBe("second");
+    expect(exported).toHaveBeenCalledTimes(3);
+  });
+
   it("loads registered templates with selected dependencies and serialized parameters", async () => {
     const dependencyNamespace = { default: { description: "GitHub connection" } };
     const loadTemplate = vi.fn(async (context: ProgrammaticModuleLoadContext) => ({
@@ -110,6 +140,7 @@ describe("derived programmatic sources", () => {
     const template = registry.templates.get(templateSource.id)!;
     const extensionOwner = {
       kind: "extension" as const,
+      mountId: "extensions/github",
       namespace: "github",
       packageName: "@acme/github",
     };
@@ -174,7 +205,12 @@ describe("derived programmatic sources", () => {
     const dependency = candidate(
       { applyTo: "root", source: dependencySource },
       "extension-package",
-      { kind: "extension", namespace: "example", packageName: "@acme/example" },
+      {
+        kind: "extension",
+        mountId: "extensions/example",
+        namespace: "example",
+        packageName: "@acme/example",
+      },
     );
     const replacement = candidate({ applyTo: "root", source: replacementSource }, "application");
     const derived = instantiateProgrammaticTemplate({

@@ -6,14 +6,10 @@ import type { ContextReader } from "#context/key.js";
 import {
   SessionDynamicSubagentRuntimeRevisionKey,
   SessionDynamicSubagentSelectionsKey,
-  TasksEnabledKey,
   TurnDynamicSubagentSelectionsKey,
   type DurableDynamicSubagentSelection,
 } from "#context/keys.js";
-import {
-  createBackgroundSubagentHarnessDefinition,
-  createHarnessDelegationToolDefinition,
-} from "#execution/delegation-tool.js";
+import { createPreparedWorkflowToolHarnessDefinition } from "#execution/tools/workflow/harness-definition.js";
 import type { HarnessToolDefinition } from "#harness/execute-tool.js";
 import { createLogger } from "#internal/logging.js";
 import type { SessionStartedStreamEvent, UnstampedMessageStreamEvent } from "#protocol/message.js";
@@ -50,20 +46,25 @@ async function resolveSelections(input: {
           name: resolver.name,
           value: result,
         });
+        const effectiveRemoteAgent =
+          resolver.tool === false ? { ...remoteAgent, tool: false as const } : remoteAgent;
         const prepared = createPreparedRuntimeSubagentTool({
-          description: remoteAgent.description,
+          description: effectiveRemoteAgent.description,
           kind: "remote",
           logicalPath: resolver.logicalPath,
           name: resolver.name,
           nodeId: resolver.nodeId,
-          outputSchema: remoteAgent.outputSchema,
-          path: remoteAgent.path,
+          path: effectiveRemoteAgent.path,
           sourceId: resolver.sourceId,
           sourceKind: resolver.sourceKind,
-          url: remoteAgent.url,
+          tool: effectiveRemoteAgent.tool,
+          url: effectiveRemoteAgent.url,
         });
 
-        return [resolver.nodeId, { kind: "remote", prepared, remoteAgent }] as const;
+        return [
+          resolver.nodeId,
+          { kind: "remote", prepared, remoteAgent: effectiveRemoteAgent },
+        ] as const;
       }
 
       const agentConfig = normalizeDynamicSubagentAgentConfig({
@@ -72,19 +73,24 @@ async function resolveSelections(input: {
         value: result,
       });
       const resolvedAgentConfig = await agentConfig;
+      const effectiveAgentConfig =
+        resolver.tool === false
+          ? { ...resolvedAgentConfig, tool: false as const }
+          : resolvedAgentConfig;
       const prepared = createPreparedRuntimeSubagentTool({
-        description: resolvedAgentConfig.description,
+        description: effectiveAgentConfig.description,
         kind: "subagent",
         logicalPath: resolver.logicalPath,
         name: resolver.name,
         nodeId: resolver.nodeId,
         sourceId: resolver.sourceId,
         sourceKind: resolver.sourceKind,
+        tool: effectiveAgentConfig.tool,
       });
 
       return [
         resolver.nodeId,
-        { agentConfig: resolvedAgentConfig, kind: "subagent", prepared },
+        { agentConfig: effectiveAgentConfig, kind: "subagent", prepared },
       ] as const;
     }),
   );
@@ -173,11 +179,11 @@ export function buildDynamicSubagentTools(input: ContextReader): readonly Harnes
       );
     }
     names.add(selection.prepared.name);
-    tools.push(
-      input.get(TasksEnabledKey) === true
-        ? createBackgroundSubagentHarnessDefinition(selection.prepared)
-        : createHarnessDelegationToolDefinition(selection.prepared),
-    );
+    const modelVisible =
+      selection.kind === "subagent"
+        ? selection.agentConfig.tool !== false
+        : selection.remoteAgent.tool !== false;
+    if (modelVisible) tools.push(createPreparedWorkflowToolHarnessDefinition(selection.prepared));
   }
 
   return tools;
@@ -187,11 +193,18 @@ export function getDynamicSubagentSelection(
   input: ContextReader,
   nodeId: string,
 ): Exclude<DurableDynamicSubagentSelection, null> | undefined {
-  const turn = input.get(TurnDynamicSubagentSelectionsKey) ?? {};
-  if (Object.hasOwn(turn, nodeId)) {
-    return turn[nodeId] ?? undefined;
-  }
+  return readDynamicSubagentSelections(input)[nodeId] ?? undefined;
+}
 
-  const session = input.get(SessionDynamicSubagentSelectionsKey) ?? {};
-  return session[nodeId] ?? undefined;
+/**
+ * The dynamic subagents selected for the current turn, by node id. A turn
+ * selection overrides the session's, and `null` withdraws one.
+ */
+export function readDynamicSubagentSelections(
+  input: ContextReader,
+): Readonly<Record<string, DurableDynamicSubagentSelection>> {
+  return {
+    ...input.get(SessionDynamicSubagentSelectionsKey),
+    ...input.get(TurnDynamicSubagentSelectionsKey),
+  };
 }

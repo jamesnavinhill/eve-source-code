@@ -1,7 +1,9 @@
+import { TEST_USAGE } from "#internal/testing/events.js";
 import { describe, expect, it } from "vitest";
 
 import type { ChannelAdapter, ChannelAdapterContext, FetchFileResult } from "#channel/adapter.js";
 import { callAdapterEventHandler, defaultDeliverResult, getAdapterKind } from "#channel/adapter.js";
+import { attachClientContext, readClientContext } from "#internal/client-context.js";
 import { createSessionWaitingEvent } from "#protocol/message.js";
 
 describe("ChannelAdapter (fetchFile field)", () => {
@@ -81,6 +83,18 @@ describe("ChannelAdapter helpers", () => {
     });
   });
 
+  it("defaultDeliverResult forwards ephemeral context separately", () => {
+    const ephemeralContext = ["Client context:\ncurrent page"];
+    const result = defaultDeliverResult(attachClientContext({ message: "hi" }, ephemeralContext));
+
+    expect(result).toMatchObject({
+      inputResponses: undefined,
+      message: "hi",
+      context: undefined,
+    });
+    expect(readClientContext(result)).toEqual(ephemeralContext);
+  });
+
   it("defaultDeliverResult forwards context with inputResponses payloads", () => {
     const context = ["thread background"];
     const inputResponses = [{ requestId: "req-1", text: "yes" }];
@@ -101,7 +115,7 @@ describe("ChannelAdapter helpers", () => {
     expect(defaultDeliverResult({})).toBeUndefined();
   });
 
-  it("publishes a waiting handler's re-keyed channel address", async () => {
+  it("publishes a waiting handler's aliased channel address", async () => {
     let continuationToken = "slack:temporary";
     let observedToken: string | undefined;
     const context: ChannelAdapterContext = {
@@ -113,7 +127,7 @@ describe("ChannelAdapter helpers", () => {
           get token() {
             return continuationToken.slice("slack:".length);
           },
-          rekey(token: string) {
+          alias(token: string) {
             continuationToken = `slack:${token}`;
           },
         },
@@ -124,14 +138,18 @@ describe("ChannelAdapter helpers", () => {
       kind: "slack",
       "session.waiting"(data, ctx) {
         observedToken = data.continuationToken;
-        ctx.session.continuation?.rekey("C1:T1");
+        ctx.session.continuation?.alias("C1:T1");
       },
     };
 
-    const event = await callAdapterEventHandler(adapter, createSessionWaitingEvent(), context);
+    const event = await callAdapterEventHandler(
+      adapter,
+      createSessionWaitingEvent(TEST_USAGE),
+      context,
+    );
 
     expect(event).toEqual({
-      data: { continuationToken: "C1:T1", wait: "next-user-message" },
+      data: { continuationToken: "C1:T1", usage: TEST_USAGE, wait: "next-user-message" },
       type: "session.waiting",
     });
     expect(observedToken).toBe("temporary");
@@ -150,12 +168,12 @@ describe("ChannelAdapter helpers", () => {
 
     const event = await callAdapterEventHandler(
       { kind: "http" },
-      createSessionWaitingEvent(),
+      createSessionWaitingEvent(TEST_USAGE),
       context,
     );
 
     expect(event).toEqual({
-      data: { continuationToken: "session-1", wait: "next-user-message" },
+      data: { continuationToken: "session-1", usage: TEST_USAGE, wait: "next-user-message" },
       type: "session.waiting",
     });
   });

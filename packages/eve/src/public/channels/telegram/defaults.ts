@@ -1,9 +1,17 @@
 import type { SessionAuthContext } from "#channel/types.js";
 
-import { extractErrorId, formatErrorHint } from "#internal/logging.js";
+import { createLogger, extractErrorId, formatErrorHint } from "#internal/logging.js";
+import {
+  formatTelegramAuthorizationDisplayName,
+  renderTelegramAuthorizationCompleted,
+  renderTelegramAuthorizationPrompt,
+  renderTelegramAuthorizationStatus,
+} from "#public/channels/telegram/authorization.js";
 import {
   registerTelegramFreeformPrompt,
+  registerTelegramHitlPrompt,
   renderTelegramInputRequest,
+  takeTelegramResolvedPrompt,
 } from "#public/channels/telegram/hitl.js";
 import type { TelegramMessage } from "#public/channels/telegram/inbound.js";
 import type {
@@ -12,8 +20,15 @@ import type {
   TelegramInboundResult,
 } from "#public/channels/telegram/telegramChannel.js";
 
-/** Default auth projection for Telegram webhook actors. */
-export function defaultTelegramAuth(message: TelegramMessage): SessionAuthContext | null {
+const log = createLogger("telegram.defaults");
+
+/**
+ * Default auth projection for Telegram webhook actors. A button press passes
+ * the message it was on with the presser as `from`.
+ */
+export function defaultTelegramAuth(
+  message: Pick<TelegramMessage, "chat" | "from" | "messageId" | "messageThreadId">,
+): SessionAuthContext | null {
   const user = message.from;
   if (!user) return null;
 
@@ -53,16 +68,91 @@ export async function defaultOnMessage(
   return { auth: defaultTelegramAuth(message) };
 }
 
+export function isTelegramBotMentioned(
+  message: Pick<TelegramMessage, "caption" | "text">,
+  botUsername: string | undefined,
+): boolean {
+  if (botUsername === undefined) return false;
+  const text = message.text || message.caption;
+  if (isTargetedBotCommand(text, botUsername)) return true;
+  const escapedUsername = botUsername.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(`(?:^|[^A-Za-z0-9_])@${escapedUsername}(?=$|[^A-Za-z0-9_])`, "iu").test(text);
+}
+
 /** Built-in Telegram event handlers for typing, replies, HITL, and terminal errors. */
 export const defaultEvents: TelegramChannelEvents = {
   async "turn.started"(_event, channel, _ctx) {
     await channel.telegram.startTyping();
   },
 
+  async "authorization.required"(event, channel, _ctx) {
+    if (event.candidateId !== undefined) return;
+
+    const displayName = formatTelegramAuthorizationDisplayName(
+      event.name,
+      event.authorization?.displayName,
+    );
+    const isPrivate = channel.telegram.chatType === "private";
+    const pending = channel.state.pendingAuthMessageIds ?? {};
+
+    if (isPrivate) {
+      try {
+        const posted = await channel.telegram.post(renderTelegramAuthorizationPrompt(event));
+        if (posted.id) {
+          channel.state.pendingAuthMessageIds = { ...pending, [event.name]: posted.id };
+        }
+      } catch (error) {
+        log.error("Telegram authorization prompt delivery failed", { error, name: event.name });
+      }
+      return;
+    }
+
+    if (pending[event.name] === undefined) {
+      try {
+        const posted = await channel.telegram.post(
+          renderTelegramAuthorizationStatus({
+            displayName,
+            requesterUserId: channel.state.triggeringUserId,
+          }),
+        );
+        if (posted.id) {
+          channel.state.pendingAuthMessageIds = { ...pending, [event.name]: posted.id };
+        }
+      } catch (error) {
+        log.error("Telegram authorization status delivery failed", { error, name: event.name });
+      }
+    }
+  },
+
   async "authorization.completed"(event, channel, _ctx) {
-    if (event.outcome === "authorized") {
+    if (event.outcome === "authorized" && event.candidateId === undefined) {
       await channel.telegram.startTyping();
     }
+    if (event.candidateId !== undefined) return;
+
+    const pending = channel.state.pendingAuthMessageIds ?? {};
+    const messageId = pending[event.name];
+    if (messageId === undefined) return;
+    const displayName = formatTelegramAuthorizationDisplayName(
+      event.name,
+      event.authorization?.displayName,
+    );
+    try {
+      await channel.telegram.editMessageText({
+        messageId,
+        replyMarkup: { inline_keyboard: [] },
+        text: renderTelegramAuthorizationCompleted({
+          displayName,
+          outcome: event.outcome,
+          reason: event.reason,
+        }),
+      });
+    } catch (error) {
+      log.error("Telegram authorization status edit failed", { error, name: event.name });
+    }
+    const next = { ...pending };
+    delete next[event.name];
+    channel.state.pendingAuthMessageIds = next;
   },
 
   async "actions.requested"(_event, channel, _ctx) {
@@ -76,10 +166,35 @@ export const defaultEvents: TelegramChannelEvents = {
         reply_markup: rendered.replyMarkup,
         text: rendered.text,
       });
-      if (rendered.freeformRequestId !== undefined && posted.id) {
+      if (!posted.id) continue;
+      if (rendered.freeformRequestId !== undefined) {
         registerTelegramFreeformPrompt(channel.state, {
           messageId: posted.id,
           requestId: rendered.freeformRequestId,
+        });
+      } else {
+        registerTelegramHitlPrompt(channel.state, request, {
+          messageId: posted.id,
+          text: rendered.text,
+        });
+      }
+    }
+  },
+
+  // Covers every way a prompt ends: a press, a typed answer, or a withdrawal.
+  async "input.resolved"(event, channel, _ctx) {
+    for (const resolution of event.resolutions) {
+      const edit = takeTelegramResolvedPrompt(channel.state, resolution);
+      if (edit === undefined) continue;
+      try {
+        await channel.telegram.editMessageText({
+          ...edit,
+          replyMarkup: { inline_keyboard: [] },
+        });
+      } catch (error) {
+        log.warn("Telegram answered prompt edit failed", {
+          error,
+          requestId: resolution.requestId,
         });
       }
     }
@@ -132,7 +247,7 @@ function shouldDispatchTelegramMessage(
   if (message.replyToMessage?.from?.isBot === true) return true;
 
   if (isBotCommand(text, botUsername)) return true;
-  if (botUsername !== undefined && mentionsBot(text, botUsername)) return true;
+  if (botUsername !== undefined && mentionsBotUsername(text, botUsername)) return true;
 
   return false;
 }
@@ -145,6 +260,11 @@ function isBotCommand(text: string, botUsername: string | undefined): boolean {
   return botUsername !== undefined && target.toLowerCase() === botUsername.toLowerCase();
 }
 
-function mentionsBot(text: string, botUsername: string): boolean {
+function isTargetedBotCommand(text: string, botUsername: string): boolean {
+  const match = /^\/[A-Za-z0-9_]+@(?<target>[A-Za-z0-9_]+)(?:\s|$)/u.exec(text);
+  return match?.groups?.target?.toLowerCase() === botUsername.toLowerCase();
+}
+
+function mentionsBotUsername(text: string, botUsername: string): boolean {
   return text.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
 }

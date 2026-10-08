@@ -7,11 +7,16 @@ import {
   getDynamicSubagentSelection,
   refreshDynamicSessionSubagentsForRuntimeRevision,
 } from "#context/dynamic-subagent-lifecycle.js";
-import { SessionDynamicSubagentRuntimeRevisionKey, SessionIdKey } from "#context/keys.js";
+import {
+  StaticModelReferenceKey,
+  SessionDynamicSubagentRuntimeRevisionKey,
+  SessionIdKey,
+} from "#context/keys.js";
 import { defineAgent } from "#public/definitions/agent.js";
 import { defineRemoteAgent } from "#public/definitions/remote-agent.js";
 import { createSessionStartedEvent, createTurnStartedEvent } from "#protocol/message.js";
 import type { ResolvedDynamicSubagentResolver } from "#runtime/subagents/registry.js";
+import { captureLogRecords } from "#internal/testing/log-records.js";
 
 describe("dynamic subagent lifecycle", () => {
   it("omits a subagent when its resolver returns null", async () => {
@@ -27,6 +32,28 @@ describe("dynamic subagent lifecycle", () => {
 
     expect(buildDynamicSubagentTools(ctx)).toEqual([]);
     expect(getDynamicSubagentSelection(ctx, resolver.nodeId)).toBeUndefined();
+  });
+
+  it("exposes the active agent model to a resolver", async () => {
+    const ctx = createContext();
+    const created = createResolver();
+    const handler = vi.fn((_model: { readonly id: string }) => created.agentConfig);
+    const resolver: ResolvedDynamicSubagentResolver = {
+      ...created.resolver,
+      events: {
+        "session.started": (_event, resolveCtx) =>
+          handler((resolveCtx as { model: { id: string } }).model),
+      },
+    };
+
+    await dispatchDynamicSubagentEvent({
+      ctx,
+      event: createSessionStartedEvent(),
+      messages: [],
+      resolvers: [resolver],
+    });
+
+    expect(handler).toHaveBeenCalledWith({ id: "openai/gpt-root" });
   });
 
   it("exposes a subagent with the returned agent config", async () => {
@@ -46,15 +73,57 @@ describe("dynamic subagent lifecycle", () => {
 
     expect(buildDynamicSubagentTools(ctx)).toMatchObject([
       {
-        description: "Research the request.",
+        description: expect.stringContaining("Research the request."),
         name: "researcher",
-        runtimeAction: {
-          kind: "subagent-call",
-          nodeId: "subagents/researcher",
-          subagentName: "researcher",
-        },
       },
     ]);
+    expect(getDynamicSubagentSelection(ctx, resolver.nodeId)).toBeDefined();
+  });
+
+  it("keeps a tool-disabled dynamic subagent available without advertising it", async () => {
+    const ctx = createContext();
+    const created = createResolver();
+    const resolver: ResolvedDynamicSubagentResolver = {
+      ...created.resolver,
+      events: {
+        "session.started": () =>
+          defineAgent({
+            description: "Route internally.",
+            model: "openai/gpt-5.5",
+            modelContextWindowTokens: 200_000,
+            tool: false,
+          }),
+      },
+    };
+
+    await dispatchDynamicSubagentEvent({
+      ctx,
+      event: createSessionStartedEvent(),
+      messages: [],
+      resolvers: [resolver],
+    });
+
+    expect(buildDynamicSubagentTools(ctx)).toEqual([]);
+    expect(getDynamicSubagentSelection(ctx, resolver.nodeId)).toBeDefined();
+  });
+
+  it("applies a same-named disabled tool to a dynamic subagent", async () => {
+    const ctx = createContext();
+    const created = createResolver();
+    const resolver: ResolvedDynamicSubagentResolver = {
+      ...created.resolver,
+      events: { "session.started": () => created.agentConfig },
+      tool: false,
+    };
+
+    await dispatchDynamicSubagentEvent({
+      ctx,
+      event: createSessionStartedEvent(),
+      messages: [],
+      resolvers: [resolver],
+    });
+
+    expect(buildDynamicSubagentTools(ctx)).toEqual([]);
     expect(getDynamicSubagentSelection(ctx, resolver.nodeId)).toBeDefined();
   });
 
@@ -87,6 +156,74 @@ describe("dynamic subagent lifecycle", () => {
     });
     expect(buildDynamicSubagentTools(ctx)).toEqual([]);
     expect(getDynamicSubagentSelection(ctx, resolver.nodeId)).toBeUndefined();
+  });
+
+  it("runs every dynamic local and remote selection as a workflow tool", async () => {
+    const ctx = createContext();
+    const created = createResolver({ eventNames: ["session.started", "turn.started"] });
+    const resolver: ResolvedDynamicSubagentResolver = {
+      ...created.resolver,
+      events: {
+        "session.started": () =>
+          defineAgent({
+            description: "Research the request.",
+            model: "openai/gpt-5.5",
+            modelContextWindowTokens: 200_000,
+          }),
+        "turn.started": () =>
+          defineRemoteAgent({
+            description: "Review remotely.",
+            url: "https://review.example.com",
+          }),
+      },
+    };
+
+    await dispatchDynamicSubagentEvent({
+      ctx,
+      event: createSessionStartedEvent(),
+      messages: [],
+      resolvers: [resolver],
+    });
+    expect(buildDynamicSubagentTools(ctx)[0]?.workflowId).toBe(
+      "workflow//eve//agentToolServeWorkflow",
+    );
+
+    await dispatchDynamicSubagentEvent({
+      ctx,
+      event: createTurnStartedEvent({ sequence: 0, turnId: "turn-1" }),
+      messages: [],
+      resolvers: [resolver],
+    });
+    expect(buildDynamicSubagentTools(ctx)[0]?.workflowId).toBe(
+      "workflow//eve//agentToolServeWorkflow",
+    );
+  });
+
+  it("exposes a dynamic selection without root configuration", async () => {
+    const ctx = createContext();
+    const created = createResolver();
+    const resolver: ResolvedDynamicSubagentResolver = {
+      ...created.resolver,
+      events: {
+        "session.started": () =>
+          defineAgent({
+            description: "Research the request.",
+            model: "openai/gpt-5.5",
+            modelContextWindowTokens: 200_000,
+          }),
+      },
+    };
+
+    await dispatchDynamicSubagentEvent({
+      ctx,
+      event: createSessionStartedEvent(),
+      messages: [],
+      resolvers: [resolver],
+    });
+
+    expect(buildDynamicSubagentTools(ctx)[0]?.workflowId).toBe(
+      "workflow//eve//agentToolServeWorkflow",
+    );
   });
 
   it("lets a turn-scoped agent config switch the subagent model", async () => {
@@ -138,6 +275,27 @@ describe("dynamic subagent lifecycle", () => {
     });
   });
 
+  it("runs dynamic local selections as workflow tools", async () => {
+    const ctx = createContext();
+    const selected = defineAgent({
+      description: "Research the request.",
+      model: "openai/gpt-5.5",
+      modelContextWindowTokens: 200_000,
+    });
+    const created = createResolver({ handler: () => selected });
+
+    await dispatchDynamicSubagentEvent({
+      ctx,
+      event: createSessionStartedEvent(),
+      messages: [],
+      resolvers: [created.resolver],
+    });
+
+    expect(buildDynamicSubagentTools(ctx)[0]?.workflowId).toBe(
+      "workflow//eve//agentToolServeWorkflow",
+    );
+  });
+
   it("exposes a remote subagent with the returned remote config", async () => {
     const ctx = createContext();
     const created = createResolver();
@@ -148,7 +306,6 @@ describe("dynamic subagent lifecycle", () => {
       description: "Research on the remote deployment.",
       forwardPrincipal: true,
       headers,
-      outputSchema: { properties: { answer: { type: "string" } }, type: "object" },
       url: async () => "https://research.example.com",
     });
     const credentialsFactory = Object.assign(
@@ -174,20 +331,15 @@ describe("dynamic subagent lifecycle", () => {
 
     expect(buildDynamicSubagentTools(ctx)).toMatchObject([
       {
-        description: "Research on the remote deployment.",
+        description: expect.stringContaining("Research on the remote deployment."),
         name: "researcher",
-        runtimeAction: {
-          kind: "remote-agent-call",
-          nodeId: "subagents/researcher",
-          remoteAgentName: "researcher",
-        },
       },
     ]);
     expect(getDynamicSubagentSelection(ctx, resolver.nodeId)).toMatchObject({
       kind: "remote",
       prepared: {
         inputSchema: {
-          properties: { agentId: expect.any(Object) },
+          properties: { message: expect.any(Object) },
         },
       },
       remoteAgent: {
@@ -204,7 +356,51 @@ describe("dynamic subagent lifecycle", () => {
     );
   });
 
+  it("keeps a tool-disabled dynamic remote subagent available without advertising it", async () => {
+    const ctx = createContext();
+    const remoteAgent = defineRemoteAgent({
+      description: "Route remotely.",
+      tool: false,
+      url: "https://research.example.com",
+    });
+    const created = createResolver({ handler: () => remoteAgent });
+
+    await dispatchDynamicSubagentEvent({
+      ctx,
+      event: createSessionStartedEvent(),
+      messages: [],
+      resolvers: [created.resolver],
+    });
+
+    expect(buildDynamicSubagentTools(ctx)).toEqual([]);
+    expect(getDynamicSubagentSelection(ctx, created.resolver.nodeId)).toMatchObject({
+      kind: "remote",
+      remoteAgent: { tool: false },
+    });
+  });
+
+  it("runs dynamic remote selections as workflow tools", async () => {
+    const ctx = createContext();
+    const remoteAgent = defineRemoteAgent({
+      description: "Research on the remote deployment.",
+      url: "https://research.example.com",
+    });
+    const created = createResolver({ handler: () => remoteAgent });
+
+    await dispatchDynamicSubagentEvent({
+      ctx,
+      event: createSessionStartedEvent(),
+      messages: [],
+      resolvers: [created.resolver],
+    });
+
+    expect(buildDynamicSubagentTools(ctx)[0]?.workflowId).toBe(
+      "workflow//eve//agentToolServeWorkflow",
+    );
+  });
+
   it("omits an invalid non-null result", async () => {
+    const logs = captureLogRecords();
     const ctx = createContext();
     const { resolver } = createResolver({
       handler: () => false,
@@ -218,6 +414,12 @@ describe("dynamic subagent lifecycle", () => {
     });
 
     expect(buildDynamicSubagentTools(ctx)).toEqual([]);
+    expect(logs.records).toContainEqual(
+      expect.objectContaining({
+        level: "error",
+        message: "Dynamic subagent resolver (session.started) threw — omitting subagent.",
+      }),
+    );
   });
 
   it("refreshes session availability once per runtime revision", async () => {
@@ -252,6 +454,7 @@ describe("dynamic subagent lifecycle", () => {
 
 function createContext(): ContextContainer {
   const ctx = new ContextContainer();
+  ctx.set(StaticModelReferenceKey, { id: "openai/gpt-root" });
   ctx.set(SessionIdKey, "session-1");
   return ctx;
 }

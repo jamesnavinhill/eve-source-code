@@ -47,6 +47,7 @@ export function createTestAgentInfoResult(
     instructions: { dynamic: [], static: [] },
     kernelEffects: [],
     kind: "eve-agent-info",
+    memories: [],
     mode: "development",
     remoteAgents: { entries: [], total: 0 },
     sandbox: {
@@ -59,10 +60,10 @@ export function createTestAgentInfoResult(
         logicalPath: "sandbox.ts",
         owner,
       },
-      hasBootstrap: false,
-      hasOnSession: false,
+      environmentExportName: "environment",
       logicalPath: "sandbox.ts",
       owner,
+      revisionHash: "sandbox-revision",
       sourceId: "sandbox.ts",
       sourceKind: "module",
     },
@@ -70,8 +71,7 @@ export function createTestAgentInfoResult(
     skills: { dynamic: [], static: [] },
     subagents: { local: [], total: 0 },
     tools: { dynamic: [], static: [] },
-    version: 3,
-    workflow: { enabled: false, toolName: "Workflow" },
+    version: 5,
     workspace: { resourceRoot: null, rootEntries: [] },
   };
 }

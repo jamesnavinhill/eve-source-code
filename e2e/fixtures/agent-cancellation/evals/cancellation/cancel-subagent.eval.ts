@@ -2,21 +2,22 @@ import { defineEval } from "eve/evals";
 import { satisfies } from "eve/evals/expect";
 
 export default defineEval({
-  tags: ["real-model"],
-  description: "Cancel a parent turn and cascade cancellation to its local sleeper subagent.",
+  description:
+    "Cancel a parent turn and cascade cancellation to the local sleeper session its workflow run opened.",
   timeoutMs: 240_000,
 
   async test(t) {
+    const session = await t.session();
     // Explicit directive phrasing keeps the delegation deterministic so a
     // scripted mock responder can drive this eval in the world suites.
-    const parent = await t.start(
-      "Use the sleeper subagent exactly once with message 'Call the wait-for-cancellation tool exactly once and wait until this delegated turn is cancelled.'",
+    const parent = await session.start(
+      "Use the workflow tool exactly once to call the sleeper subagent with message 'Call the wait-for-cancellation tool exactly once and wait until this delegated turn is cancelled.' Return the sleeper result.",
     );
-    const called = await parent.waitForEvent("subagent.called", {
+    const started = await parent.waitForEvent("agent.started", {
       data: { name: "sleeper" },
     });
 
-    const child = t.target.watchTurn(called.data.childSessionId);
+    const child = t.target.watchTurn(started.data.sessionId);
     await child.waitForEvent("actions.requested", {
       data: {
         actions: (actions) =>
@@ -43,27 +44,17 @@ export default defineEval({
 
     parentTurn.event("turn.cancelled", { count: 1 });
     parentTurn.eventOrder([{ type: "turn.cancelled" }, { type: "session.waiting" }]);
-    parentTurn.notEvent("subagent.completed");
     parentTurn.notEvent("turn.failed");
     parentTurn.notEvent("session.failed");
 
-    const followUp = await t.send("Reply with exactly CANCELLATION-SUBAGENT-FOLLOW-UP-OK.");
+    const followUp = await session.send("Reply with exactly CANCELLATION-SUBAGENT-FOLLOW-UP-OK.");
     followUp.expectOk();
     followUp.notEvent("turn.cancelled");
     followUp.messageIncludes(/CANCELLATION-SUBAGENT-FOLLOW-UP-OK/i);
 
-    // The cancelled child must survive in the parent's model-visible
-    // [Agents] listing as a parked "(cancelled)" handle. A handle leaked as
-    // `running` never re-enters the listing, so this catches the abandoned
-    // cancelled batch regressing to a permanent leak.
-    const listing = await t.send(
-      "Look at the [Agents] listing in your context and reply with the sleeper agent's entry verbatim, including its status.",
-    );
-    listing.expectOk();
-    listing.notEvent("turn.cancelled");
-    listing.messageIncludes(/sleeper/i);
-    listing.messageIncludes(/\(cancelled\)/);
-
+    // The eval watches both the parent and the sleeper session; each one's turn is cancelled once.
     t.event("turn.cancelled", { count: 2 });
+    t.event("agent.started", { count: 1, data: { name: "sleeper" } });
+    t.event("task.settled", { count: 1, data: { status: "cancelled" } });
   },
 });

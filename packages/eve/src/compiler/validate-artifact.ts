@@ -8,7 +8,7 @@ import type {
 import { ROOT_COMPILED_AGENT_NODE_ID } from "#compiler/manifest.js";
 import type { CompiledModuleBinding } from "#compiler/source-graph.js";
 import type { CompiledModuleMap } from "#compiler/module-map.js";
-import { collectModuleBindingsForManifest } from "#compiler/module-map.js";
+import { collectRuntimeModuleBindingsForManifest } from "#compiler/module-map.js";
 import { HOST_HTTP_INVENTORY } from "#framework/host-inventory.js";
 
 type CompiledNode = CompiledAgentNodeManifest | CompiledAgentResources;
@@ -89,14 +89,16 @@ export function validateCompiledModuleMap(
   const expected = new Map<string, Set<string>>([
     [
       "__root__",
-      new Set(collectModuleBindingsForManifest(manifest).map((binding) => binding.sourceId)),
+      new Set(collectRuntimeModuleBindingsForManifest(manifest).map((binding) => binding.sourceId)),
     ],
     ...manifest.subagents.map(
       (subagent) =>
         [
           subagent.nodeId,
           new Set(
-            collectModuleBindingsForManifest(subagent.agent).map((binding) => binding.sourceId),
+            collectRuntimeModuleBindingsForManifest(subagent.agent).map(
+              (binding) => binding.sourceId,
+            ),
           ),
         ] as const,
     ),
@@ -165,12 +167,30 @@ export function validateCompiledAgentResources(
     "connection name",
   );
   validateUniqueIdentities(
+    node.dynamicConnections.map((entry) => ({
+      identity: entry.slug,
+      kind: "dynamic connection",
+    })),
+    "dynamic connection slug",
+  );
+  validateUniqueIdentities(
     node.hooks.map((entry) => ({ identity: entry.slug, kind: "hook" })),
     "hook slug",
   );
   validateUniqueIdentities(
+    node.memories.map((entry) => ({ identity: entry.slot, kind: "memory" })),
+    "memory slot",
+  );
+  validateUniqueIdentities(
     node.schedules.map((entry) => ({ identity: entry.name, kind: "schedule" })),
     "schedule name",
+  );
+  validateUniqueIdentities(
+    node.scheduleCollections.map((entry) => ({
+      identity: entry.name,
+      kind: "schedule collection",
+    })),
+    "schedule collection name",
   );
   const referencedModuleSources = collectReferencedModuleSources(node);
   for (const source of options.additionalModuleSources ?? []) {
@@ -228,6 +248,9 @@ export function validateCompiledAgentResources(
 }
 
 function validateSubagentRecord(subagent: CompiledSubagentNode): void {
+  if (subagent.name === "agent") {
+    fail('subagent name "agent" is reserved for the built-in root-copy target');
+  }
   if (subagent.backing.kind !== "resource" || subagent.backing.sourcePath.length === 0) {
     fail(`subagent "${subagent.nodeId}" has no physical resource backing`);
   }
@@ -246,6 +269,9 @@ function validateBinding(
   logicalPath: string,
   binding: CompiledModuleBinding,
 ): void {
+  if (!binding.usage.compile && !binding.usage.runtimeEntry) {
+    fail(`compiled binding "${sourceId}" has no compile or runtime usage`);
+  }
   if (binding.logicalPath !== logicalPath) {
     fail(`compiled binding "${sourceId}" targets "${binding.logicalPath}", not "${logicalPath}"`);
   }
@@ -283,6 +309,14 @@ function validateProgrammaticBindingDependencies(
             `programmatic binding "${sourceId}" depends on missing binding "${dependencySourceId}"`,
           );
         }
+        if (
+          binding.usage.runtimeEntry &&
+          bindings[dependencySourceId]?.usage.runtimeEntry !== true
+        ) {
+          fail(
+            `runtime binding "${sourceId}" depends on non-runtime binding "${dependencySourceId}"`,
+          );
+        }
         visit(dependencySourceId);
       }
     }
@@ -313,16 +347,17 @@ function collectReferencedModuleSources(
     if (route.source.backing.kind !== "resource") add(route.source);
   }
   for (const value of node.connections) add(value);
+  for (const value of node.dynamicConnections) add(value);
   for (const value of node.tools) add(value);
   for (const value of node.dynamicInstructions) add(value);
   for (const value of node.dynamicSkills) add(value);
   for (const value of node.dynamicTools) add(value);
   for (const value of node.hooks) add(value);
+  for (const value of node.memories) add(value);
   for (const value of node.instructions) if (value.sourceKind === "module") add(value);
-  if (node.instrumentation !== undefined) add(node.instrumentation);
-  if (node.workflowTool !== undefined) add(node.workflowTool);
   for (const value of node.skills) if (value.sourceKind === "module") add(value);
   for (const value of node.schedules) if (value.sourceKind === "module") add(value);
+  for (const value of node.scheduleCollections) add(value);
   add(node.sandbox);
   for (const mount of node.extensionMounts) {
     add({ logicalPath: mount.mountLogicalPath, sourceId: mount.mountSourceId });

@@ -6,9 +6,11 @@ import {
   withAnswers,
   withPolicy,
 } from "#setup/ask.js";
+import { WEB_CHAT_TEAM_REQUIREMENT } from "#setup/integrations/web/auth-options.js";
 import { ensureVercelProject } from "#setup/flows/ensure-vercel-project.js";
+import { resolveEveProjectContext } from "#internal/project-context.js";
 import { createHeadlessPrompter } from "#setup/headless.js";
-import { SetupPrerequisiteRequired } from "#setup/integrations/shared/prerequisite.js";
+import { setupPrerequisiteOf } from "#setup/integrations/shared/prerequisite.js";
 import { createPrompter, type Prompter } from "#setup/prompter.js";
 import { createRegistrySetupClient, type SetupProcess } from "#setup/registry-setup-client.js";
 import {
@@ -22,6 +24,7 @@ import { serializeHeadlessSetupEvent } from "./setup-headless.js";
 
 export interface IntegrationSetupOptions {
   yes?: boolean;
+  force?: boolean;
   nonInteractive?: boolean;
   answers?: Record<string, unknown>;
   signal?: AbortSignal;
@@ -49,6 +52,7 @@ export async function runIntegrationSetupCommand(
   });
   try {
     const nonInteractive = options.nonInteractive === true;
+    const projectRoot = (await resolveEveProjectContext(appRoot)).environmentRoot;
     const prompter =
       client?.prompter ??
       dependencies.createPrompter?.() ??
@@ -60,13 +64,16 @@ export async function runIntegrationSetupCommand(
       kind,
       {
         appRoot,
+        projectRoot,
         prompter,
         asker,
+        force: options.force,
         resolveVercelProject: nonInteractive
           ? undefined
           : () =>
               ensureVercelProject({
-                appRoot,
+                appRoot: projectRoot,
+                teamRequirement: kind === "web" ? WEB_CHAT_TEAM_REQUIREMENT : undefined,
                 prompter,
                 signal: client?.signal ?? options.signal,
               }),
@@ -114,6 +121,7 @@ export async function runIntegrationSetupCommand(
   } catch (error) {
     client?.fail(error);
     if (client !== undefined) return;
+    const prerequisite = setupPrerequisiteOf(error);
     if (options.nonInteractive && error instanceof InteractionRequired) {
       logger.error(
         serializeHeadlessSetupEvent({
@@ -135,13 +143,13 @@ export async function runIntegrationSetupCommand(
         }),
       );
       process.exitCode = 2;
-    } else if (options.nonInteractive && error instanceof SetupPrerequisiteRequired) {
+    } else if (options.nonInteractive && prerequisite !== undefined) {
       logger.error(
         serializeHeadlessSetupEvent({
           version: 1,
           type: "blocked",
           status: "prerequisite_required",
-          prerequisite: error.prerequisite,
+          prerequisite,
         }),
       );
       process.exitCode = 2;

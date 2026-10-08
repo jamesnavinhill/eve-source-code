@@ -17,25 +17,29 @@ function resolveSlackInboundMrkdwnUnsafe(text: string, raw: Record<string, unkno
   if (!trimmedText) return extracted;
   if (!extracted) return text;
 
-  if (normalizeComparableText(extracted) === normalizeComparableText(trimmedText)) {
-    return text;
-  }
-
-  const normalizedExtracted = normalizeComparableText(extracted);
   const normalizedTrimmed = normalizeComparableText(trimmedText);
+  const normalizedExtracted = normalizeComparableText(extracted);
+  if (normalizedExtracted === normalizedTrimmed) return text;
+
+  const attachmentText = extractLegacyAttachmentLines(raw.attachments).join("\n").trim();
+  if (attachmentText) {
+    const blockText = extractBlockKitLines(raw.blocks).join("\n").trim();
+    const content = [
+      text,
+      ...(blockText && !normalizedTrimmed.includes(normalizeComparableText(blockText))
+        ? [blockText]
+        : []),
+      ...(!normalizedTrimmed.includes(normalizeComparableText(attachmentText))
+        ? [attachmentText]
+        : []),
+    ];
+    return content.join("\n");
+  }
 
   if (extracted.length > trimmedText.length && normalizedExtracted.includes(normalizedTrimmed)) {
     return extracted;
   }
-
-  if (extracted.length >= trimmedText.length * 2) {
-    const hasLegacyAttachments = Array.isArray(raw.attachments) && raw.attachments.length > 0;
-    if (hasLegacyAttachments && !normalizedExtracted.includes(normalizedTrimmed)) {
-      return `${text}\n${extracted}`;
-    }
-    return extracted;
-  }
-
+  if (extracted.length >= trimmedText.length * 2) return extracted;
   return text;
 }
 
@@ -140,6 +144,7 @@ function extractLegacyAttachmentLines(legacyAttachments: unknown): string[] {
       lines.push(attachment.footer);
     }
     lines.push(...extractBlockKitLines(attachment.blocks));
+    lines.push(...extractSlackMessageUnfurlLines(attachment.message_blocks));
     // Fallback is per-attachment and only when this attachment has no other
     // visible fields; nested blocks count, and earlier attachments must not
     // suppress a later fallback.
@@ -149,6 +154,27 @@ function extractLegacyAttachmentLines(legacyAttachments: unknown): string[] {
       attachment.fallback.length > 0
     ) {
       lines.push(attachment.fallback);
+    }
+  }
+
+  return lines;
+}
+
+function extractSlackMessageUnfurlLines(messageBlocks: unknown): string[] {
+  if (!Array.isArray(messageBlocks)) return [];
+
+  const lines: string[] = [];
+  for (const messageBlock of messageBlocks) {
+    if (!isObject(messageBlock) || !isObject(messageBlock.message)) continue;
+
+    const blockLines = extractBlockKitLines(messageBlock.message.blocks);
+    if (blockLines.length > 0) {
+      lines.push(...blockLines);
+    } else if (
+      typeof messageBlock.message.text === "string" &&
+      messageBlock.message.text.length > 0
+    ) {
+      lines.push(messageBlock.message.text);
     }
   }
 
@@ -336,7 +362,10 @@ export function readSlackTextObject(textObject: unknown): string {
 }
 
 function normalizeComparableText(input: string): string {
-  return input.replace(/\s+/gu, " ").trim();
+  return input
+    .replace(/<(https?:\/\/[^|>]+)>/gu, "$1")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
 function formatInboundRichTextLink(url: string, label: string): string {

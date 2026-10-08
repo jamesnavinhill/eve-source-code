@@ -15,7 +15,7 @@ import {
   resolveModelEndpointStatus,
 } from "#internal/resolve-model-endpoint-status.js";
 import type { ChatGptAuthState } from "#public/models/openai/chatgpt/token-broker.js";
-import { WORKFLOW_TOOL_NAME } from "#shared/workflow-sandbox.js";
+import type { JsonObject } from "#shared/json.js";
 
 export type AgentInfoResponse = AgentInfoResult;
 
@@ -28,7 +28,7 @@ function toChatGptEndpoint(state: ChatGptAuthState | undefined) {
   return endpoint;
 }
 
-/** Projects v3 exclusively from the effective compiled graph. */
+/** Projects v4 exclusively from the effective compiled graph. */
 export function buildAgentInfoResponse(
   data: AgentInfoManifestData,
   input: {
@@ -61,7 +61,7 @@ export function buildAgentInfoResponse(
                 toChatGptEndpoint(input.chatgptAuth),
               ),
               id: manifest.config.model.id,
-              providerOptions: manifest.config.model.providerOptions,
+              providerOptions: projectProviderOptionsForInfo(manifest.config.model.providerOptions),
               reasoning: manifest.config.reasoning,
               routing: manifest.config.model.routing,
               source:
@@ -81,7 +81,6 @@ export function buildAgentInfoResponse(
             },
       name: manifest.config.name,
       nodeId: ROOT_COMPILED_AGENT_NODE_ID,
-      outputSchema: manifest.config.outputSchema,
     },
     capabilities: { devRoutes: input.mode === "development" },
     channels: {
@@ -125,12 +124,14 @@ export function buildAgentInfoResponse(
         role: definition.role,
       })),
     },
-    instrumentation:
-      manifest.instrumentation === undefined
-        ? undefined
-        : toModuleSource(manifest, manifest.instrumentation),
     kernelEffects: projectPreparedKernelEffects(manifest),
     kind: "eve-agent-info",
+    memories: manifest.memories.map((memory) => ({
+      ...toModuleSource(manifest, memory),
+      description: memory.description,
+      slot: memory.slot,
+      visibility: memory.visibility,
+    })),
     mode: input.mode,
     remoteAgents: {
       entries: remoteAgents,
@@ -138,12 +139,9 @@ export function buildAgentInfoResponse(
     },
     sandbox: {
       ...toModuleSource(manifest, manifest.sandbox),
-      backendKind: manifest.sandbox.backendName,
-      description: manifest.sandbox.description,
-      hasBootstrap: false,
-      hasOnSession: false,
-      revalidationKey: manifest.sandbox.revalidationKey,
-      sourceHash: manifest.sandbox.sourceHash,
+      provider: manifest.sandbox.providerName,
+      environmentExportName: manifest.sandbox.environmentExportName,
+      revisionHash: manifest.sandbox.revisionHash,
     },
     schedules: manifest.schedules.map((schedule) => ({
       ...toOwnedSource(manifest, schedule),
@@ -201,20 +199,20 @@ export function buildAgentInfoResponse(
         requiresApproval: tool.requiresApproval,
       })),
     },
-    version: 3,
-    workflow:
-      manifest.workflowTool === undefined
-        ? { enabled: false, toolName: WORKFLOW_TOOL_NAME }
-        : {
-            enabled: true,
-            source: toModuleSource(manifest, manifest.workflowTool),
-            toolName: WORKFLOW_TOOL_NAME,
-          },
+    version: 5,
     workspace: {
       resourceRoot: manifest.workspaceResourceRoot,
       rootEntries: [...manifest.workspaceResourceRoot.rootEntries],
     },
   };
+}
+
+/** Only the literal priority tier is needed by the dev TUI; other options may contain secrets. */
+function projectProviderOptionsForInfo(
+  providerOptions: Record<string, JsonObject> | undefined,
+): Record<string, JsonObject> | undefined {
+  if (providerOptions?.gateway?.serviceTier !== "priority") return undefined;
+  return { gateway: { serviceTier: "priority" } };
 }
 
 function toModuleSource(
@@ -267,10 +265,18 @@ function sourceProjection(
     sourceId: source.sourceId,
     sourceKind: toAgentInfoSourceKind(source.sourceKind),
   };
+  const publicBinding =
+    binding === undefined
+      ? undefined
+      : {
+          backing: binding.backing,
+          logicalPath: binding.logicalPath,
+          owner: binding.owner,
+        };
   if (binding !== undefined && source.exportName !== undefined) {
-    return { ...projected, binding, exportName: source.exportName };
+    return { ...projected, binding: publicBinding!, exportName: source.exportName };
   }
-  if (binding !== undefined) return { ...projected, binding };
+  if (binding !== undefined) return { ...projected, binding: publicBinding! };
   if (source.exportName !== undefined) return { ...projected, exportName: source.exportName };
   return projected;
 }
@@ -314,6 +320,7 @@ function summarizeNode(node: CompiledAgentNodeManifest | CompiledAgentResources)
     connections: node.connections.length,
     hooks: node.hooks.length,
     instructions: node.instructions.length,
+    memories: node.memories.length,
     schedules: node.schedules.length,
     skills: node.skills.length,
     tools: node.tools.length,
@@ -355,29 +362,44 @@ function collectCompositionDiagnostics(manifest: CompiledAgentManifest) {
   };
 }
 
-const KERNEL_EFFECT_BY_SLOT = {
-  "tools/agent": { action: "subagent-call", audience: ["root-session"], kind: "dispatch" },
-  "tools/ask_question": {
-    audience: ["requires-request-input"],
-    kind: "request-input",
-  },
-  "tools/task_cancel": { action: "task-cancel", audience: ["root-session"], kind: "dispatch" },
-  "tools/task_update": {
-    action: "task-update",
-    audience: ["delegated-task-child"],
-    kind: "dispatch",
-  },
-  "tools/web_search": { audience: [], kind: "provider-tool" },
-} as const;
+function projectPreparedKernelEffects(
+  manifest: CompiledAgentManifest,
+): AgentInfoResponse["kernelEffects"] {
+  const effects: AgentInfoResponse["kernelEffects"][number][] = [];
+  for (const tool of manifest.tools) {
+    const behavior = tool.behavior;
+    const handling = behavior?.handling;
+    if (behavior === undefined || handling === undefined) continue;
 
-function projectPreparedKernelEffects(manifest: CompiledAgentManifest) {
-  return manifest.tools.flatMap((tool) => {
-    const binding = manifest.bindings[tool.sourceId];
-    const slot = tool.logicalPath.replace(/\.(?:[cm]?[jt]sx?)$/, "");
-    const effect = KERNEL_EFFECT_BY_SLOT[slot as keyof typeof KERNEL_EFFECT_BY_SLOT];
-    const isAuthoredWebSearch =
-      slot === "tools/web_search" && manifest.webSearchProvider !== undefined;
-    if (binding?.owner.kind !== "framework" && !isAuthoredWebSearch) return [];
-    return effect === undefined ? [] : [{ ...effect, sourceId: tool.sourceId }];
-  });
+    switch (handling.kind) {
+      case "dispatch":
+        effects.push({
+          action: handling.action === "self-agent" ? "subagent-call" : handling.action,
+          audience: [...behavior.availability],
+          kind: "dispatch",
+          sourceId: tool.sourceId,
+        });
+        break;
+      case "provider-tool":
+        effects.push({
+          audience: [...behavior.availability],
+          kind: "provider-tool",
+          sourceId: tool.sourceId,
+        });
+        break;
+      case "workflow-tool":
+        effects.push({
+          action: "workflow-tool-call",
+          audience: [...behavior.availability],
+          kind: "dispatch",
+          sourceId: tool.sourceId,
+        });
+        break;
+      default: {
+        const _exhaustive: never = handling;
+        throw new Error(`Unsupported compiled tool handling: ${String(_exhaustive)}`);
+      }
+    }
+  }
+  return effects;
 }

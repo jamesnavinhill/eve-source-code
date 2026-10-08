@@ -9,13 +9,16 @@ import { createDiscoverErrorDiagnostic, type DiscoverDiagnostic } from "#discove
 import { parseExtensionMountSpecifier } from "#discover/extension-specifier.js";
 import { SUPPORTED_AUTHORED_MODULE_FILE_EXTENSIONS } from "#discover/filesystem.js";
 import type { ExtensionSourceRef } from "#discover/manifest.js";
-import type { ProjectSource } from "#discover/project-source.js";
-import { parseExtensionPackageRoots } from "#shared/extension-package-contract.js";
+import { type ProjectSource, readPackageJsonName } from "#discover/project-source.js";
+import {
+  parseBuiltInExtensionPackageRoots,
+  parseExtensionPackageRoots,
+} from "#shared/extension-package-contract.js";
 
 /**
  * Emitted when a mount file cannot be resolved to an extension package.
  */
-export const DISCOVER_EXTENSION_MOUNT_UNRESOLVED = "discover/extension-mount-unresolved";
+const DISCOVER_EXTENSION_MOUNT_UNRESOLVED = "discover/extension-mount-unresolved";
 
 /**
  * Emitted when one namespace is claimed by both a file mount
@@ -41,7 +44,7 @@ export const DISCOVER_EXTENSION_NESTED_MOUNT_UNSUPPORTED =
 /**
  * Emitted when a resolved package is not a valid eve extension.
  */
-export const DISCOVER_EXTENSION_PACKAGE_INVALID = "discover/extension-package-invalid";
+const DISCOVER_EXTENSION_PACKAGE_INVALID = "discover/extension-package-invalid";
 
 /**
  * Emitted when an extension distribution's compatibility manifest is missing
@@ -68,11 +71,19 @@ export const DISCOVER_EXTENSION_AGENT_CONFIG_UNSUPPORTED =
  * consuming agent's to own.
  */
 export const DISCOVER_EXTENSION_SANDBOX_UNSUPPORTED = "discover/extension-sandbox-unsupported";
+export const DISCOVER_EXTENSION_MEMORY_UNSUPPORTED = "discover/extension-memory-unsupported";
+
+/**
+ * Emitted when an extension declares agent-level instrumentation. Instrumentation
+ * is a singleton owned by the consuming agent and cannot be namespace-scoped.
+ */
+export const DISCOVER_EXTENSION_INSTRUMENTATION_UNSUPPORTED =
+  "discover/extension-instrumentation-unsupported";
 
 /**
  * Resolved on-disk location of one mounted extension package.
  */
-export interface ExtensionMountLocation {
+interface ExtensionMountLocation {
   /** Mount namespace derived from the mount filename (e.g. `crm`). */
   readonly namespace: string;
   /** Package specifier the mount imports (e.g. `@acme/crm`). */
@@ -92,7 +103,7 @@ export interface ExtensionMountLocation {
  * inspected. Development uses this to build a mounted workspace extension
  * before the consumer requires its dist tree to exist.
  */
-export interface ExtensionMountPackageLocation {
+interface ExtensionMountPackageLocation {
   /** Mount namespace derived from the mount filename. */
   readonly namespace: string;
   /** Package specifier read from the mount declaration. */
@@ -105,6 +116,8 @@ export interface ExtensionMountPackageLocation {
   readonly authoredSourceRoot?: string;
   /** Absolute path to the agent-shaped distribution root. */
   readonly distRoot: string;
+  /** The distribution is shipped by the resolved eve package itself. */
+  readonly builtIn: boolean;
 }
 
 /**
@@ -135,21 +148,6 @@ export function mountRefNamespace(logicalPath: string): string {
 }
 
 /**
- * Derives the namespace that scopes an extension's durable state keys and config
- * binding from its package name. Unlike the mount namespace, this stays keyed to
- * the package (e.g. `@acme/crm` → `acme-crm`) so renaming the consumer's mount
- * file never orphans persisted state.
- */
-export function packageStateNamespace(packageName: string): string {
-  return (
-    packageName
-      .replace(/^@/, "")
-      .replace(/[^a-zA-Z0-9._-]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "extension"
-  );
-}
-
-/**
  * Resolves one extension mount to its package and agent-shaped source root
  * without importing the mount module. Reads the mount source text to extract
  * the package specifier, resolves the package, and reads
@@ -172,6 +170,20 @@ export async function locateExtensionMount(input: {
   }
 
   const { location } = locatedPackage;
+  if (location.builtIn) {
+    return {
+      location: {
+        namespace: location.namespace,
+        specifier: location.specifier,
+        packageName: location.packageName,
+        packageRoot: location.packageRoot,
+        sourceRoot: location.distRoot,
+        externalDependencies: [],
+      },
+      diagnostics: [],
+    };
+  }
+
   const compatibilityPath = join(location.distRoot, EXTENSION_COMPATIBILITY_MANIFEST_FILENAME);
   let compatibility;
   try {
@@ -283,7 +295,7 @@ export async function locateExtensionMountPackage(input: {
   }
 
   const manifestPath = join(packageRoot, "package.json");
-  let pkg: { name?: unknown; eve?: { extension?: unknown } };
+  let pkg: { name?: unknown; eve?: { extension?: unknown; builtInExtensions?: unknown } };
   try {
     pkg = JSON.parse(await input.source.readTextFile(manifestPath)) as typeof pkg;
   } catch {
@@ -298,7 +310,11 @@ export async function locateExtensionMountPackage(input: {
     };
   }
 
-  const extension = parseExtensionPackageRoots(pkg.eve?.extension);
+  const builtInExtension = parseBuiltInExtensionPackageRoots(
+    pkg.eve?.builtInExtensions,
+    packageSpecifierSubpath(specifier),
+  );
+  const extension = builtInExtension ?? parseExtensionPackageRoots(pkg.eve?.extension);
   if (extension === null) {
     return {
       diagnostics: [
@@ -322,6 +338,7 @@ export async function locateExtensionMountPackage(input: {
       ...(extension.source === undefined
         ? {}
         : { authoredSourceRoot: resolve(packageRoot, extension.source) }),
+      builtIn: builtInExtension !== null,
       distRoot: resolve(packageRoot, extension.dist),
     },
     diagnostics: [],
@@ -350,6 +367,11 @@ async function resolvePackageRoot(input: {
   }
 
   const packageSubpath = bareSpecifierPackagePath(input.specifier);
+  // Node resolves a package's own name through self-reference; bundled extensions
+  // discovered from inside eve use it to mount other built-in extensions.
+  if ((await readPackageJsonName(input.source, input.appRoot)) === packageSubpath) {
+    return resolve(input.appRoot);
+  }
   let current = resolve(input.appRoot);
   while (true) {
     const candidate = join(current, "node_modules", packageSubpath);
@@ -362,6 +384,12 @@ async function resolvePackageRoot(input: {
     }
     current = parent;
   }
+}
+
+/** Returns the export subpath of a bare package specifier. */
+function packageSpecifierSubpath(specifier: string): string {
+  const subpath = specifier.slice(bareSpecifierPackagePath(specifier).length);
+  return subpath.length === 0 ? "." : `.${subpath}`;
 }
 
 /**

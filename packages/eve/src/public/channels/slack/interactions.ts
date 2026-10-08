@@ -1,7 +1,7 @@
 /**
- * Slack `block_actions` + `view_submission` wire handling. It decodes and
- * authorizes framework HITL responses, opens freeform modals inline before
- * Slack's trigger expires, and forwards user-owned actions to `onInteraction`.
+ * Slack interactivity wire handling. It decodes and authorizes framework HITL
+ * responses, opens freeform modals inline before Slack's trigger expires, and
+ * forwards user-owned actions, shortcuts, and slash commands to their authored hooks.
  */
 
 import {
@@ -12,15 +12,22 @@ import {
 
 import { createLogger } from "#internal/logging.js";
 import {
+  isSlackResponseError,
+  type SlackTransportOptions,
+} from "#public/channels/slack/transport.js";
+import {
   buildSlackBinding,
+  buildSlackWorkspaceHandle,
+  callSlackApi,
   resolveSlackBotToken,
   slackContinuationToken,
 } from "#public/channels/slack/api.js";
 import { buildSlackAuthContext } from "#public/channels/slack/auth.js";
+import { dispatchSignInCancel } from "#public/channels/slack/sign-in-cancel.js";
 import {
   buildFreeformModalView,
-  deriveHitlResponse,
-  freeformRequestIdFromActionId,
+  decodeFreeformHitlActionId,
+  decodeHitlResponse,
   HITL_FREEFORM_MODAL_ACTION_ID,
   HITL_FREEFORM_MODAL_BLOCK_ID,
   HITL_FREEFORM_MODAL_CALLBACK_ID,
@@ -33,10 +40,7 @@ import {
   updateAnsweredFreeformCard,
   updateAnsweredHitlCard,
 } from "#public/channels/slack/interaction-cards.js";
-import {
-  approvalResponderStatePatch,
-  authorizeInputResponse,
-} from "#public/channels/slack/input-response.js";
+import { authorizeInputResponse } from "#public/channels/slack/input-response.js";
 import type {
   SlackChannelConfig,
   SlackChannelState,
@@ -44,9 +48,15 @@ import type {
   SlackInteractionAction,
   SlackInteractionContext,
   SlackInteractionUser,
+  SlackShortcut,
+  SlackShortcutContext,
 } from "#public/channels/slack/slackChannel.js";
 import type { ChannelFrom, ChannelResolveSession } from "#channel/channel-operations.js";
-import { bindSlackSessionOperations } from "#public/channels/slack/session-operations.js";
+import {
+  bindSlackSessionOperations,
+  withSlackResponder,
+} from "#public/channels/slack/session-operations.js";
+import { dispatchSlashCommand } from "#public/channels/slack/slash-command.js";
 import { parseInputResponse } from "#shared/input.js";
 
 const log = createLogger("slack.interactions");
@@ -119,6 +129,7 @@ export function parseBlockActionsPayload(
       blockId: a.block_id != null ? String(a.block_id) : undefined,
       selectedOptionValue: extractSelectedOptionValue(a),
       messageTs: message?.ts,
+      triggerId: typeof rawBody.trigger_id === "string" ? rawBody.trigger_id : undefined,
       label: extractActionLabel(a),
       user,
     })),
@@ -148,6 +159,7 @@ function parseSharedBlockActionsPayload(
       blockId: action.blockId,
       selectedOptionValue: action.selectedOptionValue,
       messageTs: body.messageTs,
+      triggerId: body.triggerId,
       label: action.label,
       user: {
         id: action.user?.id ?? body.userId,
@@ -177,10 +189,6 @@ function extractActionLabel(action: Record<string, unknown>): string | undefined
   return undefined;
 }
 
-function findPromptBlock(blocks: readonly unknown[]): unknown {
-  return findPromptBlocks(blocks)[0];
-}
-
 function findPromptBlocks(blocks: readonly unknown[]): unknown[] {
   const promptBlocks: unknown[] = [];
   for (const block of blocks) {
@@ -199,7 +207,7 @@ function findPromptBlocks(blocks: readonly unknown[]): unknown[] {
 }
 
 function readPromptTextFromBlocks(blocks: readonly unknown[]): string | undefined {
-  const prompt = findPromptBlock(blocks) as { text?: unknown } | undefined;
+  const prompt = findPromptBlocks(blocks)[0] as { text?: unknown } | undefined;
   const text = readSlackTextObject(prompt?.text);
   return text.length > 0 ? text : undefined;
 }
@@ -229,6 +237,7 @@ function readInstallationTeamId(value: unknown): string | undefined {
 
 /** Channel-supplied dependencies for {@link handleInteractionPost}. */
 export interface InteractionHandlerDeps {
+  readonly api: SlackTransportOptions | undefined;
   readonly config: SlackChannelConfig;
   readonly onInputResponse: NonNullable<SlackChannelConfig["onInputResponse"]>;
 }
@@ -238,7 +247,8 @@ export interface InteractionHandlerDeps {
  * `view_submission` payloads to the freeform-answer flow, intercepts
  * "Type your answer" button clicks to open a modal, resolves
  * framework HITL clicks through `onInputResponse` to the parked session,
- * and forwards anything else to `config.onInteraction`.
+ * forwards other block actions to `config.onInteraction`, shortcuts to
+ * `config.onShortcut`, and slash commands to `config.onSlashCommand`.
  */
 export async function handleInteractionPost(
   rawBody: string,
@@ -265,7 +275,27 @@ export async function handleInteractionPost(
     return handleViewSubmission(payload, ctx, deps);
   }
 
-  if (payload.kind !== "block_actions") return ack;
+  if (payload.kind === "slash_command") {
+    dispatchSlashCommand(payload, ctx, deps);
+    return new Response(null, { status: 200 });
+  }
+
+  if (payload.kind === "unsupported") {
+    const shortcut = parseShortcutPayload(payload.raw);
+    if (shortcut !== null) {
+      dispatchShortcut(shortcut, readInstallationTeamId(payload.raw), ctx, deps);
+      return new Response(null, { status: 200 });
+    }
+    log.warn("unsupported Slack interaction payload ignored", { type: payload.type });
+    return ack;
+  }
+
+  if (payload.kind !== "block_actions") {
+    log.warn("unsupported Slack interaction payload ignored", { type: payload.kind });
+    return ack;
+  }
+
+  if (dispatchSignInCancel(payload.raw, ctx)) return ack;
 
   const interaction = parseBlockActionsPayload(payload);
   if (!interaction) return ack;
@@ -276,19 +306,20 @@ export async function handleInteractionPost(
     return ack;
   }
 
-  const continuationToken = slackContinuationToken(interaction.channelId, interaction.threadTs);
   const hitlActions = interaction.actions.flatMap((action) => {
-    const derived = deriveHitlResponse(action);
+    const derived = decodeHitlResponse(action);
     return derived === null ? [] : [{ action, derived }];
   });
 
   if (hitlActions.length > 0) {
     const user = hitlActions[0]!.action.user;
+    const route = hitlActions[0]!.derived.route;
     ctx.waitUntil(
       dispatchBlockInputResponses({
         ctx,
         deps,
         interaction,
+        route,
         submission: {
           type: "block_actions",
           actions: hitlActions.map(({ action }) => action),
@@ -306,6 +337,7 @@ export async function handleInteractionPost(
     if (customActions.length > 0) {
       const actionUser = customActions[0]!.user;
       const { thread, slack } = buildSlackBinding({
+        api: deps.api,
         botToken: deps.config.credentials?.botToken,
         channelId: interaction.channelId,
         threadTs: interaction.threadTs,
@@ -314,9 +346,10 @@ export async function handleInteractionPost(
       });
       const slackCtx: SlackInteractionContext = {
         ...bindSlackSessionOperations({
-          address: continuationToken,
+          address: slackContinuationToken(interaction.channelId, interaction.threadTs),
           defaultAuth: buildSlackAuthContext({
             channelId: interaction.channelId,
+            installationTeamId: interaction.installationTeamId,
             teamId: interaction.teamId,
             threadTs: interaction.threadTs,
             userId: actionUser.id,
@@ -348,30 +381,127 @@ export async function handleInteractionPost(
   return ack;
 }
 
+/** Normalizes Slack's two shortcut payload variants. */
+export function parseShortcutPayload(raw: unknown): SlackShortcut | null {
+  if (!isObjectRecord(raw)) return null;
+  const type = raw.type;
+  if (type !== "message_action" && type !== "shortcut") return null;
+
+  const callbackId = readRequiredString(raw.callback_id);
+  const triggerId = readRequiredString(raw.trigger_id);
+  const userBlock = isObjectRecord(raw.user) ? raw.user : undefined;
+  const userId = readRequiredString(userBlock?.id);
+  if (callbackId === null || triggerId === null || userId === null) return null;
+
+  const teamBlock = isObjectRecord(raw.team) ? raw.team : undefined;
+  const teamId = readOptionalString(userBlock?.team_id) ?? readOptionalString(teamBlock?.id);
+  const user: SlackInteractionUser = {
+    id: userId,
+    username: readOptionalString(userBlock?.username),
+    name: readOptionalString(userBlock?.name),
+  };
+
+  if (type === "shortcut") {
+    return { type, callbackId, triggerId, user, teamId };
+  }
+
+  const channelBlock = isObjectRecord(raw.channel) ? raw.channel : undefined;
+  const messageBlock = isObjectRecord(raw.message) ? raw.message : undefined;
+  const channelId = readRequiredString(channelBlock?.id);
+  const messageTs = readRequiredString(messageBlock?.ts);
+  if (channelId === null || messageTs === null || messageBlock === undefined) return null;
+
+  return {
+    type,
+    callbackId,
+    triggerId,
+    user,
+    teamId,
+    channelId,
+    message: {
+      text: typeof messageBlock.text === "string" ? messageBlock.text : "",
+      ts: messageTs,
+      threadTs: readOptionalString(messageBlock.thread_ts),
+      userId: readOptionalString(messageBlock.user),
+    },
+    responseUrl: readOptionalString(raw.response_url),
+  };
+}
+
+function readRequiredString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function readOptionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function dispatchShortcut(
+  shortcut: SlackShortcut,
+  installationTeamId: string | undefined,
+  ctx: { readonly waitUntil: (task: Promise<unknown>) => void },
+  deps: InteractionHandlerDeps,
+): void {
+  const onShortcut = deps.config.onShortcut;
+  if (onShortcut === undefined) {
+    log.warn("Slack shortcut ignored because onShortcut is not configured", {
+      type: shortcut.type,
+    });
+    return;
+  }
+
+  const shortcutCtx: SlackShortcutContext = {
+    slack: buildSlackWorkspaceHandle({
+      api: deps.api,
+      botToken: deps.config.credentials?.botToken,
+      installationTeamId,
+      teamId: shortcut.teamId,
+    }),
+  };
+  dispatchInteractionHook(() => onShortcut(shortcut, shortcutCtx), ctx, "shortcut handler failed");
+}
+
+function dispatchInteractionHook(
+  handler: () => void | Promise<void>,
+  ctx: { readonly waitUntil: (task: Promise<unknown>) => void },
+  failureMessage: string,
+): void {
+  ctx.waitUntil(
+    Promise.resolve()
+      .then(handler)
+      .catch((error: unknown) => {
+        log.error(failureMessage, { error });
+      }),
+  );
+}
+
 async function dispatchBlockInputResponses(input: {
   readonly ctx: {
     from: ChannelFrom<SlackChannelState>;
   };
   readonly deps: InteractionHandlerDeps;
   readonly interaction: ParsedBlockActionsPayload;
+  readonly route?: { readonly channelId: string; readonly threadTs: string };
   readonly submission: Extract<SlackInputResponseSubmission, { type: "block_actions" }>;
 }): Promise<void> {
+  const channelId = input.route?.channelId ?? input.interaction.channelId;
+  const threadTs = input.route?.threadTs ?? input.interaction.threadTs;
   const result = await authorizeInputResponse({
-    channelId: input.interaction.channelId,
+    channelId,
     deps: input.deps,
     installationTeamId: input.interaction.installationTeamId,
     submission: input.submission,
     teamId: input.interaction.teamId,
-    threadTs: input.interaction.threadTs,
+    threadTs,
   });
   if (result === null) return;
 
   try {
     await input.ctx
-      .from(slackContinuationToken(input.interaction.channelId, input.interaction.threadTs))
+      .from(slackContinuationToken(channelId, threadTs))
       .respond(input.submission.inputResponses, {
         auth: result.auth,
-        state: approvalResponderStatePatch(input.submission, result.auth),
+        state: withSlackResponder(undefined, input.submission.user.id),
       });
   } catch (error) {
     log.error("HITL interaction delivery failed", { error });
@@ -379,7 +509,7 @@ async function dispatchBlockInputResponses(input: {
   }
 
   if (
-    input.submission.actions.some((action) => deriveHitlResponse(action)?.kind === "tool-approval")
+    input.submission.actions.some((action) => decodeHitlResponse(action)?.kind === "tool-approval")
   ) {
     return;
   }
@@ -403,8 +533,12 @@ async function openFreeformModal(input: {
     return;
   }
 
-  const requestId =
-    freeformRequestIdFromActionId(input.freeformAction.actionId) ?? input.freeformAction.value;
+  const decoded = decodeFreeformHitlActionId(input.freeformAction.actionId);
+  if (decoded === null) {
+    log.warn("freeform button click carries invalid metadata");
+    return;
+  }
+  const requestId = decoded.requestId;
   if (!requestId) {
     log.warn("freeform button click missing requestId");
     return;
@@ -416,14 +550,14 @@ async function openFreeformModal(input: {
     return;
   }
 
+  const channelId = decoded?.route?.channelId ?? input.interaction.channelId;
+  const threadTs = decoded?.route?.threadTs ?? input.interaction.threadTs;
   const metadata: HitlFreeformModalMetadata = {
-    continuationToken: slackContinuationToken(
-      input.interaction.channelId,
-      input.interaction.threadTs,
-    ),
-    channelId: input.interaction.channelId,
+    continuationToken: slackContinuationToken(channelId, threadTs),
+    channelId,
     installationTeamId: input.interaction.installationTeamId,
-    threadTs: input.interaction.threadTs,
+    messageChannelId: input.interaction.channelId,
+    threadTs,
     messageTs,
     requestId,
   };
@@ -434,16 +568,20 @@ async function openFreeformModal(input: {
     teamId: input.interaction.installationTeamId,
   });
 
-  const response = await fetch("https://slack.com/api/views.open", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json; charset=utf-8",
-    },
-    body: JSON.stringify({ trigger_id: triggerId, view }),
-  });
-  if (!response.ok) {
-    log.error("Slack views.open returned non-2xx", { status: response.status });
+  // Slack retries a click whose acknowledgement is not a 2xx, so a modal
+  // that fails to open is logged and the click still acknowledged; a call
+  // that never reached Slack is rethrown and fails the request. The token
+  // above resolves outside the try so a throwing resolver joins that case.
+  try {
+    await callSlackApi({
+      api: input.deps.api,
+      botToken: token,
+      operation: "views.open",
+      body: { trigger_id: triggerId, view },
+    });
+  } catch (error) {
+    if (!isSlackResponseError(error)) throw error;
+    log.error("Slack views.open failed", { error });
   }
 }
 
@@ -540,6 +678,7 @@ async function dispatchViewInputResponse(input: {
       .from(input.metadata.continuationToken)
       .respond(input.submission.inputResponses, {
         auth: result.auth,
+        state: withSlackResponder(undefined, input.submission.user.id),
       });
   } catch (error) {
     log.error("freeform answer delivery failed", { error });
@@ -548,7 +687,7 @@ async function dispatchViewInputResponse(input: {
 
   try {
     await updateAnsweredFreeformCard({
-      channelId: input.metadata.channelId,
+      channelId: input.metadata.messageChannelId ?? input.metadata.channelId,
       messageTs: input.metadata.messageTs,
       answerLabel: input.text,
       userId: input.submission.user.id,

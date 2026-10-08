@@ -1,4 +1,5 @@
 import { basename, relative, resolve } from "node:path";
+import type { JsonObject } from "#shared/json.js";
 import type {
   MarkdownSourceRef,
   ModuleSourceRef,
@@ -20,7 +21,7 @@ export const AGENT_SOURCE_MANIFEST_KIND = "eve-agent-discovery-manifest";
 /**
  * Current manifest schema version.
  */
-export const AGENT_SOURCE_MANIFEST_VERSION = 14;
+export const AGENT_SOURCE_MANIFEST_VERSION = 15;
 
 /**
  * Channel source reference preserved by the discovery manifest.
@@ -65,6 +66,10 @@ export type SkillSourceRef =
  * Tool source reference preserved by the discovery manifest.
  */
 export type ToolSourceRef = ModuleSourceRef;
+
+export interface MemorySourceRef extends ModuleSourceRef {
+  readonly slot: string;
+}
 
 /**
  * Recursive manifest entry for a local subagent package.
@@ -143,6 +148,14 @@ export type ExtensionSourceRef = ModuleSourceRef;
  * consuming agent, prefixing contributions with {@link namespace}.
  */
 export interface ResolvedExtensionMount {
+  /** Programmatic declaration used when the mount does not exist on disk. */
+  readonly programmaticDeclaration?: {
+    readonly logicalPath: string;
+    readonly sourceId: string;
+    readonly importSpecifier: string;
+    readonly entryPath: string;
+    readonly config: JsonObject;
+  };
   /** Mount namespace derived from the mount filename (e.g. `crm`). */
   readonly namespace: string;
   /** Package specifier the mount imports (e.g. `@acme/crm`). */
@@ -174,7 +187,7 @@ export type SubagentSourceRef = LocalSubagentSourceRef;
 /**
  * Input used to build a manifest-ready connection source ref.
  */
-export interface CreateConnectionSourceRefInput extends CreateModuleSourceRefInput {
+interface CreateConnectionSourceRefInput extends CreateModuleSourceRefInput {
   connectionName: string;
 }
 
@@ -202,6 +215,7 @@ export interface AgentSourceManifest {
    */
   resolvedExtensions: ResolvedExtensionMount[];
   hooks: ModuleSourceRef[];
+  memories: MemorySourceRef[];
   lib: LibSourceRef[];
   kind: typeof AGENT_SOURCE_MANIFEST_KIND;
   /**
@@ -215,8 +229,6 @@ export interface AgentSourceManifest {
    * Empty when no instructions are authored.
    */
   instructions: InstructionsSourceRef[];
-  /** Authored single-file instrumentation module, when present. */
-  instrumentation?: ModuleSourceRef;
   /**
    * Authored sandbox module discovered for this agent, or `null` when
    * the agent does not declare one. Every agent owns at most one
@@ -250,6 +262,7 @@ export interface CreateAgentSourceManifestInput {
   extensions?: readonly ExtensionSourceRef[];
   resolvedExtensions?: readonly ResolvedExtensionMount[];
   hooks?: readonly ModuleSourceRef[];
+  memories?: readonly MemorySourceRef[];
   lib?: readonly LibSourceRef[];
   /**
    * Optional package name read from the app root's package.json.
@@ -259,7 +272,6 @@ export interface CreateAgentSourceManifestInput {
    */
   packageName?: string;
   instructions?: readonly InstructionsSourceRef[];
-  instrumentation?: ModuleSourceRef;
   sandbox?: SandboxSourceRef | null;
   sandboxWorkspaces?: readonly SandboxWorkspaceFolderSourceRef[];
   schedules?: readonly ScheduleSourceRef[];
@@ -271,7 +283,7 @@ export interface CreateAgentSourceManifestInput {
 /**
  * Input used to build a manifest-ready skill package source ref.
  */
-export interface CreateSkillPackageSourceRefInput {
+interface CreateSkillPackageSourceRefInput {
   assetsPath?: string;
   description: string;
   license?: string;
@@ -290,7 +302,7 @@ export interface CreateSkillPackageSourceRefInput {
 /**
  * Input used to build a manifest-ready module source ref.
  */
-export interface CreateModuleSourceRefInput {
+interface CreateModuleSourceRefInput {
   exportName?: string;
   logicalPath: string;
   sourceId?: string;
@@ -299,7 +311,7 @@ export interface CreateModuleSourceRefInput {
 /**
  * Input used to build a manifest-ready local subagent source ref.
  */
-export interface CreateLocalSubagentSourceRefInput {
+interface CreateLocalSubagentSourceRefInput {
   entryPath: string;
   logicalPath: string;
   manifest: AgentSourceManifest;
@@ -326,6 +338,7 @@ export function createAgentSourceManifest(
     extensions: [...(input.extensions ?? [])],
     resolvedExtensions: [...(input.resolvedExtensions ?? [])],
     hooks: [...(input.hooks ?? [])],
+    memories: [...(input.memories ?? [])],
     instructions: [...(input.instructions ?? [])],
     lib: [...(input.lib ?? [])],
     kind: AGENT_SOURCE_MANIFEST_KIND,
@@ -341,10 +354,6 @@ export function createAgentSourceManifest(
   if (input.configModule !== undefined) {
     manifest.configModule = input.configModule;
   }
-  if (input.instrumentation !== undefined) {
-    manifest.instrumentation = input.instrumentation;
-  }
-
   return manifest;
 }
 

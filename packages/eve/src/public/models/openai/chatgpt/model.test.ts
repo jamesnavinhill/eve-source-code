@@ -69,7 +69,7 @@ describe("Codex model", () => {
       { role: "user", content: [{ type: "input_text", text: "hello" }] },
       {
         role: "assistant",
-        content: [{ type: "output_text", text: "previous answer" }],
+        content: "previous answer",
         phase: "final_answer",
       },
     ]);
@@ -122,10 +122,83 @@ describe("Codex model", () => {
     // echoed back, so `include` must carry it whenever reasoning is set.
     expect(body.include).toContain("reasoning.encrypted_content");
   });
+
+  it("requests Fast mode with the service tier the Codex backend accepts", async () => {
+    const requests: RecordedRequest[] = [];
+    const model = createCodexSubscriptionModel(
+      { model: "gpt-6.1-sol" },
+      {
+        broker: fakeBroker(),
+        fetch: createRecordingFetch(requests),
+      },
+    );
+
+    await model.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      providerOptions: { openai: { serviceTier: "fast" } },
+    });
+
+    // OpenAI documents `fast` as an alias of `priority`, but the Codex backend
+    // rejects `fast` with `400 Unsupported service_tier: fast`.
+    expect(JSON.parse(requests[0]?.body ?? "{}").service_tier).toBe("priority");
+  });
+
+  it("groups summaries by reasoning item and preserves encrypted-only items", async () => {
+    const requests: RecordedRequest[] = [];
+    const model = createCodexSubscriptionModel(
+      { model: "gpt-5.6-luna" },
+      {
+        broker: fakeBroker(),
+        fetch: createRecordingFetch(requests),
+      },
+    );
+    const result = await model.doGenerate({
+      prompt: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "First summary.",
+              providerOptions: { openai: { itemId: "rs_1" } },
+            },
+            {
+              type: "reasoning",
+              text: "Second summary.",
+              providerOptions: {
+                openai: { itemId: "rs_1", reasoningEncryptedContent: "encrypted-1" },
+              },
+            },
+            {
+              type: "reasoning",
+              text: "",
+              providerOptions: {
+                openai: { itemId: "rs_2", reasoningEncryptedContent: "encrypted-2" },
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result.warnings).toEqual([]);
+    expect(JSON.parse(requests[0]?.body ?? "{}").input).toEqual([
+      {
+        type: "reasoning",
+        encrypted_content: "encrypted-1",
+        summary: [
+          { type: "summary_text", text: "First summary." },
+          { type: "summary_text", text: "Second summary." },
+        ],
+      },
+      { type: "reasoning", encrypted_content: "encrypted-2", summary: [] },
+    ]);
+  });
 });
 
 function fakeBroker(): CodexTokenBroker {
   return {
+    credentialOwner: () => undefined,
     getToken: async () => ({ token: "access-token" }),
     refreshState: async () => ({ kind: "ready" }),
     state: () => ({ kind: "ready" }),

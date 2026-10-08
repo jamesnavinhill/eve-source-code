@@ -19,7 +19,7 @@
  */
 
 /** Surface an integration targets. Extend as new kinds are catalogued. */
-export type IntegrationKind = "channel" | "connection" | "extension" | "instrumentation";
+export type IntegrationKind = "channel" | "connection" | "extension" | "instrumentation" | "memory";
 
 /** Wire protocol a connection speaks at runtime. */
 export type ConnectionProtocol = "mcp" | "openapi";
@@ -118,6 +118,13 @@ export const INTEGRATIONS: readonly IntegrationEntry[] = [
     name: "Twilio",
     kind: "channel",
     tagline: "Put your agent on a phone number: SMS and speech-transcribed calls.",
+    surfaces: { scaffoldable: false, registry: true, gallery: true },
+  },
+  {
+    slug: "blooio",
+    name: "Blooio",
+    kind: "channel",
+    tagline: "Send and receive iMessage, RCS, and SMS through Blooio.",
     surfaces: { scaffoldable: false, registry: true, gallery: true },
   },
   {
@@ -270,11 +277,32 @@ export const INTEGRATIONS: readonly IntegrationEntry[] = [
     surfaces: { scaffoldable: false, registry: true, gallery: true },
   },
   {
+    slug: "chat-sdk-gmail",
+    name: "Gmail",
+    kind: "channel",
+    tagline: "Turn labelled Gmail threads into agent conversations via the Chat SDK.",
+    surfaces: { scaffoldable: false, registry: true, gallery: true },
+  },
+  {
     slug: "agent-browser",
     name: "agent-browser",
     kind: "extension",
     tagline: "Add browser automation tools backed by agent-browser to an eve agent.",
     surfaces: { scaffoldable: false, registry: true, gallery: true },
+  },
+  {
+    slug: "blitzreels",
+    name: "BlitzReels",
+    kind: "extension",
+    tagline: "Turn long videos into short clips, generate media, repair edits, and export.",
+    surfaces: { scaffoldable: false, registry: true, gallery: true },
+  },
+  {
+    slug: "mux-video",
+    name: "Mux Video",
+    kind: "extension",
+    tagline: "Create and inspect video assets, make clips, and run Mux Robots workflows.",
+    surfaces: { scaffoldable: false, registry: false, gallery: true },
   },
   {
     slug: "browserbase",
@@ -298,6 +326,13 @@ export const INTEGRATIONS: readonly IntegrationEntry[] = [
     surfaces: { scaffoldable: false, registry: true, gallery: true },
   },
   {
+    slug: "link",
+    name: "Link",
+    kind: "extension",
+    tagline: "Give your eve agent guarded access to Link wallet and purchase tools.",
+    surfaces: { scaffoldable: false, registry: true, gallery: true },
+  },
+  {
     slug: "kernel",
     name: "KERNEL",
     kind: "extension",
@@ -306,18 +341,35 @@ export const INTEGRATIONS: readonly IntegrationEntry[] = [
     surfaces: { scaffoldable: false, registry: true, gallery: true },
   },
   {
+    slug: "file",
+    name: "File memory",
+    kind: "memory",
+    tagline:
+      "Store durable per-principal memory in a private Vercel Blob store provisioned for the agent.",
+    surfaces: { scaffoldable: false, registry: true, gallery: true },
+  },
+  {
+    slug: "supermemory",
+    name: "Supermemory",
+    kind: "memory",
+    tagline:
+      "Give your agents long-term memory, user profiles, and SuperRAG across conversations and context.",
+    surfaces: { scaffoldable: false, registry: true, gallery: true },
+  },
+  {
     slug: "upstash-agentkit",
     name: "Upstash AgentKit",
-    kind: "extension",
-    tagline: "Add long-term memory, Redis Search, and durable chat history with Upstash Redis.",
+    kind: "memory",
+    tagline:
+      "Give your agents ranked recall and automatic capture on Upstash Redis, or a Redis backend for file memory.",
     surfaces: { scaffoldable: false, registry: true, gallery: true },
   },
   {
     slug: "arcana",
     name: "Kybernesis Arcana",
-    kind: "extension",
+    kind: "memory",
     tagline:
-      "Give your agent workspace-scoped long-term memory with recall, storage, and brain notes.",
+      "Give your agents workspace-scoped long-term memory with automatic recall and deliberate storage.",
     surfaces: { scaffoldable: false, registry: true, gallery: true },
   },
   {
@@ -332,11 +384,23 @@ export const INTEGRATIONS: readonly IntegrationEntry[] = [
     name: "Browser Use",
     kind: "connection",
     tagline: "Run managed browser automation tasks through Browser Use's MCP server.",
-    surfaces: { scaffoldable: false, registry: true, gallery: true },
+    surfaces: { scaffoldable: true, registry: true, gallery: true },
     connection: {
       description:
         "Browser Use: run browser automation tasks, inspect sessions, and manage browser profiles.",
       mcp: { url: "https://api.browser-use.com/v3/mcp" },
+    },
+  },
+  {
+    slug: "dataforseo",
+    name: "DataForSEO",
+    kind: "connection",
+    tagline: "Run SEO, keyword, and SERP data lookups through DataForSEO's MCP server.",
+    surfaces: { scaffoldable: false, registry: true, gallery: false },
+    connection: {
+      description:
+        "DataForSEO: run SEO, keyword, and SERP data lookups through DataForSEO's MCP server.",
+      mcp: { url: "https://mcp.dataforseo.com/v3/mcp" },
     },
   },
   {
@@ -613,6 +677,17 @@ export const INTEGRATIONS: readonly IntegrationEntry[] = [
     },
   },
   {
+    slug: "neon",
+    name: "Neon",
+    kind: "connection",
+    tagline: "Manage Neon projects, run queries, and make schema changes.",
+    surfaces: { scaffoldable: false, registry: true, gallery: true },
+    connection: {
+      description: "Neon: manage projects, run queries, and make schema changes.",
+      mcp: { url: "https://mcp.neon.tech/mcp" },
+    },
+  },
+  {
     slug: "netlify",
     name: "Netlify",
     kind: "connection",
@@ -679,6 +754,18 @@ export const INTEGRATIONS: readonly IntegrationEntry[] = [
     },
   },
   {
+    slug: "sanity",
+    name: "Sanity",
+    kind: "connection",
+    tagline: "Query and edit Sanity content, inspect schemas, and manage releases.",
+    surfaces: { scaffoldable: false, registry: true, gallery: true },
+    connection: {
+      description:
+        "Sanity: query content with GROQ, edit documents, inspect schemas, and manage releases.",
+      mcp: { url: "https://mcp.sanity.io" },
+    },
+  },
+  {
     slug: "sentry",
     name: "Sentry",
     kind: "connection",
@@ -698,6 +785,17 @@ export const INTEGRATIONS: readonly IntegrationEntry[] = [
     connection: {
       description: "Similarweb: web traffic, app, and market intelligence data.",
       mcp: { url: "https://mcp.similarweb.com" },
+    },
+  },
+  {
+    slug: "shopify",
+    name: "Shopify",
+    kind: "connection",
+    tagline: "Search products and manage carts and checkouts on a Shopify storefront.",
+    surfaces: { scaffoldable: false, registry: true, gallery: true },
+    connection: {
+      description: "Search products and build carts and checkouts on a Shopify storefront.",
+      mcp: { url: "https://{shop}.myshopify.com/api/ucp/mcp" },
     },
   },
   {
@@ -902,4 +1000,9 @@ export function extensionEntries(): IntegrationEntry[] {
 /** All instrumentation entries, in catalog order. */
 export function instrumentationEntries(): IntegrationEntry[] {
   return integrationsByKind("instrumentation");
+}
+
+/** All memory provider entries, in catalog order. */
+export function memoryEntries(): IntegrationEntry[] {
+  return integrationsByKind("memory");
 }

@@ -8,6 +8,7 @@ import { createTestAgentInfoResult } from "#internal/testing/agent-info-fixture.
 import { resolveTestVercelTarget } from "#internal/testing/verified-vercel-target.js";
 import { resolveRemoteDevelopmentClientOptions } from "#services/dev-client/client-options.js";
 import { createDevelopmentCredentialGate } from "#services/dev-client/credential-gate.js";
+import { EVE_MESSAGE_STREAM_VERSION, EVE_STREAM_VERSION_HEADER } from "#protocol/message.js";
 
 const AGENT_INFO = createTestAgentInfoResult({
   agentRoot: "/tmp/weather-agent/agent",
@@ -38,6 +39,18 @@ afterEach(() => {
 });
 
 describe("Client request policy", () => {
+  it("forwards inspection cancellation without changing authentication", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(Response.json(AGENT_INFO));
+    const controller = new AbortController();
+    const client = new Client({ host: "https://eve.test", auth: { bearer: "test-token" } });
+    await client.info({ signal: controller.signal });
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.signal).toBe(controller.signal);
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer test-token");
+  });
+
   it("rejects malformed health payloads", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       Response.json({ ok: true, status: "ready", workflowId: "wf", extra: true }),
@@ -58,7 +71,9 @@ describe("Client request policy", () => {
         Response.json({ sessionId: "session_1", status: "accepted" }, { status: 202 }),
       )
       .mockResolvedValueOnce(
-        new Response(`${JSON.stringify({ data: {}, type: "session.completed" })}\n`),
+        new Response(`${JSON.stringify({ data: {}, type: "session.completed" })}\n`, {
+          headers: { [EVE_STREAM_VERSION_HEADER]: EVE_MESSAGE_STREAM_VERSION },
+        }),
       );
     const client = new Client({
       host: "https://eve.test?x-vercel-protection-bypass=secret",
@@ -87,7 +102,9 @@ describe("Client request policy", () => {
         Response.json({ sessionId: "session_1", status: "accepted" }, { status: 202 }),
       )
       .mockResolvedValueOnce(
-        new Response(`${JSON.stringify({ data: {}, type: "session.completed" })}\n`),
+        new Response(`${JSON.stringify({ data: {}, type: "session.completed" })}\n`, {
+          headers: { [EVE_STREAM_VERSION_HEADER]: EVE_MESSAGE_STREAM_VERSION },
+        }),
       );
     const client = new Client({ host: "https://eve.test", redirect: "manual" });
 
@@ -125,7 +142,9 @@ describe("Client request policy", () => {
         Response.json({ sessionId: "session_1", status: "accepted" }, { status: 202 }),
       )
       .mockResolvedValueOnce(
-        new Response(`${JSON.stringify({ data: {}, type: "session.completed" })}\n`),
+        new Response(`${JSON.stringify({ data: {}, type: "session.completed" })}\n`, {
+          headers: { [EVE_STREAM_VERSION_HEADER]: EVE_MESSAGE_STREAM_VERSION },
+        }),
       );
     const client = new Client({
       host: "https://eve.test",
@@ -223,6 +242,129 @@ describe("Client request policy", () => {
       name: "web_search",
     });
     expect(info.tools.static[0]).not.toHaveProperty("outputSchema");
+  });
+
+  it.each(["extensions/crm", ""])(
+    "validates extension mount identity %j in agent info",
+    async (mountId) => {
+      const owner = {
+        kind: "extension" as const,
+        mountId,
+        namespace: "crm",
+        packageName: "@acme/crm",
+      };
+      const instructions = {
+        content: "Review customer requests.",
+        logicalPath: "instructions/crm.md",
+        name: "crm",
+        owner,
+        role: "system",
+        sourceId: "ext:crm:instructions.md",
+        sourceKind: "markdown",
+      };
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        Response.json({
+          ...AGENT_INFO,
+          instructions: { ...AGENT_INFO.instructions, static: [instructions] },
+        }),
+      );
+      const client = new Client({ host: "https://eve.test" });
+
+      if (mountId === "") {
+        await expect(client.info()).rejects.toThrow(AgentInfoResponseError);
+      } else {
+        const info = await client.info();
+        expect(info.instructions.static[0]?.owner).toEqual(owner);
+      }
+    },
+  );
+
+  it("accepts mount provenance for extension tools and application overrides", async () => {
+    const mountId = "extensions/crm";
+    const owners = [
+      { kind: "extension", mountId, namespace: "crm", packageName: "@acme/crm" },
+      { kind: "application" },
+    ];
+    const tools = owners.map((owner, index) => ({
+      binding: {
+        backing: {
+          kind: "filesystem",
+          sourcePath: `/app/tools/${index}.ts`,
+          externalDependencies: [],
+          mountId,
+        },
+        logicalPath: `tools/${index}.ts`,
+        owner,
+      },
+      description: "Read account",
+      hasAuth: false,
+      hasExecute: true,
+      hasModelOutputProjection: false,
+      hasOutputSchema: false,
+      inputSchema: {},
+      logicalPath: `tools/${index}.ts`,
+      name: `crm__${index}`,
+      owner,
+      requiresApproval: false,
+      sourceId: `tools/${index}.ts`,
+      sourceKind: "module",
+    }));
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({ ...AGENT_INFO, tools: { ...AGENT_INFO.tools, static: tools } }),
+    );
+    const info = await new Client({ host: "https://eve.test" }).info();
+    expect(info.tools.static.map((tool) => tool.binding?.backing)).toEqual(
+      tools.map((tool) => tool.binding.backing),
+    );
+  });
+
+  it("accepts the legacy optional instrumentation field in v4 agent info", async () => {
+    const owner = { kind: "application" as const };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        ...AGENT_INFO,
+        instrumentation: {
+          binding: testBinding("instrumentation.ts", owner),
+          logicalPath: "instrumentation.ts",
+          owner,
+          sourceId: "instrumentation.ts",
+          sourceKind: "module",
+        },
+      }),
+    );
+    const client = new Client({ host: "https://eve.test" });
+
+    const info = await client.info();
+
+    expect(info.instrumentation?.logicalPath).toBe("instrumentation.ts");
+  });
+
+  it("marks legacy kernel effect options as unrecognized", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        ...AGENT_INFO,
+        kernelEffects: [
+          {
+            action: "task-cancel",
+            audience: ["root-session", "delegated-task-child"],
+            kind: "background-task",
+            sourceId: "tools/task.ts",
+          },
+        ],
+      }),
+    );
+    const client = new Client({ host: "https://eve.test" });
+
+    const info = await client.info();
+
+    expect(info.kernelEffects).toEqual([
+      {
+        action: "unrecognized",
+        audience: ["root-session", "unrecognized"],
+        kind: "unrecognized",
+        sourceId: "tools/task.ts",
+      },
+    ]);
   });
 
   it("rejects unknown fields in the agent info payload", async () => {

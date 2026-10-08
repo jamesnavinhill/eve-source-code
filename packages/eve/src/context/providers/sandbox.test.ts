@@ -59,6 +59,7 @@ describe("sandboxProvider", () => {
   beforeEach(() => {
     vi.mocked(ensureSandboxAccess).mockResolvedValue({
       captureState: vi.fn().mockResolvedValue({ initialized: false, session: null }),
+      detach: vi.fn().mockResolvedValue(undefined),
       get: vi.fn().mockResolvedValue(null),
       stop: vi.fn().mockResolvedValue(undefined),
     });
@@ -80,13 +81,14 @@ describe("sandboxProvider", () => {
 
     expect(ensureSandboxAccess).toHaveBeenCalledWith(
       expect.objectContaining({
+        ownsSandbox: false,
         sessionId: "root-sandbox-session",
         state: parentSandboxState,
       }),
     );
   });
 
-  it("tags sandbox backend resources with agent, channel, and session id", async () => {
+  it("passes the owning session identity to sandbox access", async () => {
     const ctx = new ContextContainer();
     const registry: RuntimeSandboxRegistry = createStubSandboxRegistry();
 
@@ -98,11 +100,8 @@ describe("sandboxProvider", () => {
 
     expect(ensureSandboxAccess).toHaveBeenCalledWith(
       expect.objectContaining({
-        tags: {
-          agent: "weather-agent",
-          channel: "slack",
-          sessionId: "session_1",
-        },
+        ownsSandbox: true,
+        sessionId: "session_1",
       }),
     );
   });

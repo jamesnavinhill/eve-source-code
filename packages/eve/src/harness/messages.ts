@@ -8,6 +8,130 @@ import type {
 } from "#channel/types.js";
 import type { InputResponse } from "#shared/input.js";
 import type { StepInput } from "#harness/types.js";
+import { attachClientContext, readClientContext } from "#internal/client-context.js";
+import { attachInputText, readInputText } from "#internal/input-text.js";
+
+/** Reason a framework-authored user-role message was added to model history. */
+export type FrameworkMessageKind =
+  | "context.instruction"
+  | "context.state"
+  | "context.compaction"
+  | "memory.load"
+  | "execution.continuation"
+  | "execution.retry"
+  | "task.result";
+
+/** Semantic classification for every user-role message in model history. */
+export type UserMessageKind = "user" | FrameworkMessageKind;
+
+/** A user-role message that is safe to retain in framework model history. */
+export type UserModelMessage = Extract<ModelMessage, { readonly role: "user" }> & {
+  readonly kind: UserMessageKind;
+  readonly metadata?: Record<string, unknown>;
+};
+
+/** Model message shape retained in framework history. */
+export type HarnessModelMessage =
+  | Exclude<ModelMessage, { readonly role: "user" }>
+  | UserModelMessage;
+
+type FrameworkUserMessage = UserModelMessage & {
+  readonly kind: FrameworkMessageKind;
+};
+
+/** Builds a classified user-role message for model history. */
+export function createUserMessage(
+  kind: FrameworkMessageKind,
+  content: UserContent,
+  metadata?: Record<string, unknown>,
+): FrameworkUserMessage;
+export function createUserMessage(
+  kind: "user",
+  content: UserContent,
+  metadata?: Record<string, unknown>,
+): UserModelMessage;
+export function createUserMessage(
+  kind: UserMessageKind,
+  content: UserContent,
+  metadata?: Record<string, unknown>,
+): UserModelMessage {
+  const message: UserModelMessage = { content, kind, role: "user" };
+  return metadata === undefined ? message : { ...message, metadata };
+}
+
+/** Builds a framework-authored user-role message for model history. */
+export function createFrameworkUserMessage(
+  kind: FrameworkMessageKind,
+  content: UserContent,
+  metadata?: Record<string, unknown>,
+): FrameworkUserMessage {
+  return createUserMessage(kind, content, metadata);
+}
+
+/** True when a value is a recognized classification for a user-role message. */
+export function isUserMessageKind(value: unknown): value is UserMessageKind {
+  return value === "user" || isFrameworkMessageKind(value);
+}
+
+/** True when a user-role model message has the required semantic classification. */
+export function isUserModelMessage(message: ModelMessage): message is UserModelMessage {
+  if (message.role !== "user") return false;
+  const { kind } = message as ModelMessage & { readonly kind?: unknown };
+  return isUserMessageKind(kind);
+}
+
+/** True when a user-role message was authored by the framework. */
+export function isFrameworkUserMessage(message: ModelMessage): message is FrameworkUserMessage {
+  return isUserModelMessage(message) && message.kind !== "user";
+}
+
+/** Validates that every user-role message is classified before history retains it. */
+export function validateHarnessModelMessages(
+  messages: readonly ModelMessage[],
+): HarnessModelMessage[] {
+  const validated: HarnessModelMessage[] = [];
+  for (const message of messages) {
+    if (message.role !== "user") {
+      validated.push(message);
+      continue;
+    }
+    if (!isUserModelMessage(message)) {
+      throw new TypeError("Expected every user-role model message to have a kind.");
+    }
+    validated.push(message);
+  }
+  return validated;
+}
+
+export function isFrameworkMessageKind(value: unknown): value is FrameworkMessageKind {
+  return (
+    value === "context.instruction" ||
+    value === "context.state" ||
+    value === "context.compaction" ||
+    value === "memory.load" ||
+    value === "execution.continuation" ||
+    value === "execution.retry" ||
+    value === "task.result"
+  );
+}
+
+type FrameworkStepInput = StepInput & {
+  readonly frameworkMessageKind?: FrameworkMessageKind;
+};
+
+/** Marks an execution-owned delivery so its model message retains provenance. */
+export function markFrameworkStepInput(input: StepInput, kind: FrameworkMessageKind): StepInput {
+  return { ...input, frameworkMessageKind: kind } as FrameworkStepInput;
+}
+
+/** Returns the framework reason for an execution-owned user message, when present. */
+export function frameworkMessageKindForStepInput(
+  input: StepInput | undefined,
+): FrameworkMessageKind | undefined {
+  if (input === undefined) return undefined;
+  const { frameworkMessageKind } = input as FrameworkStepInput;
+  return isFrameworkMessageKind(frameworkMessageKind) ? frameworkMessageKind : undefined;
+}
 
 /**
  * Merges two {@link StepInput} values into one.
@@ -29,9 +153,20 @@ export function coalesceTurnInputs(a: StepInput, b: StepInput): StepInput {
     a: a.context,
     b: b.context,
   });
+  const frameworkMessageKind = coalesceFrameworkMessageKind({ a, b });
+  const ephemeralContext = coalesceContext({
+    a: readClientContext(a),
+    b: readClientContext(b),
+  });
   const outputSchema = b.outputSchema ?? a.outputSchema;
 
+  const attributedInputResponses = [
+    ...(a.attributedInputResponses ?? []),
+    ...(b.attributedInputResponses ?? []),
+  ];
+
   const result: {
+    attributedInputResponses?: StepInput["attributedInputResponses"];
     inputResponses?: readonly InputResponse[];
     message?: string | UserContent;
     context?: readonly string[];
@@ -40,6 +175,10 @@ export function coalesceTurnInputs(a: StepInput, b: StepInput): StepInput {
 
   if (inputResponses !== undefined) {
     result.inputResponses = inputResponses;
+  }
+
+  if (attributedInputResponses.length > 0) {
+    result.attributedInputResponses = attributedInputResponses;
   }
 
   if (message !== undefined) {
@@ -54,7 +193,22 @@ export function coalesceTurnInputs(a: StepInput, b: StepInput): StepInput {
     result.outputSchema = outputSchema;
   }
 
-  return result;
+  // Typed text describes one message, so it survives only when the other input has none.
+  const inputText =
+    normalizeUserContent(a.message) === undefined
+      ? readInputText(b)
+      : normalizeUserContent(b.message) === undefined
+        ? readInputText(a)
+        : undefined;
+  return attachClientContext(
+    attachInputText(
+      frameworkMessageKind === undefined
+        ? result
+        : markFrameworkStepInput(result, frameworkMessageKind),
+      inputText,
+    ),
+    ephemeralContext,
+  );
 }
 
 /**
@@ -79,6 +233,34 @@ export function normalizeUserContent(
     return undefined;
   }
   return parts.length === content.length ? content : parts;
+}
+
+/**
+ * Model-only assistant text between tool results and a person's next message.
+ * Without it, providers such as Anthropic fold the message into the user turn
+ * that carries the tool results, and the model reads it as tool output: it
+ * continues its plan instead of answering.
+ */
+export const TOOL_RESULT_BOUNDARY = "…";
+
+/** Whether a user message appended to `messages` would share a turn with tool results. */
+export function followsToolResults(messages: readonly ModelMessage[]): boolean {
+  return messages.findLast((message) => message.role !== "user")?.role === "tool";
+}
+
+export function createTurnInputMessages(input: StepInput | undefined): UserModelMessage[] {
+  const messages = [...(readClientContext(input) ?? []), ...(input?.context ?? [])].map((content) =>
+    createFrameworkUserMessage("context.instruction", content),
+  );
+  const content = normalizeUserContent(input?.message);
+  if (content === undefined) return messages;
+  const kind = frameworkMessageKindForStepInput(input);
+  return [
+    ...messages,
+    kind === undefined
+      ? createUserMessage("user", content)
+      : createFrameworkUserMessage(kind, content),
+  ];
 }
 
 /** Removes blank text blocks that some providers reject from model-bound history. */
@@ -179,6 +361,17 @@ function coalesceContext(input: {
   return [...a, ...b];
 }
 
+function coalesceFrameworkMessageKind(input: {
+  readonly a: StepInput;
+  readonly b: StepInput;
+}): FrameworkMessageKind | undefined {
+  const a = frameworkMessageKindForStepInput(input.a);
+  const b = frameworkMessageKindForStepInput(input.b);
+  if (input.a.message === undefined) return b;
+  if (input.b.message === undefined) return a;
+  return a === b ? a : undefined;
+}
+
 /**
  * Merges two optional turn messages into one after removing blank content.
  */
@@ -271,9 +464,10 @@ export function coalesceDeliveries<T extends DeliverLike>(items: readonly T[]): 
       auth = item.auth;
     }
     if (item.caller !== undefined) {
-      if (caller !== undefined) {
+      if (caller !== undefined && caller.callId !== item.caller.callId) {
         throw new Error("Cannot coalesce deliveries from different turns.");
       }
+      // The same caller's later message awaits its reply at its own address.
       caller = item.caller;
     }
     payloads.push(...item.payloads);

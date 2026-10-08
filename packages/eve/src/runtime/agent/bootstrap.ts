@@ -1,11 +1,15 @@
-import type { ModelMessage } from "ai";
+import type { HarnessModelMessage } from "#harness/messages.js";
 
-import { AGENT_TOOL_NAME } from "#tools/framework/agent-contract.js";
+import { createFrameworkUserMessage } from "#harness/messages.js";
+
 import { composeRuntimeBasePrompt } from "#runtime/prompt/compose.js";
 import type { PreparedRuntimeTool } from "#runtime/sessions/turn.js";
 import type { ResolvedAgent, ResolvedAgentDefinition } from "#runtime/types.js";
 import type { WorkspaceRuntimeSpec } from "#runtime/workspace/types.js";
-import type { InternalAgentModelDefinition } from "#shared/agent-definition.js";
+import type {
+  AgentReasoningDefinition,
+  InternalAgentModelDefinition,
+} from "#shared/agent-definition.js";
 import type { ModuleSourceRef } from "#shared/source-ref.js";
 import type { AvailableSkillDescription } from "#execution/skills/instructions.js";
 
@@ -18,7 +22,9 @@ export const BOOTSTRAP_RUNTIME_MODEL_ID = "eve-bootstrap-model";
 /**
  * Runtime-owned model identifier prepared for one harness turn.
  */
-export type RuntimeModelReference = Readonly<InternalAgentModelDefinition>;
+export type RuntimeModelReference = Readonly<
+  InternalAgentModelDefinition & { reasoning?: AgentReasoningDefinition }
+>;
 
 /**
  * Runtime-owned reference to a dynamic model resolver authored in `agent.ts`.
@@ -36,7 +42,7 @@ interface RuntimeTurnAgentBase {
   readonly availableSkills?: readonly AvailableSkillDescription[];
   readonly id: string;
   readonly instructions: readonly string[];
-  readonly initialMessages?: readonly ModelMessage[];
+  readonly initialMessages?: readonly HarnessModelMessage[];
   /**
    * Optional model used only for compaction summaries.
    *
@@ -44,7 +50,6 @@ interface RuntimeTurnAgentBase {
    */
   readonly compactionModel?: RuntimeModelReference;
   readonly nodeId?: string;
-  readonly outputSchema?: ResolvedAgentDefinition["outputSchema"];
   readonly reasoning?: ResolvedAgentDefinition["reasoning"];
   readonly tools: readonly PreparedRuntimeTool[];
   readonly workspaceSpec: WorkspaceRuntimeSpec;
@@ -91,15 +96,6 @@ export function createResolvedRuntimeTurnAgent(input: {
   if (id === undefined) {
     throw new Error("Expected a path-derived agent id while resolving agent resources.");
   }
-  const subagentDeclaredTool = input.tools.some(
-    (tool) => tool.kind === "subagent" || tool.kind === "remote",
-  );
-  const subagentFrameworkRootTool = input.tools.some(
-    (tool) =>
-      tool.kind === "authored-tool" &&
-      tool.owner.kind === "framework" &&
-      tool.name === AGENT_TOOL_NAME,
-  );
   const base: RuntimeTurnAgentBase = {
     availableSkills: agent.skills.map((skill) => ({
       description: skill.description,
@@ -108,18 +104,14 @@ export function createResolvedRuntimeTurnAgent(input: {
     id,
     initialMessages: agent.instructions
       .filter((entry) => entry.role === "user" && entry.content.trim().length > 0)
-      .map((entry) => ({ content: entry.content.trim(), role: "user" as const })),
+      .map((entry) => createFrameworkUserMessage("context.instruction", entry.content.trim())),
     instructions: composeRuntimeBasePrompt({
-      connections: agent.connections,
       instructions: agent.instructions,
-      subagentsAvailable: subagentDeclaredTool || subagentFrameworkRootTool,
-      tasksEnabled: config?.experimental?.tasks === true,
       toolsAvailable: input.tools.length > 0,
       workspaceSpec: agent.workspaceSpec,
     }),
     compactionModel: config?.compaction?.model,
     nodeId: input.nodeId,
-    outputSchema: config?.outputSchema,
     reasoning: config?.reasoning,
     tools: [...input.tools],
     workspaceSpec: agent.workspaceSpec,

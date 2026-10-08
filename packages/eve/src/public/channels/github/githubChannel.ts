@@ -90,7 +90,7 @@ export interface GitHubInboundContext {
 }
 
 /** Channel-owned GitHub context rebuilt from persisted channel state. */
-export interface GitHubChannelContext {
+interface GitHubChannelContext {
   readonly conversation: GitHubConversationRef;
   readonly github: GitHubHandle;
   readonly repository: GitHubRepositoryRef;
@@ -133,7 +133,8 @@ type GitHubSessionFailedHandler = (
 /**
  * Event handlers for `githubChannel({ events })`. The channel installs built-in
  * handlers for `turn.started` (eyes reaction plus repo checkout),
- * `message.completed` (posts the reply), `input.requested` (posts the prompt),
+ * `message.completed` (posts the reply), `input.requested`, `input.resolved`, and
+ * `approval.settled` (post each prompt in turn),
  * and `session.failed`/`turn.failed` (posts an error comment). A handler supplied
  * here replaces the built-in for that key rather than running alongside it.
  */
@@ -144,6 +145,8 @@ export interface GitHubChannelEvents {
   readonly "authorization.completed"?: GitHubEventHandler<"authorization.completed">;
   readonly "authorization.required"?: GitHubEventHandler<"authorization.required">;
   readonly "input.requested"?: GitHubEventHandler<"input.requested">;
+  readonly "input.resolved"?: GitHubEventHandler<"input.resolved">;
+  readonly "approval.settled"?: GitHubEventHandler<"approval.settled">;
   readonly "message.appended"?: GitHubEventHandler<"message.appended">;
   readonly "message.completed"?: GitHubEventHandler<"message.completed">;
   readonly "session.completed"?: GitHubEventHandler<"session.completed">;
@@ -326,6 +329,7 @@ export function githubChannel(config: GitHubChannelConfig = {}): GitHubChannel {
           if (event.kind === "issues" && config.onIssue !== undefined) {
             waitUntil(
               dispatchIssue({
+                botName,
                 config,
                 event,
                 handler: config.onIssue,
@@ -338,6 +342,7 @@ export function githubChannel(config: GitHubChannelConfig = {}): GitHubChannel {
           if (event.kind === "pull_request" && config.onPullRequest !== undefined) {
             waitUntil(
               dispatchPullRequest({
+                botName,
                 config,
                 event,
                 handler: config.onPullRequest,
@@ -350,6 +355,7 @@ export function githubChannel(config: GitHubChannelConfig = {}): GitHubChannel {
           if (event.kind === "check_suite" && config.onCheckSuite !== undefined) {
             waitUntil(
               dispatchCheckSuite({
+                botName,
                 config,
                 event,
                 handler: config.onCheckSuite,
@@ -362,6 +368,7 @@ export function githubChannel(config: GitHubChannelConfig = {}): GitHubChannel {
           if (event.kind === "check_run" && config.onCheckRun !== undefined) {
             waitUntil(
               dispatchCheckRun({
+                botName,
                 config,
                 event,
                 handler: config.onCheckRun,
@@ -374,6 +381,7 @@ export function githubChannel(config: GitHubChannelConfig = {}): GitHubChannel {
           if (event.kind === "workflow_run" && config.onWorkflowRun !== undefined) {
             waitUntil(
               dispatchWorkflowRun({
+                botName,
                 config,
                 event,
                 handler: config.onWorkflowRun,

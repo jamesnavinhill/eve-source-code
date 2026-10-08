@@ -5,6 +5,7 @@ import { callAdapterEventHandler, type ChannelAdapter } from "#channel/adapter.j
 import { isCompiledChannel, type CompiledChannel } from "#channel/compiled-channel.js";
 import { isHttpRouteDefinition } from "#channel/routes.js";
 import { ContextContainer, contextStorage } from "#context/container.js";
+import { enterSessionProjection } from "#harness/session-machine/current.js";
 import { SessionKey } from "#context/keys.js";
 import { mockChannelContext } from "#internal/testing/mocks/mock-channel-operations.js";
 import type { UnstampedMessageStreamEvent } from "#protocol/message.js";
@@ -12,6 +13,8 @@ import { defaultLinearAuth } from "#public/channels/linear/defaults.js";
 import { linearChannel, type LinearChannelState } from "#public/channels/linear/linearChannel.js";
 import { signLinearWebhookBody } from "#public/channels/linear/verify.js";
 import type { InputRequest } from "#shared/input.js";
+import { captureLogRecords } from "#internal/testing/log-records.js";
+import { mockAgentRouteArgs } from "#internal/testing/mocks/mock-route-args.js";
 
 const SECRET = "linear-secret";
 
@@ -32,7 +35,10 @@ function withState(
 }
 
 function stubAccessor() {
-  return { get: () => undefined, set: () => {} } as any;
+  const accessor = { get: () => undefined, set: () => {} } as any;
+  // A step enters its projection before it publishes.
+  enterSessionProjection(accessor, undefined);
+  return accessor;
 }
 
 const stubAlsContext = (() => {
@@ -92,6 +98,7 @@ function signedRequest(payload: Record<string, unknown>): Request {
 function sessionPayload(extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     action: "created",
+    appUserId: "app_user_1",
     agentSession: {
       creator: { displayName: "Ada Lovelace", id: "user_1" },
       id: "agent_session_1",
@@ -128,6 +135,7 @@ async function firePost(
   const waitUntil = vi.fn();
 
   const response = await post.handler(request, {
+    ...mockAgentRouteArgs(),
     attachSession: vi.fn() as any,
     ...mockChannelContext(send),
     params: {},
@@ -172,6 +180,7 @@ describe("linearChannel inbound Agent Session events", () => {
     const [continuationToken, input] = send.mock.calls[0]!;
     expect(input.message).toBe("Please handle this issue.");
     expect(input.context?.[0]).toContain("<linear_context>");
+    expect(input.context?.[0]).toContain("app_user_id: app_user_1");
     expect(input.context?.[0]).toContain("issue_identifier: EVE-123");
     expect(continuationToken).toBe("agent-session:agent_session_1");
     expect(input).toMatchObject({
@@ -200,29 +209,6 @@ describe("linearChannel inbound Agent Session events", () => {
 
     expect(response.status).toBe(200);
     expect(send).toHaveBeenCalledTimes(1);
-  });
-
-  it("delivers prompted values as messages for the harness to resolve", async () => {
-    const channel = linearChannel({ credentials: { webhookSecret: SECRET } });
-    const { send } = await firePost(
-      channel,
-      signedRequest(
-        sessionPayload({
-          action: "prompted",
-          agentActivity: {
-            content: { body: "approve", type: "prompt" },
-            id: "activity_prompt",
-            user: { id: "user_1" },
-            userId: "user_1",
-          },
-        }),
-      ),
-    );
-
-    expect(send).toHaveBeenCalledTimes(1);
-    const [, input] = send.mock.calls[0]!;
-    expect(input.inputResponses).toBeUndefined();
-    expect(input.message).toBe("approve");
   });
 
   it("attaches authenticated Linear upload images to prompted messages", async () => {
@@ -399,6 +385,7 @@ describe("linearChannel default event handlers", () => {
   });
 
   it("posts turn-start and tool-call progress as ephemeral Linear activities", async () => {
+    const logs = captureLogRecords();
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse({
         data: {
@@ -458,6 +445,12 @@ describe("linearChannel default event handlers", () => {
         },
       },
     });
+    expect(logs.records).toContainEqual(
+      expect.objectContaining({
+        level: "error",
+        message: "adapter event handler threw — event swallowed",
+      }),
+    );
   });
 
   it("surfaces pre-tool-call assistant text as the next ephemeral Linear thought", async () => {

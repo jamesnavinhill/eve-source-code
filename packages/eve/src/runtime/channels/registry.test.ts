@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { ChannelAdapter } from "#channel/adapter.js";
 import { HTTP_ADAPTER, HTTP_ADAPTER_KIND } from "#channel/http.js";
 import { SCHEDULE_ADAPTER, SCHEDULE_ADAPTER_KIND } from "#channel/schedule.js";
-import { SUBAGENT_ADAPTER_KIND } from "#execution/subagent-adapter-state.js";
-import { SUBAGENT_ADAPTER } from "#execution/subagent-adapter.js";
+import { SUBAGENT_ADAPTER_KIND } from "#subagents/adapter-state.js";
+import { SUBAGENT_ADAPTER } from "#subagents/adapter.js";
 import { RuntimeRegistryError } from "#internal/runtime-registry.js";
 import type { ResolvedChannelDefinition } from "#runtime/types.js";
 import {
@@ -55,7 +55,7 @@ describe("createRuntimeAdapterRegistry", () => {
     // channel-less schedule (i.e. every markdown schedule, which is
     // forbidden from declaring a channel). Locks the framework
     // registration so that rehydrating a serialized schedule adapter
-    // returns the bare discriminator instead of throwing.
+    // restores its kind and state instead of throwing.
     it("rehydrates a serialized schedule adapter through the framework registry", () => {
       const registry = createRuntimeAdapterRegistry({ channels: [] });
 
@@ -64,7 +64,7 @@ describe("createRuntimeAdapterRegistry", () => {
         state: {},
       });
 
-      expect(rehydrated).toEqual({ kind: SCHEDULE_ADAPTER_KIND, state: {} });
+      expect(rehydrated).toMatchObject({ kind: SCHEDULE_ADAPTER_KIND, state: {} });
     });
 
     // Mirror of the schedule rehydration regression — proves the

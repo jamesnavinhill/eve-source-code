@@ -17,12 +17,14 @@ import { translations } from "@/geistdocs";
 import { Markdown } from "../components/markdown";
 import { SetupTabs } from "../components/setup-tabs";
 import { IntegrationDocsLink } from "./integration-docs-link";
+import { RelatedResources } from "./related-resources";
 
 const typeLabel = {
   channel: "Channel",
   connection: "Connection",
   extension: "Extension",
   instrumentation: "Instrumentation",
+  memory: "Memory provider",
 } as const;
 
 const languages = Object.keys(translations);
@@ -96,7 +98,7 @@ const IntegrationDetailPage = async ({ params }: PageProps<"/[lang]/integrations
       </Link>
 
       <header className="mt-8 flex flex-col gap-5 border-b pb-10">
-        <span className="flex size-14 items-center justify-center rounded-xl border bg-background text-gray-1000">
+        <span className="flex size-14 items-center justify-center rounded-xl border bg-background">
           <Logo aria-hidden className="size-7" height={28} width={28} />
         </span>
         <div className="flex flex-col gap-2">
@@ -135,7 +137,7 @@ const IntegrationDetailPage = async ({ params }: PageProps<"/[lang]/integrations
           </Markdown>
         </Section>
         <Section title="Quick start">
-          {setup ? (
+          {setup && integration.quickStart === undefined ? (
             <Suspense
               fallback={
                 <Markdown>
@@ -157,7 +159,7 @@ const IntegrationDetailPage = async ({ params }: PageProps<"/[lang]/integrations
           )}
         </Section>
         <Section id="configure" title="Configure">
-          {setup ? (
+          {setup && integration.configure === undefined ? (
             <Suspense
               fallback={
                 <Markdown>
@@ -178,6 +180,14 @@ const IntegrationDetailPage = async ({ params }: PageProps<"/[lang]/integrations
             </Markdown>
           )}
         </Section>
+        {integration.relatedResources?.length ? (
+          <Section id="related-resources" title="Related resources">
+            <RelatedResources
+              integration={integration.slug}
+              resources={integration.relatedResources}
+            />
+          </Section>
+        ) : null}
       </div>
     </main>
   );

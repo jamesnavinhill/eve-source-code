@@ -6,7 +6,7 @@ import {
 } from "#setup/primitives/pm/run.js";
 
 /** Effects used to install dependencies added by an integration scaffold. */
-export interface IntegrationScaffoldDeps {
+interface IntegrationScaffoldDeps {
   detectPackageManager: typeof detectPackageManager;
   runPackageManagerInstall: typeof runPackageManagerInstall;
 }
@@ -27,7 +27,7 @@ export async function installScaffoldDependencies(input: {
   const packageManager = await deps.detectPackageManager(input.projectPath);
   const installResult = await withPhase(
     input.log,
-    `Installing channel dependencies (${packageManager.kind} install)...`,
+    `Installing integration dependencies (${packageManager.kind} install)...`,
     () =>
       deps.runPackageManagerInstall(packageManager.kind, input.projectPath, {
         onOutput: createPromptCommandOutput(input.log),
@@ -36,7 +36,7 @@ export async function installScaffoldDependencies(input: {
   );
   if (packageManagerInstallSucceeded(installResult)) return;
   input.log.warning(
-    `Dependency installation failed. The new channel stays unloadable until \`${packageManager.kind} install\` or a deploy succeeds.`,
+    `Dependency installation failed. The integration stays unloadable until \`${packageManager.kind} install\` or a deploy succeeds.`,
   );
 }
 

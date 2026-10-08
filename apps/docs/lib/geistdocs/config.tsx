@@ -1,5 +1,5 @@
 import { defineConfig } from "@vercel/geistdocs/config";
-import { LogoEve } from "@vercel/geistdocs/assets/logos/logo-eve";
+import { LogoEveSvg } from "@vercel/geistdocs/assets/logos/logo-eve-svg";
 import {
   agent,
   basePath,
@@ -29,6 +29,7 @@ export const config = defineConfig({
   siteId,
   siteUrl: getSiteOrigin(),
   translations,
+  webmcp: { enabled: true },
   // Built-in edit link hardcodes `/edit/` and a `content/docs/` prefix; we
   // render our own `/blob/` link instead (see EditOnGithubAction).
   pageActions: { editSource: false },
@@ -47,7 +48,7 @@ export const config = defineConfig({
           href="https://eve.dev"
         >
           <span>Powered by</span>
-          <LogoEve height={10} />
+          <LogoEveSvg height={10} />
         </a>
       </div>
     ),

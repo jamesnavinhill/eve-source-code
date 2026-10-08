@@ -62,6 +62,7 @@ import { readNonEmptyString } from "#shared/guards.js";
 import { parseJsonObject, type JsonObject } from "#shared/json.js";
 import { defineChannel, POST, type Channel } from "#public/definitions/channel.js";
 import type { ChannelAudience } from "#shared/channel-audience.js";
+import type { InputOption } from "#shared/input.js";
 
 const log = createLogger("teams.channel");
 
@@ -81,7 +82,7 @@ export interface TeamsInboundMessageContext extends TeamsContext {
 }
 
 /** Channel-owned Teams context returned by `context()`. */
-export interface TeamsChannelContext extends TeamsContext {
+interface TeamsChannelContext extends TeamsContext {
   readonly adaptiveCardVersion: string;
   state: TeamsChannelState;
 }
@@ -89,12 +90,15 @@ export interface TeamsChannelContext extends TeamsContext {
 /** Event-handler Teams context, including continuation routing. */
 export interface TeamsEventContext extends TeamsChannelContext, ChannelContinuationOps {}
 
-/** JSON-serializable Teams channel state. */
-export interface TeamsPendingApprovalCard {
+/** A posted question or approval card, kept until eve resolves its request. */
+export interface TeamsPendingPromptCard {
   readonly activityId: string;
+  /** A question's options, so its card can show the chosen label. */
+  readonly options?: readonly Pick<InputOption, "id" | "label">[];
   readonly prompt: string;
 }
 
+/** JSON-serializable Teams channel state. */
 export interface TeamsChannelState {
   /** Bot account captured from the inbound activity recipient. */
   bot: TeamsChannelAccount | null;
@@ -111,7 +115,7 @@ export interface TeamsChannelState {
   triggeringUser: TeamsChannelAccount | null;
   /** Activity id for the default connection-auth card, when posted. */
   pendingAuthActivityId?: string | null;
-  pendingApprovalCards?: Record<string, TeamsPendingApprovalCard>;
+  pendingPromptCards?: Record<string, TeamsPendingPromptCard>;
   approvalResponderAccounts?: Record<string, TeamsChannelAccount>;
 }
 
@@ -179,6 +183,7 @@ type TeamsSessionFailedHandler = (
 export interface TeamsChannelEvents {
   readonly "approval.candidate"?: TeamsEventHandler<"approval.candidate">;
   readonly "approval.settled"?: TeamsEventHandler<"approval.settled">;
+  readonly "input.resolved"?: TeamsEventHandler<"input.resolved">;
   readonly "turn.started"?: TeamsEventHandler<"turn.started">;
   readonly "actions.requested"?: TeamsEventHandler<"actions.requested">;
   readonly "action.partial"?: TeamsEventHandler<"action.partial">;
@@ -302,13 +307,16 @@ export function teamsChannel(config: TeamsChannelConfig = {}): TeamsChannel {
     kindHint: "teams",
     turnPolicy: config.turnPolicy,
     state: initialTeamsState(),
-    fetchFile: createTeamsFetchFile(filesPolicy),
+    fetchFile: createTeamsFetchFile(filesPolicy, {
+      ...config.api,
+      credentials: config.credentials,
+    }),
     metadata: (state) => ({
-      audience: teamsAudience(state.conversationType),
       channelId: state.channelId,
       conversationType: state.conversationType,
       teamId: state.teamId,
     }),
+    audience: ({ state }) => teamsAudience(state.conversationType),
 
     context(state, session) {
       return rebuildTeamsContext(state, session, config);
@@ -316,11 +324,11 @@ export function teamsChannel(config: TeamsChannelConfig = {}): TeamsChannel {
 
     deliver(payload, channel) {
       const state = payload.state as Partial<TeamsChannelState> | undefined;
-      const cards = state?.pendingApprovalCards;
+      const cards = state?.pendingPromptCards;
       if (cards !== undefined) {
-        channel.state.pendingApprovalCards = {
+        channel.state.pendingPromptCards = {
           ...cards,
-          ...channel.state.pendingApprovalCards,
+          ...channel.state.pendingPromptCards,
         };
       }
       const responders = state?.approvalResponderAccounts;
@@ -502,7 +510,7 @@ function buildTeamsHandle(input: {
     state.replyToActivityId = posted.id;
     const conversationId = state.conversationId;
     if (conversationId) {
-      input.session?.continuation?.rekey(
+      input.session?.continuation?.alias(
         teamsContinuationToken({
           conversationId,
           replyToActivityId: posted.id,
@@ -638,9 +646,11 @@ async function dispatchMessage(input: {
   const turnMessage = buildTeamsTurnMessage(input.activity.text, fileParts);
   const inboundContext: TeamsInboundContext = {
     activityId: input.activity.id,
+    botId: input.activity.recipient.id,
     channelId: input.activity.teamsChannelId,
     conversationId: input.activity.conversation.id,
     conversationType: input.activity.conversationType,
+    isMentioned: input.activity.isBotMentioned,
     scope: input.activity.scope,
     teamId: input.activity.teamId,
     tenantId: input.activity.tenantId,
@@ -764,7 +774,7 @@ function approvalResponseStatePatch(
   }
   return {
     approvalResponderAccounts: { [auth.principalId]: activity.from },
-    pendingApprovalCards: {
+    pendingPromptCards: {
       [requestId]: {
         activityId,
         prompt: readTeamsToolApprovalPrompt(activity) ?? "Tool approval",
@@ -791,7 +801,7 @@ function initialTeamsState(): TeamsChannelState {
     conversationId: null,
     conversationType: null,
     approvalResponderAccounts: {},
-    pendingApprovalCards: {},
+    pendingPromptCards: {},
     pendingAuthActivityId: null,
     replyToActivityId: null,
     serviceUrl: null,

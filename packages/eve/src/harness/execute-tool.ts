@@ -1,38 +1,30 @@
 import type { FlexibleSchema } from "ai";
 
 import type { Approval } from "#approval/definition.js";
-import type { ToolExecuteOptions } from "#tools/definition.js";
-import type { TaskExec } from "#tools/task.js";
-
-/**
- * Runtime-owned action metadata attached to one harness-visible tool.
- *
- * These tools are surfaced to the model without a local `execute` function.
- * The harness records the tool call and the runtime executes it later.
- *
- * `task-control` marks the `experimental.tasks` parent tools
- * (`task_cancel`, `task_update`): they carry no child
- * address of their own — the dispatch step resolves targets through the
- * session task index by tool name.
- */
-export type HarnessRuntimeActionDefinition =
-  | {
-      readonly kind: "remote-agent-call" | "subagent-call";
-      readonly nodeId: string;
-      readonly remoteAgentName?: string;
-      readonly subagentName: string;
-    }
-  | { readonly kind: "task-control" };
+import type {
+  InternalToolDefinition,
+  InternalToolLabelDefinition,
+  ToolExecuteOptions,
+} from "#tools/definition.js";
+import type { JsonValue } from "#shared/json.js";
+import type { PreparedToolBehavior } from "#tools/behavior.js";
 
 /**
  * Unified harness-owned tool definition.
  */
 export interface HarnessToolDefinition {
+  readonly availableInSubagents?: boolean;
+  readonly label?: InternalToolLabelDefinition;
   readonly approvalKey?: (toolInput: Readonly<Record<string, unknown>>) => string;
+  readonly behavior?: PreparedToolBehavior;
   readonly description: string;
-  readonly execute?: (input: any, options: ToolExecuteOptions, task?: TaskExec) => any;
-  readonly execution?: "background";
-  readonly frameworkAction?: "load-skill";
+  /** A successful call ends the turn without a final reply; see `ToolDefinition.endsTurn`. */
+  readonly endsTurn?: InternalToolDefinition["endsTurn"];
+  readonly execute?: (input: any, options: ToolExecuteOptions) => any;
+  /** Optional JSON input substituted when this tool starts its workflow body. */
+  readonly executeInput?: (input: unknown) => JsonValue;
+  readonly frameworkTool?: boolean;
+  readonly frameworkAction?: "load-skill" | "task-cancel" | "task-wait";
   readonly inputSchema: FlexibleSchema;
   readonly name: string;
   readonly approval?: Approval;
@@ -43,7 +35,7 @@ export interface HarnessToolDefinition {
    * cannot delegate recursively. Absent means visible everywhere.
    */
   readonly rootOnly?: boolean;
-  readonly runtimeAction?: HarnessRuntimeActionDefinition;
   readonly toModelOutput?: (output: unknown) => unknown;
-  readonly workflowCallable?: boolean;
+  /** Present when this tool starts an associated durable workflow. */
+  readonly workflowId?: string;
 }

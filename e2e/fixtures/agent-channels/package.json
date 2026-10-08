@@ -7,8 +7,9 @@
     "build": "eve build",
     "dev": "eve dev",
     "start": "eve start",
-    "typecheck": "eve build && tsc",
-    "test:e2e": "eve eval --strict"
+    "typecheck": "eve build --skip-sandbox-prewarm && tsc",
+    "test:e2e": "eve eval --strict",
+    "test:unit": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@eve-e2e/config": "workspace:*",
@@ -18,7 +19,6 @@
   },
   "devDependencies": {
     "@types/node": "catalog:",
-    "historical-eve-0-30-8": "npm:eve@0.30.8",
     "typescript": "catalog:"
   }
 }

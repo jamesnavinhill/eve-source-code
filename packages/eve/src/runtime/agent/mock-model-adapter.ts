@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { LanguageModel } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import { z } from "#compiled/zod/index.js";
@@ -23,7 +25,7 @@ import {
   getLastUserPromptText,
   getPromptContentText,
   getPromptText,
-  isAgentsAnnouncementText,
+  isFrameworkAnnouncementText,
 } from "#runtime/agent/bootstrap-model-utils.js";
 import {
   findRelevantSkill,
@@ -32,6 +34,7 @@ import {
 } from "#runtime/agent/mock-model-skill-selection.js";
 import { createJsonSchemaSample } from "#runtime/agent/mock-structured-output.js";
 import { FINAL_OUTPUT_TOOL_NAME } from "#harness/final-output.js";
+import { readTaskResults } from "#execution/tasks/render.js";
 import { LOAD_SKILL_TOOL_NAME } from "#runtime/skills/fragment-context.js";
 
 const MOCK_RUNTIME_MODEL_PROVIDER = "eve-runtime-mock";
@@ -258,7 +261,7 @@ function createParallelAuthoredToolCallsResult(
 /**
  * Emits one built-in `agent` tool call when the current user message uses
  * the explicit directive `Delegate to a subagent: <message>`, letting
- * tests exercise a real runtime-action wait. Fires only before the
+ * tests exercise a real coordination wait. Fires only before the
  * delegated call resolves; then the reply path takes over.
  */
 function createSubagentDelegationResult(
@@ -277,22 +280,22 @@ function createSubagentDelegationResult(
     return null;
   }
 
-  const tool = getAvailableTools(options).find((entry) => entry.name === SUBAGENT_TOOL_NAME);
+  const toolName = SUBAGENT_TOOL_NAME;
+  const tool = getAvailableTools(options).find((entry) => entry.name === toolName);
 
   if (tool === undefined) {
     return null;
   }
 
   const message = directive[1].trim();
-  const toolInput = { message };
 
   return createToolCallGenerateResult({
-    input: toolInput,
+    input: { message },
     inputTokens: estimateTokenCount(getPromptText(options.prompt)),
     modelId,
-    outputTokens: estimateTokenCount(toolInput.message),
-    toolCallId: createToolCallId(SUBAGENT_TOOL_NAME),
-    toolName: SUBAGENT_TOOL_NAME,
+    outputTokens: estimateTokenCount(message),
+    toolCallId: createToolCallId(toolName),
+    toolName,
   });
 }
 
@@ -364,8 +367,14 @@ function createFollowUpToolCallResult(input: {
   });
 }
 
+const LIST_ATTACHMENTS_DIRECTIVE = /\blist the attachments\b/iu;
+
 function createAssistantMessage(prompt: BootstrapPrompt): string {
   const lastUserMessage = getLastUserPromptText(prompt) ?? "Hello from eve";
+  // Lets tests see exactly which files reached the model, through a channel's real reply.
+  if (LIST_ATTACHMENTS_DIRECTIVE.test(lastUserMessage)) {
+    return `Attachments: ${JSON.stringify(listPromptAttachments(prompt))}`;
+  }
   const systemLabels = getSystemPromptLabels(prompt);
   const systemProbe = resolveSystemProbe(prompt);
   const fixtureToken = resolveMockFixtureToken(prompt);
@@ -485,14 +494,16 @@ function getAvailableTools(options: BootstrapGenerateOptions): AvailableBootstra
 function getLastAuthoredToolResult(prompt: BootstrapPrompt): BootstrapToolResult | null {
   for (const message of [...prompt].reverse()) {
     if (message.role === "user") {
-      // A framework-injected [Agents] announcement is scaffolding, not a
-      // turn boundary. Treating it as one masks the tool result behind it,
-      // and the adapter then re-issues the same deterministic tool call —
-      // for subagent starts that collides on the derived operation id and
-      // fatally fails the parent session.
-      if (isAgentsAnnouncementText(getPromptContentText(message.content).trim())) {
-        continue;
+      const text = getPromptContentText(message.content).trim();
+      // A task's result arrives after its receipt, in a message of its own.
+      const task = readTaskResults(text).at(-1);
+      if (task !== undefined) {
+        const { body: output, taskId: toolCallId, tool: toolName } = task;
+        return { isError: task.status === "failed", output, toolCallId, toolName };
       }
+      // The [Tasks] note is scaffolding, not a turn boundary: skipping it keeps
+      // the tool result behind it, so the same call is not issued again.
+      if (isFrameworkAnnouncementText(text)) continue;
       return null;
     }
 
@@ -686,9 +697,57 @@ function isWeatherPayload(value: unknown): value is {
   readonly summary: string;
   readonly temperatureF: number;
 } {
-  return bootstrapWeatherPayloadSchema.safeParse(value).success;
+  return z.validate(bootstrapWeatherPayloadSchema, value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// eve's notes for files it couldn't pass on, such as "Attachment x.pdf could not be retrieved."
+const ATTACHMENT_NOTE = /^Attachment\b/u;
+
+/**
+ * Every file part in the prompt's user messages, and every note eve left for a
+ * file it couldn't pass on, oldest first, as a test can compare them.
+ */
+function listPromptAttachments(prompt: BootstrapPrompt): readonly Record<string, unknown>[] {
+  return prompt.flatMap((message): Record<string, unknown>[] => {
+    if (message.role !== "user" || typeof message.content === "string") return [];
+    return message.content.flatMap((part): Record<string, unknown>[] => {
+      if (typeof part === "string") return [];
+      // Single quotes, so a channel that strips Markdown escapes can't break the listing's JSON.
+      if (part.type === "text") {
+        return ATTACHMENT_NOTE.test(part.text) ? [{ note: part.text.replaceAll('"', "'") }] : [];
+      }
+      if (part.type !== "file") return [];
+      const name = part.filename?.split("/").at(-1) ?? null;
+      const data = fileData(part.data);
+      if (data instanceof URL) return [{ mediaType: part.mediaType, name, url: data.href }];
+      if (data === undefined) return [{ mediaType: part.mediaType, name }];
+      const bytes = typeof data === "string" ? Buffer.from(data, "base64") : Buffer.from(data);
+      return [
+        {
+          bytes: bytes.length,
+          mediaType: part.mediaType,
+          name,
+          sha256: createHash("sha256").update(bytes).digest("hex").slice(0, 16),
+        },
+      ];
+    });
+  });
+}
+
+/** A file part's bytes or URL, from either the plain or the tagged (`{ type: "data" }`) shape. */
+function fileData(data: unknown): Uint8Array | string | URL | undefined {
+  if (typeof data === "string" || data instanceof Uint8Array || data instanceof URL) return data;
+  if (typeof data !== "object" || data === null) return undefined;
+  const tagged = data as {
+    readonly data?: unknown;
+    readonly type?: unknown;
+    readonly url?: unknown;
+  };
+  if (tagged.type === "url" && tagged.url instanceof URL) return tagged.url;
+  if (tagged.type === "data") return fileData(tagged.data);
+  return undefined;
 }

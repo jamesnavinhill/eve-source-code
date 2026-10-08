@@ -72,7 +72,7 @@ void (async () => {
       start: 900,
       end: 900,
       attributes: {
-        "agent.session.id": "session-smoke",
+        "gen_ai.conversation.id": "session-smoke",
         "agent.name": "smoke-agent",
       },
     });
@@ -83,7 +83,7 @@ void (async () => {
       end: 1_000,
       parentSpanId: sessionRoot,
       attributes: {
-        "agent.session.id": "session-smoke",
+        "gen_ai.conversation.id": "session-smoke",
         "agent.name": "smoke-agent",
         "agent.turn.id": "turn_0",
       },
@@ -115,7 +115,7 @@ void (async () => {
       parentSpanId: step,
       attributes: {
         "gen_ai.request.model": "smoke-model-v1",
-        "ai.prompt.system": SYSTEM_PROMPT,
+        "gen_ai.system_instructions": JSON.stringify([{ content: SYSTEM_PROMPT, type: "text" }]),
         "ai.response.text": "smoke reply",
       },
     });
@@ -140,7 +140,7 @@ void (async () => {
       end: 7_000,
       parentSpanId: turn,
       attributes: {
-        "agent.action.call_id": "call-1",
+        "gen_ai.tool.call.id": "call-1",
         "agent.action.kind": "subagent-call",
         "agent.action.name": "echo",
         "agent.turn.id": "turn_0",
@@ -155,7 +155,7 @@ void (async () => {
       end: 7_000,
       parentSpanId: subagentAction,
       attributes: {
-        "agent.session.id": "child-session",
+        "gen_ai.conversation.id": "child-session",
         "agent.turn.id": "turn_child",
       },
     });
@@ -194,7 +194,7 @@ void (async () => {
       name: "agent.turn",
       start: 500,
       end: 900,
-      attributes: { "agent.session.id": "older-session" },
+      attributes: { "gen_ai.conversation.id": "older-session" },
     });
     // The viewer lists traces by segments-dir mtime (last span activity);
     // same-millisecond writes would race, so pin the ordering explicitly.
@@ -212,7 +212,7 @@ void (async () => {
     await screen.waitForText("smoke prompt", 5_000);
     await screen.waitForText("smoke reply", 5_000);
     await screen.waitForText("get_weather", 5_000);
-    if (screen.snapshot().includes("›")) {
+    if (screen.snapshot().includes("❯")) {
       throw new Error(`The chat prompt leaked into the viewer frame:\n${screen.snapshot()}`);
     }
     console.log(theme.muted("[tui-traces] /traces opened on the conversation cards"));

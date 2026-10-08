@@ -7,12 +7,7 @@ import { runtimeToolCallActionRequestSchema } from "#shared/action-types.js";
  */
 export type InputOption = z.infer<typeof inputOptionSchema>;
 
-/**
- * Zod schema for one input option.
- *
- * Includes descriptions because the `ask_question` tool input embeds this
- * schema and exposes it directly to the model.
- */
+/** Zod schema for one input option. */
 export const inputOptionSchema = z
   .object({
     description: z.string().describe("Optional additional context for this option.").optional(),
@@ -131,12 +126,12 @@ export type StrictInputResponses<TResponses extends readonly InputResponse[]> = 
  * Returns true when a value matches the input request contract.
  */
 export function isInputRequest(value: unknown): value is InputRequest {
-  return inputRequestSchema.safeParse(value).success;
+  return z.validate(inputRequestSchema, value);
 }
 
 /**
  * Returns true when a value matches the input response contract.
  */
 export function isInputResponse(value: unknown): value is ValidatedInputResponse {
-  return inputResponseSchema.safeParse(value).success;
+  return z.validate(inputResponseSchema, value);
 }

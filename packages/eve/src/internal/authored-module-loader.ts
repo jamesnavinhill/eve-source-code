@@ -1,36 +1,48 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 
+import { extensionOverridePaths } from "#compiler/extension-mount-bindings.js";
 import type { CompiledAgentManifest } from "#compiler/manifest.js";
 import { createCompiledModuleMapSource } from "#compiler/module-map.js";
 import { createAuthoredAssetImportPlugin } from "#internal/authored-asset-import-plugin.js";
-import { assertNoWorkflowDirectivePrologue } from "#internal/authored-directive-prologue.js";
+import {
+  createExtensionMountPlugin,
+  EXTENSION_CHUNK_DIRECTORY,
+} from "#internal/bundler/extension-mount-plugin.js";
+import { authoredModuleConditions } from "#internal/authored-module-conditions.js";
 import { createAuthoredModuleBundleError } from "#internal/authored-module-bundle.js";
 import { createAuthoredModuleEvaluationError } from "#internal/authored-module-evaluation-error.js";
 import { createAuthoredPackageTsConfigPathsPlugin } from "#internal/authored-package-tsconfig-paths.js";
 import { createAuthoredRelativeExtensionResolverPlugin } from "#internal/authored-relative-extension-resolver.js";
 import {
   createExtensionScopePlugin,
-  createFixedNamespaceScopePlugin,
+  createFixedMountScopePlugin,
 } from "#internal/bundler/extension-scope-plugin.js";
 import {
-  CACHED_CHANNEL_PREFIX,
   RESOLVE_EXTENSIONS,
   createDistributionPackageBoundaryPlugin,
   createGenerationPackageBoundaryPlugin,
   createRuntimeLoaderPackageBoundaryPlugin,
   isNodeModulesPath,
   normalizeExternalDependencies,
-  type RolldownResolveContext,
 } from "#internal/authored-package-boundary.js";
 import { expectObjectRecord } from "#internal/authored-module.js";
+import { normalizeEsmImportSpecifier } from "#internal/application/import-specifier.js";
+import { resolvePackageSourceFilePath } from "#internal/application/package.js";
 import {
   buildSingleRolldownChunk,
   buildWithNitroRolldown,
 } from "#internal/bundler/nitro-rolldown.js";
 import { createNodeEsmCompatBannerPlugin } from "#internal/node-esm-compat-banner.js";
+import type { AuthoredWorkflowModules } from "#internal/workflow-bundle/builder-support.js";
+import { prepareAuthoredWorkflowDirectives } from "#internal/workflow-bundle/authored-workflow-directives.js";
 import { createDynamicCapabilityTransformPlugin } from "#internal/workflow-bundle/dynamic-capability-transform-plugin.js";
+import {
+  applyWorkflowTransform,
+  isAuthoredApplicationModule,
+  type WorkflowManifest,
+} from "#internal/workflow-bundle/workflow-builders.js";
 
 const AUTHORED_BUNDLED_MODULE_EXTENSION = /\.[cm]?[jt]sx?$/;
 const AUTHORED_MODULE_BUNDLE_DIRECTORY_PATH = join(
@@ -39,22 +51,32 @@ const AUTHORED_MODULE_BUNDLE_DIRECTORY_PATH = join(
   "eve",
   "authored-modules",
 );
-const CHANNEL_MODULE_CACHE_KEY = "__eveChannelModuleCache__";
 
-export interface AuthoredModuleLoadOptions {
-  readonly externalDependencies?: readonly string[];
-  /**
-   * When set, the module being loaded is extension-owned: its
-   * `defineState`/`defineExtension` calls (and those of its same-package
-   * dependencies bundled with it) are scoped to this namespace at bundle time.
-   */
-  readonly extensionScopeNamespace?: string;
+export interface ExtensionMountEntry {
+  readonly mountSourcePath: string;
+  readonly packageName: string;
+  readonly sourceRoot: string;
+  readonly specifier: string;
 }
 
-function getChannelModuleCache(): Map<string, unknown> | undefined {
-  return (globalThis as Record<string, unknown>)[CHANNEL_MODULE_CACHE_KEY] as
-    | Map<string, unknown>
-    | undefined;
+export interface AuthoredModuleLoadOptions {
+  /**
+   * Selected app root that owns authored Workflow ids. A workspace member's app root sits
+   * below the shared package root, which still owns dependency resolution.
+   */
+  readonly appRoot?: string;
+  readonly externalDependencies?: readonly string[];
+  readonly extension?: {
+    readonly mountId: string;
+    /** Only filesystem mounts need a synthetic entry to bind their configuration. */
+    readonly entry?: ExtensionMountEntry;
+    /**
+     * Filesystem mounts enclosing `mountId`, outermost first. A mount declared inside another
+     * extension may read that extension's configuration, so those mounts bind first.
+     */
+    readonly ancestors?: readonly (ExtensionMountEntry & { readonly mountId: string })[];
+    readonly evaluationId?: string;
+  };
 }
 
 /**
@@ -146,13 +168,42 @@ export async function bundleAuthoredModuleCode(
   modulePath: string,
   options: AuthoredModuleLoadOptions = {},
 ): Promise<string> {
+  const packageRoot = resolveAuthoredPackageRoot(modulePath);
+  const mount = options.extension?.entry;
+  const mountId = options.extension?.mountId;
+  const mountChain =
+    mount === undefined
+      ? []
+      : [...(options.extension?.ancestors ?? []), { ...mount, mountId: mountId! }];
   return await buildAuthoredModuleBundle(modulePath, options, {
-    channelIdentity: true,
     packageBoundaryPlugin: createRuntimeLoaderPackageBoundaryPlugin({
       externalDependencies: normalizeExternalDependencies(options.externalDependencies),
-      packageRoot: resolveAuthoredPackageRoot(modulePath),
+      packageRoot,
+      extensionSpecifiers: new Set(mountChain.map((entry) => entry.specifier)),
     }),
-    plugins: [],
+    plugins: [
+      ...(mount === undefined
+        ? []
+        : [
+            {
+              name: "eve-compile-mount-entry",
+              resolveId(id: string) {
+                return id === "\0eve-compile-mount-entry" ? id : undefined;
+              },
+              load(id: string) {
+                if (id !== "\0eve-compile-mount-entry") return undefined;
+                const mountImports = mountChain.map(
+                  (entry) =>
+                    `import ${JSON.stringify(`${entry.mountSourcePath}?eve-mount=${encodeURIComponent(entry.mountId)}`)};`,
+                );
+                const contribution = `${modulePath}?eve-mount=${encodeURIComponent(mountId!)}`;
+                return `${mountImports.join(" ")} export * from ${JSON.stringify(contribution)}; import entry from ${JSON.stringify(contribution)}; export default entry;`;
+              },
+            },
+          ]),
+      createAuthoredWorkflowDirectivePlugin({ appRoot: options.appRoot ?? packageRoot }),
+      ...(mount === undefined ? [] : [createExtensionMountPlugin(mountChain)!]),
+    ],
     sourcemap: "inline",
   });
 }
@@ -168,10 +219,6 @@ export async function bundleAuthoredModuleForGeneration(
   options: AuthoredModuleLoadOptions = {},
 ): Promise<string> {
   const code = await buildAuthoredModuleBundle(modulePath, options, {
-    // Generation bundles must not reference process state: the channel
-    // identity plugin emits reads of a process-global cache keyed by live
-    // source paths, which an immutable retained artifact cannot depend on.
-    channelIdentity: false,
     packageBoundaryPlugin: createGenerationPackageBoundaryPlugin({
       externalDependencies: normalizeExternalDependencies(options.externalDependencies),
       packageRoot: resolveAuthoredPackageRoot(modulePath),
@@ -200,11 +247,14 @@ export async function bundleExtensionDistributionGraph(input: {
   readonly entries: readonly ExtensionDistributionGraphEntry[];
   readonly packageRoot: string;
   readonly runtimeDependencies: readonly string[];
-}): Promise<ReadonlyMap<string, string>> {
+}): Promise<{
+  readonly files: ReadonlyMap<string, string>;
+  readonly imports: readonly string[];
+}> {
   const plugins = [
     createAuthoredDirectiveGuardPlugin(),
     createAuthoredRelativeExtensionResolverPlugin({ extensions: RESOLVE_EXTENSIONS }),
-    createAuthoredAssetImportPlugin(),
+    createAuthoredAssetImportPlugin({ packageRoot: input.packageRoot }),
     createAuthoredPackageTsConfigPathsPlugin({
       appPackageRoot: input.packageRoot,
       extensions: RESOLVE_EXTENSIONS,
@@ -228,7 +278,7 @@ export async function bundleExtensionDistributionGraph(input: {
       tsconfig: resolveAuthoredTsConfigPath(input.packageRoot),
       write: false,
       output: {
-        chunkFileNames: "_chunks/[name]-[hash].mjs",
+        chunkFileNames: `${EXTENSION_CHUNK_DIRECTORY}/[name]-[hash].mjs`,
         codeSplitting: true,
         comments: false,
         entryFileNames: "[name].mjs",
@@ -238,12 +288,14 @@ export async function bundleExtensionDistributionGraph(input: {
     });
 
     const files = new Map<string, string>();
+    const imports = new Set<string>();
     for (const item of result.output) {
       if (item.type === "chunk") {
         files.set(item.fileName, removeRolldownModuleRegionComments(item.code));
+        for (const specifier of [...item.imports, ...item.dynamicImports]) imports.add(specifier);
       }
     }
-    return files;
+    return { files, imports: [...imports] };
   } catch (error) {
     throw createAuthoredModuleBundleError(input.packageRoot, error);
   }
@@ -254,11 +306,29 @@ export async function bundleExtensionDistributionGraph(input: {
  * Shared dependencies are parsed and emitted once instead of once per authored
  * entry.
  */
+export interface AuthoredModuleMapBundle {
+  readonly authoredWorkflowModules: AuthoredWorkflowModules;
+  readonly code: string;
+  /** Application modules in the graph, including shared workspace modules outside the app root. */
+  readonly sourceModules: readonly string[];
+  /** Fingerprint of the sources that also feed the driver and step registry; a change rebuilds the host. */
+  readonly workflowSourceFingerprint: string | undefined;
+}
+
 export async function bundleAuthoredModuleMapForGeneration(input: {
+  readonly appRoot: string;
   readonly manifest: CompiledAgentManifest;
   readonly moduleMapPath: string;
-}): Promise<string> {
+  readonly resolveExternalPaths?: boolean;
+}): Promise<AuthoredModuleMapBundle> {
+  // The package root owns dependency resolution, while the selected app root
+  // owns authored workflow IDs and must match the workflow driver.
   const packageRoot = resolveAuthoredPackageRoot(input.manifest.agentRoot);
+  const programmaticLoaderImportSpecifier = resolvePackageSourceFilePath(
+    usesDevelopmentExtensionModules(input.manifest)
+      ? "src/internal/development-programmatic-source-loader.ts"
+      : "src/internal/programmatic-source-loader.ts",
+  );
   const externalDependencies = normalizeExternalDependencies([
     ...(input.manifest.config.build?.externalDependencies ?? []),
     ...input.manifest.subagents.flatMap((subagent) =>
@@ -270,32 +340,49 @@ export async function bundleAuthoredModuleMapForGeneration(input: {
   const moduleMapSource = createCompiledModuleMapSource({
     manifest: input.manifest,
     moduleMapPath: input.moduleMapPath,
+    programmaticLoaderImportSpecifier,
   });
+  const extensionMounts = [
+    input.manifest,
+    ...input.manifest.subagents.map((subagent) => subagent.agent),
+  ].flatMap((node) => node.extensionMounts);
   const extensionScopePlugin = createExtensionScopePlugin(
     [input.manifest, ...input.manifest.subagents.map((subagent) => subagent.agent)].flatMap(
       (node) =>
         node.extensionMounts.map((mount) => ({
-          packageNamespace: mount.packageNamespace,
+          mountId: mount.mountId,
           sourceRoot: mount.sourceRoot,
         })),
     ),
   );
+  const workflowSources = new AuthoredWorkflowSourceRecorder(input.appRoot);
   const plugins = [
     createVirtualGenerationModuleMapPlugin({
       id: input.moduleMapPath,
       source: moduleMapSource,
     }),
-    createDynamicCapabilityTransformPlugin(),
-    createAuthoredDirectiveGuardPlugin(),
+    createExternalRuntimeImportPlugin(programmaticLoaderImportSpecifier),
+    // Before callback stamping, which must see the stub and never the directive.
+    createAuthoredWorkflowDirectivePlugin({ appRoot: input.appRoot, recorder: workflowSources }),
+    createDynamicCapabilityTransformPlugin({
+      workflowFunctions: (id) => workflowSources.workflowFunctions(id),
+    }),
+    workflowSources.graphPlugin(),
+    createExtensionMountPlugin(extensionMounts, extensionOverridePaths(input.manifest)),
     extensionScopePlugin,
     createAuthoredRelativeExtensionResolverPlugin({ extensions: RESOLVE_EXTENSIONS }),
-    createAuthoredAssetImportPlugin(),
+    createAuthoredAssetImportPlugin({ packageRoot }),
     createAuthoredPackageTsConfigPathsPlugin({
       appPackageRoot: packageRoot,
       extensions: RESOLVE_EXTENSIONS,
     }),
     createNodeEsmCompatBannerPlugin({ includeRequire: true }),
-    createGenerationPackageBoundaryPlugin({ externalDependencies, packageRoot }),
+    createGenerationPackageBoundaryPlugin({
+      externalDependencies,
+      packageRoot,
+      extensionSpecifiers: new Set(extensionMounts.map((mount) => mount.specifier)),
+      resolveExternalPaths: input.resolveExternalPaths,
+    }),
   ].filter((plugin) => plugin !== null);
 
   try {
@@ -305,7 +392,7 @@ export async function bundleAuthoredModuleMapForGeneration(input: {
       platform: "node",
       plugins,
       resolve: {
-        conditionNames: ["eve-source"],
+        conditionNames: authoredModuleConditions(),
         extensions: [...RESOLVE_EXTENSIONS],
       },
       tsconfig: resolveAuthoredTsConfigPath(packageRoot),
@@ -315,10 +402,118 @@ export async function bundleAuthoredModuleMapForGeneration(input: {
         sourcemap: false,
       },
     });
-    return removeRolldownModuleRegionComments(chunk.code);
+    return {
+      authoredWorkflowModules: workflowSources.modules(),
+      code: removeRolldownModuleRegionComments(chunk.code),
+      sourceModules: workflowSources.sourceModules().filter((id) => id !== input.moduleMapPath),
+      workflowSourceFingerprint: workflowSources.fingerprint(),
+    };
   } catch (error) {
     throw createAuthoredModuleBundleError(input.moduleMapPath, error);
   }
+}
+
+function usesDevelopmentExtensionModules(manifest: CompiledAgentManifest): boolean {
+  return [manifest, ...manifest.subagents.map((subagent) => subagent.agent)].some((node) =>
+    Object.values(node.bindings).some(
+      (binding) =>
+        binding.backing.kind === "programmatic" &&
+        binding.backing.registryId.startsWith("eve:development-extension:"),
+    ),
+  );
+}
+
+function createExternalRuntimeImportPlugin(importSpecifier: string): Record<string, unknown> {
+  const normalizedImportSpecifier = normalizeEsmImportSpecifier(importSpecifier);
+  return {
+    name: "eve-external-runtime-import",
+    resolveId(id: string) {
+      return id === normalizedImportSpecifier
+        ? { external: true, id: normalizedImportSpecifier }
+        : undefined;
+    },
+  };
+}
+
+/** Reuses the build's own resolution so the fingerprint is exact without a second resolver. */
+class AuthoredWorkflowSourceRecorder {
+  readonly #appRoot: string;
+  readonly #directiveModules = new Set<string>();
+  readonly #imports = new Map<string, readonly string[]>();
+  readonly #sources = new Map<string, string>();
+  readonly #workflowFunctions = new Map<string, ReadonlySet<string>>();
+
+  constructor(appRoot: string) {
+    this.#appRoot = appRoot;
+  }
+
+  record(id: string, source: string, manifest: WorkflowManifest): void {
+    this.#sources.set(id, source);
+    if (manifest.steps !== undefined || manifest.workflows !== undefined) {
+      this.#directiveModules.add(id);
+    }
+    const workflows = Object.values(manifest.workflows ?? {})[0];
+    if (workflows !== undefined) this.#workflowFunctions.set(id, new Set(Object.keys(workflows)));
+  }
+
+  workflowFunctions(id: string): ReadonlySet<string> | undefined {
+    return this.#workflowFunctions.get(id);
+  }
+
+  sourceModules(): readonly string[] {
+    return [...this.#sources.keys()].sort();
+  }
+
+  graphPlugin(): Record<string, unknown> {
+    const imports = this.#imports;
+    return {
+      name: "eve-authored-module-graph",
+      buildEnd(this: RolldownModuleGraphContext) {
+        for (const id of this.getModuleIds()) {
+          const info = this.getModuleInfo(id);
+          if (info === null) continue;
+          imports.set(id, [...info.importedIds, ...info.dynamicallyImportedIds]);
+        }
+      },
+    };
+  }
+
+  modules(): AuthoredWorkflowModules {
+    return {
+      directiveModules: [...this.#directiveModules].sort(),
+      workflowModules: [...this.#workflowFunctions.keys()].sort(),
+    };
+  }
+
+  fingerprint(): string | undefined {
+    if (this.#directiveModules.size === 0) return undefined;
+
+    const reachable = new Set<string>();
+    const queue = [...this.#directiveModules];
+    for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
+      if (reachable.has(id) || !this.#sources.has(id)) continue;
+      reachable.add(id);
+      queue.push(...(this.#imports.get(id) ?? []));
+    }
+
+    const hash = createHash("sha256");
+    for (const id of [...reachable].sort()) {
+      hash
+        .update(relative(this.#appRoot, id).split(sep).join("/"))
+        .update("\0")
+        .update(this.#sources.get(id) ?? "")
+        .update("\0");
+    }
+    return hash.digest("hex");
+  }
+}
+
+interface RolldownModuleGraphContext {
+  getModuleIds(): Iterable<string>;
+  getModuleInfo(id: string): {
+    readonly dynamicallyImportedIds: readonly string[];
+    readonly importedIds: readonly string[];
+  } | null;
 }
 
 function createVirtualGenerationModuleMapPlugin(input: {
@@ -340,70 +535,18 @@ async function buildAuthoredModuleBundle(
   modulePath: string,
   options: AuthoredModuleLoadOptions,
   configuration: {
-    readonly channelIdentity: boolean;
     readonly packageBoundaryPlugin: Record<string, unknown>;
     readonly plugins: readonly Record<string, unknown>[];
     readonly sourcemap: false | "inline";
   },
 ): Promise<string> {
-  const channelCache = configuration.channelIdentity ? getChannelModuleCache() : undefined;
   const packageRoot = resolveAuthoredPackageRoot(modulePath);
   const tsconfigPath = resolveAuthoredTsConfigPath(packageRoot);
-  const channelIdentityPlugin =
-    channelCache && channelCache.size > 0
-      ? {
-          name: "eve-channel-identity",
-          async resolveId(
-            this: RolldownResolveContext,
-            source: string,
-            importer: string | undefined,
-            options: { kind: string },
-          ) {
-            if (!/channels[/\\]/.test(source) || options.kind !== "import-statement") {
-              return undefined;
-            }
-
-            const resolved = await this.resolve(source, importer, {
-              kind: options.kind,
-              skipSelf: true,
-            });
-
-            if (resolved === null || typeof resolved.id !== "string") {
-              return undefined;
-            }
-
-            const resolvedPath = resolve(resolved.id);
-
-            if (!channelCache.has(resolvedPath)) {
-              return undefined;
-            }
-
-            return { id: `${CACHED_CHANNEL_PREFIX}${resolvedPath}` };
-          },
-          load(id: string) {
-            if (!id.startsWith(CACHED_CHANNEL_PREFIX)) {
-              return undefined;
-            }
-
-            const cachedPath = id.slice(CACHED_CHANNEL_PREFIX.length);
-            return {
-              code: [
-                `const cache = globalThis["${CHANNEL_MODULE_CACHE_KEY}"];`,
-                `export default cache.get(${JSON.stringify(cachedPath)});`,
-              ].join("\n"),
-              moduleType: "js" as const,
-            };
-          },
-        }
-      : null;
   const plugins = [
-    channelIdentityPlugin,
     ...configuration.plugins,
-    options.extensionScopeNamespace === undefined
-      ? null
-      : createFixedNamespaceScopePlugin(options.extensionScopeNamespace),
+    options.extension === undefined ? null : createFixedMountScopePlugin(options.extension.mountId),
     createAuthoredRelativeExtensionResolverPlugin({ extensions: RESOLVE_EXTENSIONS }),
-    createAuthoredAssetImportPlugin(),
+    createAuthoredAssetImportPlugin({ packageRoot }),
     createAuthoredPackageTsConfigPathsPlugin({
       appPackageRoot: packageRoot,
       extensions: RESOLVE_EXTENSIONS,
@@ -415,11 +558,11 @@ async function buildAuthoredModuleBundle(
   try {
     const chunk = await buildSingleRolldownChunk(`authored module for "${modulePath}"`, {
       cwd: packageRoot,
-      input: modulePath,
+      input: options.extension?.entry === undefined ? modulePath : "\0eve-compile-mount-entry",
       platform: "node",
       plugins,
       resolve: {
-        conditionNames: ["eve-source"],
+        conditionNames: authoredModuleConditions(),
         extensions: [...RESOLVE_EXTENSIONS],
       },
       tsconfig: tsconfigPath,
@@ -443,8 +586,37 @@ function createAuthoredDirectiveGuardPlugin(): Record<string, unknown> {
         return undefined;
       }
 
-      await assertNoWorkflowDirectivePrologue({ filePath: id, source });
+      const { hasDirectives } = await prepareAuthoredWorkflowDirectives({ filePath: id, source });
+      if (hasDirectives) {
+        throw new Error(
+          `Module "${id}" uses Workflow directives ("use step" or "use workflow"). ` +
+            "Workflow directives are supported in application modules only, not in extensions or instrumentation.",
+        );
+      }
       return undefined;
+    },
+  };
+}
+
+// Client mode: steps keep their bodies, workflows become references. Step
+// registration happens once, in the host's step entrypoint.
+function createAuthoredWorkflowDirectivePlugin(input: {
+  readonly appRoot: string;
+  readonly recorder?: AuthoredWorkflowSourceRecorder;
+}): Record<string, unknown> {
+  return {
+    name: "eve-authored-workflow-directives",
+    async transform(source: string, id: string) {
+      if (!AUTHORED_BUNDLED_MODULE_EXTENSION.test(id) || isNodeModulesPath(id)) {
+        return undefined;
+      }
+      if (!isAuthoredApplicationModule(id, input.appRoot)) {
+        return undefined;
+      }
+
+      const transformed = await applyWorkflowTransform(id, source, "client", id, input.appRoot);
+      input.recorder?.record(id, source, transformed.workflowManifest);
+      return transformed.code === source ? undefined : { code: transformed.code, map: null };
     },
   };
 }
@@ -468,7 +640,7 @@ async function loadBundledAuthoredModule(
     .update("\0")
     .update(externalDependencies.join("\0"))
     .update("\0")
-    .update(options.extensionScopeNamespace ?? "")
+    .update(options.extension?.mountId ?? "")
     .update("\0")
     .update(code)
     .digest("hex");
@@ -484,7 +656,10 @@ async function loadBundledAuthoredModule(
   }
 
   try {
-    return await import(`${createFileImportSpecifier(bundlePath)}?v=${bundleHash}`);
+    const instance = options.extension?.evaluationId ?? "";
+    return await import(
+      `${createFileImportSpecifier(bundlePath)}?v=${bundleHash}&instance=${encodeURIComponent(instance)}`
+    );
   } catch (error) {
     throw createAuthoredModuleEvaluationError(modulePath, error);
   }
@@ -496,10 +671,10 @@ function createInFlightModuleLoadKey(
 ): string {
   const externalDependencies = normalizeExternalDependencies(options.externalDependencies);
 
-  return `${modulePath}\0${externalDependencies.join("\0")}\0${options.extensionScopeNamespace ?? ""}`;
+  return `${modulePath}\0${externalDependencies.join("\0")}\0${options.extension?.mountId ?? ""}\0${options.extension?.evaluationId ?? ""}\0${options.appRoot ?? ""}`;
 }
 
-function resolveAuthoredTsConfigPath(packageRoot: string): string | false {
+export function resolveAuthoredTsConfigPath(packageRoot: string): string | false {
   for (const fileName of ["tsconfig.json", "jsconfig.json"]) {
     const path = join(packageRoot, fileName);
     if (existsSync(path)) {
@@ -510,7 +685,7 @@ function resolveAuthoredTsConfigPath(packageRoot: string): string | false {
   return false;
 }
 
-function resolveAuthoredPackageRoot(modulePath: string): string {
+export function resolveAuthoredPackageRoot(modulePath: string): string {
   let currentDirectory = dirname(modulePath);
 
   while (true) {
