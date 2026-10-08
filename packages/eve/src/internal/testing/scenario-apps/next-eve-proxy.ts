@@ -3,8 +3,9 @@ import { createRequire } from "node:module";
 import type { ScenarioAppDescriptor } from "#internal/testing/scenario-app.js";
 
 const require = createRequire(import.meta.url);
+const nextRequire = createRequire(require.resolve("next/package.json"));
 
-export interface NextEveProxyDescriptorOptions {
+interface NextEveProxyDescriptorOptions {
   readonly installDependencies?: boolean;
   readonly vercelVersion?: string;
 }
@@ -58,7 +59,7 @@ export function proxy() {
 }
 
 function resolveInstalledPackageVersion(packageName: string): string {
-  const manifest: unknown = require(`${packageName}/package.json`);
+  const manifest: unknown = nextRequire(`${packageName}/package.json`);
 
   if (
     typeof manifest !== "object" ||

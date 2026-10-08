@@ -21,7 +21,7 @@ import type {
 import type { OpenAPISpecSource } from "#public/definitions/connections/openapi.js";
 import type { CompiledWorkspaceResourceRoot } from "#compiler/manifest.js";
 import type { WorkspaceRuntimeSpec } from "#runtime/workspace/types.js";
-import type { JsonObject } from "#shared/json.js";
+import type { JsonValue } from "#shared/json.js";
 import type { Optional } from "#shared/optional.js";
 import type { Node } from "#shared/node.js";
 import type {
@@ -34,9 +34,8 @@ import type { NamedSkillDefinition } from "#shared/skill-definition.js";
 import type { InternalAgentDefinition } from "#shared/agent-definition.js";
 import type { RuntimeDynamicModelReference } from "#runtime/agent/bootstrap.js";
 import type { InternalToolDefinitionWithExecuteFn } from "#tools/definition.js";
-import type { WebSearchProvider } from "#shared/web-search.js";
-import type { SandboxBackend } from "#shared/sandbox-backend.js";
-import type { SandboxBootstrapContext, SandboxSessionContext } from "#shared/sandbox-definition.js";
+import type { CompiledToolBehavior } from "#tools/behavior.js";
+import type { SandboxEnvironmentIdentity, SandboxSelector } from "#shared/sandbox-environment.js";
 import type { ToolSchema } from "#tools/schema.js";
 import type { AgentSourceOwner } from "#compiler/source-graph.js";
 import type { MemoryDefinition } from "#public/memory/index.js";
@@ -101,6 +100,9 @@ export type ResolvedScheduleDefinition = Readonly<
  * server that requires no authentication (e.g. localhost) may omit both.
  */
 export interface ResolvedConnectionDefinition extends ResolvedModuleSourceRef {
+  readonly protocolVersionDiscovery?: boolean;
+  /** MCP only: send the turn's principals in `eve-forwarded-principal`. */
+  readonly forwardPrincipal?: boolean;
   readonly approval?: Approval;
   readonly authorization?: Readonly<AuthorizationDefinition> | ConnectionAuthResolver;
   readonly connectionName: string;
@@ -127,32 +129,20 @@ export interface ResolvedConnectionDefinition extends ResolvedModuleSourceRef {
 }
 
 /**
- * Runtime-owned authored sandbox definition resolved from a compiled module
- * map.
- *
- * The resolved `backend` is non-optional: every sandbox in the runtime
- * graph carries a concrete SandboxBackend value, even when the
- * authored definition omits `backend`. The omitted field is filled
- * in by `defaultSandbox()` (which itself selects between
- * `vercel()`, `docker()`, `microsandbox()`, and `justbash()` based on the current
- * environment).
+ * Runtime-owned sandbox definition resolved from a compiled module map.
+ * Independent definitions carry their exported environment; parent definitions
+ * explicitly inherit the dispatching agent's sandbox.
  */
-export type ResolvedSandboxDefinition = ResolvedModuleSourceRef & {
-  readonly bootstrap?: (input: SandboxBootstrapContext) => Promise<void> | void;
-  readonly revalidationKey?: string;
-  readonly sourceHash?: string;
-  /**
-   * Resolved backend value. The authored `SandboxDefinition.backend`
-   * accepts either a `SandboxBackend` or a `() => SandboxBackend`; by
-   * the time it reaches the runtime the function form has been
-   * unwrapped via `lazyBackend(...)` so consumers always see a plain
-   * value.
-   */
-  readonly backend: SandboxBackend;
-  readonly description?: string;
-  readonly inheritsParent?: boolean;
-  readonly onSession?: (input: SandboxSessionContext) => Promise<void> | void;
+type ResolvedSandboxDefinitionBase = ResolvedModuleSourceRef & {
+  readonly revisionHash: string;
+  readonly selector: SandboxSelector;
 };
+
+export type ResolvedSandboxDefinition = ResolvedSandboxDefinitionBase &
+  (
+    | { readonly environment: SandboxEnvironmentIdentity; readonly kind: "independent" }
+    | { readonly kind: "parent" }
+  );
 
 /**
  * Runtime-owned tool definition resolved from the selected compiled source graph.
@@ -165,12 +155,17 @@ export type ResolvedToolDefinition = Readonly<
   >
 > &
   ResolvedModuleSourceRef & {
+    readonly behavior?: CompiledToolBehavior;
     readonly owner: AgentSourceOwner;
     /**
      * Validated runtime input schema. Compiled and durable JSON Schemas are
      * rehydrated before entering this runtime-owned definition.
      */
     readonly inputSchema: ToolSchema | null;
+    /** Framework-owned input projected before a workflow tool executor starts. */
+    readonly executeInput?: (input: unknown) => JsonValue;
+    /** Presentation projected from tool lifecycle values. */
+    readonly label?: import("#tools/definition.js").InternalToolLabelDefinition;
     /**
      * Optional validated runtime output schema.
      */
@@ -281,6 +276,7 @@ export type ResolvedRuntimeSubagentNode = Readonly<
     Node & {
       kind: "subagent";
       name: string;
+      tool?: boolean;
     } & (
       | {
           description: string;
@@ -306,8 +302,8 @@ export type ResolvedRuntimeRemoteAgentNode = Readonly<
       headers?: HeadersValue;
       kind: "remote";
       name: string;
-      outputSchema?: JsonObject;
       path: string;
+      tool?: boolean;
       url: string;
     }
 >;
@@ -432,16 +428,7 @@ export interface ResolvedAgent {
   readonly config?: ResolvedAgentDefinition;
   readonly connections: readonly ResolvedConnectionDefinition[];
   readonly dynamicConnectionResolvers?: readonly ResolvedDynamicConnectionResolver[];
-  /**
-   * Configuration for the experimental framework `Workflow` orchestration
-   * tool. Present when an authored tool module exports
-   * `experimental_workflow(...)`.
-   */
-  readonly workflowTool?: {
-    readonly maxSubagents?: number;
-  };
   /** AI Gateway provider selected for the framework `web_search` tool. */
-  readonly webSearchProvider?: WebSearchProvider;
   readonly dynamicInstructionsResolvers: readonly ResolvedDynamicInstructionsResolver[];
   readonly dynamicSkillResolvers: readonly ResolvedDynamicSkillResolver[];
   readonly dynamicToolResolvers: readonly ResolvedDynamicToolResolver[];

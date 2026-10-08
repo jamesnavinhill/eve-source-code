@@ -7,7 +7,7 @@ export default defineEval({
   tags: ["real-model"],
   description: "The built-in recursive agent tool is exposed only to the root session.",
   async test(t) {
-    await t.send(
+    const completed = await t.send(
       [
         "Use the built-in agent subagent exactly once.",
         "Give the child this task:",
@@ -16,10 +16,11 @@ export default defineEval({
         `After the child returns, reply with its exact output and no other token.`,
       ].join(" "),
     );
+    completed.expectOk();
+    completed.messageIncludes(CHILD_TOKEN);
 
     t.succeeded();
-    t.calledSubagent("agent", { count: 1 });
-    t.messageIncludes(CHILD_TOKEN);
+    t.calledSubagent("agent", { status: "completed", count: 1 });
     t.noFailedActions();
   },
 });

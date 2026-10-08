@@ -1,14 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { useEveAgent } from "#svelte/use-eve-agent.js";
-import { EVE_SESSION_ID_HEADER } from "#protocol/message.js";
+import {
+  EVE_MESSAGE_STREAM_VERSION,
+  EVE_SESSION_ID_HEADER,
+  EVE_STREAM_VERSION_HEADER,
+} from "#protocol/message.js";
 import {
   createMessageCompletedEvent,
   createMessageReceivedEvent,
   createSessionWaitingEvent,
   type UnstampedMessageStreamEvent,
 } from "#protocol/message.js";
-import { stampTestEvents } from "#internal/testing/events.js";
+import { TEST_USAGE, stampTestEvents } from "#internal/testing/events.js";
 
 function createStartedMessageResponse(sessionId: string, continuationToken: string): Response {
   return new Response(JSON.stringify({ continuationToken, ok: true, sessionId }), {
@@ -31,16 +35,30 @@ function createEagerStreamResponse(events: readonly UnstampedMessageStreamEvent[
         controller.close();
       },
     }),
+    {
+      headers: { [EVE_STREAM_VERSION_HEADER]: EVE_MESSAGE_STREAM_VERSION },
+    },
   );
 }
 
-function createBoundedStreamResponse(events: readonly UnstampedMessageStreamEvent[]): Response {
+function createBoundedStreamResponse(
+  events: readonly UnstampedMessageStreamEvent[],
+  tailIndex = events.length - 1,
+): Response {
   const response = createEagerStreamResponse(events);
-  response.headers.set("x-eve-stream-tail-index", String(events.length - 1));
+  response.headers.set("x-eve-stream-tail-index", String(tailIndex));
   return response;
 }
 
+const cleanupMounts: Array<() => void> = [];
+vi.mock("svelte", () => ({
+  onMount: (callback: () => () => void) => {
+    cleanupMounts.push(callback());
+  },
+}));
+
 afterEach(() => {
+  for (const cleanup of cleanupMounts.splice(0)) cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -91,12 +109,12 @@ describe("useEveAgent (Svelte rune binding)", () => {
     vi.stubGlobal("window", {});
     const events = [
       createMessageReceivedEvent({ message: "Hello", sequence: 0, turnId: "turn_1" }),
-      createSessionWaitingEvent(),
+      createSessionWaitingEvent(TEST_USAGE),
     ];
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(createBoundedStreamResponse(events))
-      .mockResolvedValueOnce(createEagerStreamResponse([]));
+      .mockResolvedValueOnce(createBoundedStreamResponse([], events.length - 1));
     const seenEvents: UnstampedMessageStreamEvent[] = [];
 
     useEveAgent({
@@ -108,14 +126,14 @@ describe("useEveAgent (Svelte rune binding)", () => {
     });
 
     await vi.waitFor(() => expect(seenEvents).toEqual(stampTestEvents(events)));
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("sends messages and notifies lifecycle callbacks from the shared store", async () => {
     vi.stubGlobal("window", {});
     const events = [
       createMessageReceivedEvent({ message: "Hello", sequence: 0, turnId: "turn_1" }),
-      createSessionWaitingEvent(),
+      createSessionWaitingEvent(TEST_USAGE),
     ];
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(createStartedMessageResponse("session_1", "http:session_1"))
@@ -123,6 +141,7 @@ describe("useEveAgent (Svelte rune binding)", () => {
     const seenEvents: UnstampedMessageStreamEvent[] = [];
 
     const agent = useEveAgent({
+      prewarm: false,
       onEvent(event) {
         seenEvents.push(event);
       },

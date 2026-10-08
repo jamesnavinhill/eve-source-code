@@ -4,7 +4,7 @@ import { defineEval } from "eve/evals";
 const requestedModel = process.env.EVE_E2E_MODEL;
 const selectedModel =
   requestedModel === undefined || requestedModel === MOCK_MODEL_SENTINEL
-    ? "openai/gpt-5.6-sol"
+    ? "openai/gpt-6.1-sol"
     : requestedModel;
 
 export default defineEval({
@@ -13,13 +13,14 @@ export default defineEval({
     const first = await t.send(
       'Reply with exactly the text "session model turn one" and nothing else.',
     );
+    const session = first.session;
     first.expectOk();
     first.messageIncludes("session model turn one");
     first.eventsSatisfy("the session resolver selects the configured model", (events) =>
       events.some((event) => event.type === "step.started" && event.data.modelId === selectedModel),
     );
 
-    const second = await t.send(
+    const second = await session.send(
       'Reply with exactly the text "session model turn two" and nothing else.',
     );
     second.expectOk();

@@ -14,6 +14,8 @@ import {
   type TelegramChannelState,
 } from "#public/channels/telegram/index.js";
 import { isTelegramBotMentioned } from "#public/channels/telegram/defaults.js";
+import { captureLogRecords } from "#internal/testing/log-records.js";
+import { mockAgentRouteArgs } from "#internal/testing/mocks/mock-route-args.js";
 
 const SECRET = "telegram-secret";
 
@@ -93,6 +95,7 @@ async function firePost(
   const waitUntil = vi.fn();
 
   const response = await post.handler(signedRequest(JSON.stringify(body)), {
+    ...mockAgentRouteArgs(),
     attachSession: vi.fn() as any,
     ...mockChannelContext(send),
     resolveSession: options.resolveSession ?? (async () => undefined),
@@ -153,7 +156,15 @@ describe("telegramChannel() inbound route", () => {
   ] as const)("maps %s chats to the %s audience", (chatType, audience) => {
     const adapter = withState(getAdapter(telegramChannel()), { chatType });
 
-    expect(adapter.instrumentation?.metadata?.(adapter.state)).toMatchObject({ audience });
+    expect(
+      adapter.instrumentation?.audience?.({
+        auth: null,
+        caller: { type: "anonymous" },
+        channel: { kind: "channel:telegram" },
+        environment: "production",
+        state: adapter.state,
+      }),
+    ).toBe(audience);
   });
 
   it("dispatches verified private messages with Telegram auth and chat-wide token", async () => {
@@ -240,34 +251,8 @@ describe("telegramChannel() inbound route", () => {
     );
   });
 
-  it("delivers Telegram callback queries as compact HITL input responses", async () => {
-    const channel = telegramChannel({
-      api: { fetch: fakeTelegramFetch() },
-      credentials: { botToken: "bot-token", webhookSecretToken: SECRET },
-    });
-
-    const { send } = await firePost(channel, {
-      callback_query: {
-        id: "cb1",
-        from: { id: 42, is_bot: false },
-        data: "eve:0",
-        message: {
-          message_id: 55,
-          chat: { id: -1001, type: "supergroup" },
-        },
-      },
-    });
-
-    expect(send).toHaveBeenCalledWith(
-      "-1001::55",
-      expect.objectContaining({
-        auth: null,
-        inputResponses: [{ optionId: "selected", requestId: "telegram_callback:eve:0" }],
-      }),
-    );
-  });
-
   it("sends authorization privately after the requester taps its group callback", async () => {
+    const logs = captureLogRecords();
     const fetchMock = vi
       .fn()
       .mockResolvedValue(new Response(JSON.stringify({ ok: true, result: true })));
@@ -328,9 +313,15 @@ describe("telegramChannel() inbound route", () => {
       callback_query_id: "cb-auth",
       text: "Sign-in prompt sent privately.",
     });
+    expect(logs.records).toContainEqual(
+      expect.objectContaining({
+        level: "error",
+        message: "Telegram authorization callback delivery failed",
+      }),
+    );
   });
 
-  it("marks replies to bot messages as possible freeform HITL answers", async () => {
+  it("sends a reply to a bot prompt as a message carrying the replied-to id", async () => {
     const channel = telegramChannel({
       api: { fetch: fakeTelegramFetch() },
       credentials: { botToken: "bot-token", webhookSecretToken: SECRET },
@@ -346,17 +337,20 @@ describe("telegramChannel() inbound route", () => {
           from: { id: 99, is_bot: true, username: "testbot" },
           chat: { id: 42, type: "private" },
         },
-        text: "approved",
+        text: "approve",
       },
     });
 
     const [, input] = send.mock.calls[0]!;
     expect(input).toMatchObject({
-      inputResponses: [{ requestId: "telegram_reply:55", text: "approved" }],
+      message: expect.stringContaining("approve"),
+      state: { replyToBotMessageId: "55" },
     });
+    expect(input).not.toHaveProperty("inputResponses");
   });
 
   it("rejects requests with invalid webhook verification", async () => {
+    const logs = captureLogRecords();
     const channel = telegramChannel({ credentials: { webhookSecretToken: SECRET } });
     const compiled = asCompiled(channel);
     const post = compiled.routes.find((route) => route.method === "POST");
@@ -372,6 +366,7 @@ describe("telegramChannel() inbound route", () => {
         method: "POST",
       }),
       {
+        ...mockAgentRouteArgs(),
         attachSession: vi.fn() as any,
         ...mockChannelContext(send),
         to: vi.fn() as any,
@@ -383,15 +378,15 @@ describe("telegramChannel() inbound route", () => {
 
     expect(response.status).toBe(401);
     expect(send).not.toHaveBeenCalled();
+    expect(logs.records).toContainEqual(
+      expect.objectContaining({ level: "warn", message: "telegram inbound verification failed" }),
+    );
   });
 });
 
 describe("telegramChannel() deliver hook", () => {
-  it("maps compact callback and freeform reply responses through durable state", async () => {
+  it("maps freeform reply responses through durable state", async () => {
     const adapter = withState(getAdapter(telegramChannel()), {
-      hitlCallbacks: {
-        "eve:0": { optionId: "approve", requestId: "call_1" },
-      },
       pendingFreeformReplies: {
         "55": "call_2",
       },
@@ -399,20 +394,9 @@ describe("telegramChannel() deliver hook", () => {
     const ctx = buildAdapterContext(adapter, { get: () => undefined, set: () => {} } as any);
 
     expect(
-      await adapter.deliver!(
-        {
-          inputResponses: [
-            { optionId: "selected", requestId: "telegram_callback:eve:0" },
-            { requestId: "telegram_reply:55", text: "because" },
-          ],
-        },
-        ctx,
-      ),
+      await adapter.deliver!({ message: "because", state: { replyToBotMessageId: "55" } }, ctx),
     ).toEqual({
-      inputResponses: [
-        { optionId: "approve", requestId: "call_1" },
-        { requestId: "call_2", text: "because" },
-      ],
+      inputResponses: [{ requestId: "call_2", text: "because" }],
       context: undefined,
     });
   });
@@ -422,13 +406,7 @@ describe("telegramChannel() deliver hook", () => {
     const ctx = buildAdapterContext(adapter, { get: () => undefined, set: () => {} } as any);
 
     expect(
-      await adapter.deliver!(
-        {
-          inputResponses: [{ requestId: "telegram_reply:55", text: "hello" }],
-          message: "hello",
-        },
-        ctx,
-      ),
+      await adapter.deliver!({ message: "hello", state: { replyToBotMessageId: "55" } }, ctx),
     ).toEqual({ message: "hello", context: undefined });
   });
 });
@@ -597,47 +575,6 @@ describe("telegramChannel() default event handlers", () => {
     expect(body).toEqual({ action: "typing", chat_id: "42" });
   });
 
-  it("input.requested posts an inline keyboard and stores compact callback mappings", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(
-        new Response(JSON.stringify({ ok: true, result: { message_id: 50, chat: { id: 42 } } })),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    const adapter = withState(
-      getAdapter(telegramChannel({ credentials: { botToken: "bot-token" } })),
-      { chatId: "42", chatType: "private" },
-    );
-    const ctx = buildAdapterContext(adapter, { get: () => undefined, set: () => {} } as any);
-
-    await callEvent(
-      adapter,
-      makeEvent("input.requested", {
-        requests: [
-          {
-            action: { callId: "call_1", input: {}, kind: "tool-call", toolName: "ask_question" },
-            options: [{ id: "approve", label: "Approve" }],
-            prompt: "Approve?",
-            requestId: "call_1",
-          },
-        ],
-        sequence: 0,
-        stepIndex: 0,
-        turnId: "t1",
-      }),
-      ctx,
-    );
-
-    const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body));
-    expect(body.reply_markup.inline_keyboard[0][0]).toEqual({
-      callback_data: "eve:0",
-      text: "Approve",
-    });
-    expect(ctx.state.hitlCallbacks).toEqual({
-      "eve:0": { optionId: "approve", requestId: "call_1" },
-    });
-  });
-
   it("freeform input requests register the prompt message id", async () => {
     const fetchMock = vi
       .fn()
@@ -672,7 +609,7 @@ describe("telegramChannel() default event handlers", () => {
     expect(ctx.state.pendingFreeformReplies).toEqual({ "51": "call_1" });
   });
 
-  it("hydrates unknown private message posts without re-keying the session", async () => {
+  it("hydrates unknown private message posts without aliasing the session", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -740,7 +677,7 @@ describe("telegramChannel() default event handlers", () => {
     expect(ctx.state.conversationId).toBeNull();
   });
 
-  it("hydrates unknown group message posts and re-keys to the posted message id", async () => {
+  it("hydrates unknown group message posts and adds an alias for to the posted message id", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -808,7 +745,7 @@ describe("telegramChannel() default event handlers", () => {
     expect(ctx.state.conversationId).toBe("caller-selected");
   });
 
-  it("group message posts re-key the session to the posted message id", async () => {
+  it("group message posts alias the session to the posted message id", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValue(

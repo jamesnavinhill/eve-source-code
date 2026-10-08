@@ -3,19 +3,42 @@ title: "Overview"
 description: "How users reach your agent: the channel contract, the base eve HTTP channel, and authoring custom channels."
 ---
 
-A channel is the edge adapter between a platform and your agent. It does three things:
+A channel connects a platform to your agent. For conversations, it:
 
-- Normalizes platform input into a user message.
-- Owns the channel-local address that maps a platform conversation to its current durable session.
-- Decides delivery, meaning how, where, and whether a response goes back.
+- Converts incoming messages into agent input.
+- Maps each platform conversation to an eve session.
+- Decides how, where, and whether to deliver replies.
+
+A channel can also receive events and pass them to another channel, without starting a conversation of its own.
 
 eve ships a base HTTP channel plus first-class platform channels, and you can author your own. Browse the full set in the [Integrations](/integrations) gallery and choose the Channels filter.
 
-After a channel normalizes input, eve runs the same agent runtime regardless of where the message came from. Tools and instructions do not need channel-specific logic.
+After a channel dispatches a message, eve runs the same agent runtime regardless of where the event came from. Tools and instructions do not need channel-specific logic.
+
+## Choose where the conversation lives
+
+The agent doesn't have to reply where an event arrived. A webhook, for example, can start a conversation in a team chat without sending an agent reply to the webhook's source.
+
+Use a [cross-channel hand-off](./custom#cross-channel-hand-off) when the conversation belongs elsewhere. The destination channel handles the session, replies, and follow-up messages. To post a notification without running the agent, use the platform's API instead.
+
+## Audience
+
+When a channel creates a session, it assigns an observability audience:
+`public`, `private`, or `unknown`. The audience controls trace content capture,
+not who may call the channel. Each channel uses the visibility information it
+has; `unknown` is the safe default when it cannot classify a conversation.
+
+Route auth controls access and supplies the session principal. See [Auth &
+route protection](../guides/auth-and-route-protection) for principal types and
+authorization. See the [default eve HTTP channel](./eve#audience) for its
+mapping, or [custom channels](./custom#conversation-audience) to classify your
+own.
 
 ## Overlapping messages
 
-Channels default to `turnPolicy: "steer"`. When an accepted message arrives while a turn is active, eve first durably buffers the message, then cooperatively cancels the active turn and starts a replacement turn. The cancelled turn emits `turn.cancelled` followed by `session.waiting`; the replacement starts with a new turn ID. Output already streamed and completed side effects are not rolled back.
+Channels default to `turnPolicy: "steer"`. Before assistant answer output or local tool execution begins, a message can interrupt pending model generation and continue the same turn with the correction. Executing tools finish and checkpoint their results before steering reaches the next model call. After answer output starts, steering waits for the next committed workflow boundary. The turn ID stays the same.
+
+Reasoning and search progress do not count as answer output. Interrupted provider-managed search may run again; completed local tools are preserved.
 
 Set `turnPolicy: "queue"` on any built-in or custom channel when each turn must finish before the next message starts:
 
@@ -28,9 +51,11 @@ export default defineChannel({
 });
 ```
 
+Adjacent queued messages can combine into one turn only when their full auth contexts match, including identity, issuer, authenticator, and authorization attributes. Their attachments and context stay in payload order. A different auth context ends the batch; eve does not regroup messages across intervening senders. Anonymous deliveries stay separate. Turns still share the session's conversation history.
+
 `from(address).send(...)`, fixed `Session.send(...)`, cross-channel sends, and Chat SDK bridge sends also accept a per-send `turnPolicy` override. Pure `inputResponses` deliveries answer their pending request without steering. Explicit `cancel()` remains the stop-without-replacement operation.
 
-Channel admission still runs first. Ignored mentions, rejected signatures, duplicates, and any other dropped platform events never affect the active turn.
+Events rejected before `send(...)`, such as invalid signatures or filtered mentions, never reach the active turn. A delivery already sent to the session can interrupt pending generation before the channel's `deliver` hook processes it. If that hook ignores the correction, eve resumes the original request with its original auth, delivery provenance, and channel state.
 
 Each channel has its own provider terms, data flow, auth model, and user-consent expectations. Before sending non-public, sensitive, regulated, or production data through a channel, confirm that the channel provider and your configured scopes, signature checks, route auth, and delivery behavior are appropriate for your use case.
 
@@ -55,9 +80,7 @@ The eve channel is the framework's default HTTP session API, the routes the term
 
 ## Custom channels
 
-When eve doesn't ship a channel for your surface, build one with `defineChannel` from `eve/channels`. A custom channel declares route handlers (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `WS`), an `events` map, and uses `send(address, input)` to start or resume a session. See [Custom channels](./custom) for the full walkthrough, including WebSocket routes, cross-channel agent hand-off, channel metadata, address tokens, and file uploads.
-
-A cross-channel `send(...)` supplies input to the agent and invokes the model on the destination channel. eve does not currently provide a direct cross-channel provider-message queue. To post without starting a turn, use the provider API. See [Durable cross-channel notifications](../patterns/durable-cross-channel-notifications) when delivery also needs application-managed retries and deduplication.
+Build a channel with `defineChannel` from `eve/channels` when you need your own HTTP or WebSocket endpoint. Its routes can start conversations on that channel or hand work to another one. See [Custom channels](./custom) for examples and the authoring API.
 
 ## Relationship to the Chat SDK
 

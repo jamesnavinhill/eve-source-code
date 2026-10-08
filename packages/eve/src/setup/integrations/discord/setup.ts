@@ -54,7 +54,7 @@ export default discordChannel({
 `;
 }
 
-export interface DiscordSetupPlan {
+interface DiscordSetupPlan {
   botToken: string;
   commandName: string;
   commandDescription: string;
@@ -123,7 +123,7 @@ export async function applyDiscordSetup(
     botToken: plan.botToken,
     log: context.presenter.log,
     project: plan.project,
-    projectRoot: context.appRoot,
+    projectRoot: context.projectRoot,
     slug: plan.slug,
     signal: context.signal,
   });

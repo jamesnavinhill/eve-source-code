@@ -1,9 +1,13 @@
+import type { AuthorizationChallenge } from "#harness/authorization.js";
 import type { LanguageModel, ModelMessage, UserContent } from "ai";
 
 import type { SessionAuthContext, SessionCapabilities } from "#channel/types.js";
 import type { AlsContext } from "#context/container.js";
-import type { UnstampedMessageStreamEvent, RuntimeIdentity } from "#protocol/message.js";
-import type { RunMode } from "#shared/run-mode.js";
+import type {
+  RuntimeIdentity,
+  StepStartedStreamEvent,
+  UnstampedMessageStreamEvent,
+} from "#protocol/message.js";
 import type { RuntimeActionResult } from "#shared/action-types.js";
 import type { RuntimeModelReference } from "#runtime/agent/bootstrap.js";
 import type { InputResponse } from "#shared/input.js";
@@ -11,9 +15,9 @@ import type { SandboxState } from "#sandbox/state.js";
 import type { JsonObject } from "#shared/json.js";
 import type { TokenUsage } from "#shared/token-usage.js";
 import type { InternalToolDefinition } from "#tools/definition.js";
-import type { WebSearchProvider } from "#shared/web-search.js";
 import type { AgentReasoningDefinition } from "#shared/agent-definition.js";
 import type { HarnessToolDefinition } from "#harness/execute-tool.js";
+import type { HarnessModelMessage } from "#harness/messages.js";
 import type { SessionInstrumentation } from "#instrumentation/runtime.js";
 import type { HistoryViewProjector, PreparedHistoryView } from "#shared/history-view.js";
 
@@ -67,16 +71,14 @@ export type SessionAgent = SessionAgentBase &
   );
 
 /**
- * Serializable session state passed between harness and runtime.
- *
- * Only contains plain data -- no resolved model instances or tool execute
- * functions. The harness resolves those at step time via injected config.
+ * A {@link HarnessSession} without its conversation history. Session steps
+ * that only publish events or change `state` rebuild this, so the history
+ * never becomes part of their Workflow step input.
  */
-export interface HarnessSession {
+export interface HarnessSessionBase {
   readonly agent: SessionAgent;
   readonly compaction: CompactionConfig;
   readonly continuationToken: string;
-  readonly history: ModelMessage[];
   readonly limits?: SessionLimits;
   readonly outputSchema?: JsonObject;
   /**
@@ -91,17 +93,16 @@ export interface HarnessSession {
   readonly sessionId: string;
   readonly sandboxState?: SandboxState;
   readonly state?: SessionStateMap;
-  /**
-   * Number of local delegated subagent hops from the root session to this
-   * session. Root sessions are depth 0.
-   */
-  readonly subagentDepth?: number;
-  /**
-   * Effective maximum subagent calls one `Workflow` invocation may dispatch
-   * for this session, configured by `experimental_workflow({ maxSubagents })`.
-   * When omitted, the dispatch step applies the framework default.
-   */
-  readonly workflowMaxSubagents?: number;
+}
+
+/**
+ * Serializable session state passed between harness and runtime.
+ *
+ * Only contains plain data -- no resolved model instances or tool execute
+ * functions. The harness resolves those at step time via injected config.
+ */
+export interface HarnessSession extends HarnessSessionBase {
+  readonly history: HarnessModelMessage[];
 }
 
 export function requireSessionModelReference(session: HarnessSession): RuntimeModelReference {
@@ -129,6 +130,11 @@ export interface SessionLimits {
    * eve refuses to start another model call.
    */
   readonly maxOutputTokensPerSession?: number;
+  /**
+   * Maximum provider-reported model token cost this durable session may spend,
+   * in US dollars, before eve refuses to start another model call.
+   */
+  readonly maxTokenCostUsdPerSession?: number;
 }
 
 /**
@@ -154,8 +160,8 @@ export interface StepInput {
   /** Internal actor attribution for `message`. */
   readonly messageAuth?: SessionAuthContext | null;
   /**
-   * Context strings from the channel delivery. Each entry is appended
-   * as a `role: "user"` message to `session.history` before the
+   * Context strings from the channel delivery. Each entry is appended as a
+   * synthetic user-role message to `session.history` before the
    * delivery message. Populated by channels via `SendPayload.context`.
    */
   readonly context?: readonly string[];
@@ -180,9 +186,9 @@ export interface StepDone {
   readonly done: true;
   readonly output: unknown;
   /**
-   * Marks a terminal turn that failed (e.g. a task-mode turn that could not
-   * fulfil its output schema). For a delegated subagent this routes the result
-   * to the parent as an error tool-result rather than an empty success.
+   * Marks a terminal turn that failed. For a delegated subagent this routes
+   * the result to the parent as an error tool-result rather than an empty
+   * success.
    */
   readonly isError?: boolean;
 }
@@ -212,14 +218,7 @@ export interface SettledTurn {
  * Result returned by one harness step invocation.
  */
 export interface StepResult {
-  /** Background-tool effects projected onto the session that entered this step. */
-  readonly backgroundTaskSession?: HarnessSession;
-  /** Durable tasks started by background tools and awaiting the parent commit barrier. */
-  readonly backgroundTasks?: readonly {
-    readonly taskInboxToken: string;
-    readonly taskId: string;
-    readonly taskRunId: string;
-  }[];
+  readonly steered?: true;
   readonly next: StepNext;
   readonly session: HarnessSession;
   /**
@@ -227,7 +226,17 @@ export interface StepResult {
    * across the park boundary so a delegated parent can be notified.
    */
   readonly settledTurn?: SettledTurn;
+  /**
+   * Present when the turn stays open: the model ended it while tasks work, or
+   * it waits on a sign-in or tool approval it raised. It resumes when a task
+   * settles, or when the person answers, steers, or cancels.
+   */
+  readonly held?: TurnHold;
 }
+
+export type TurnHold =
+  | { readonly kind: "tasks"; readonly taskIds: readonly string[] }
+  | { readonly kind: "request" };
 
 /**
  * A single step of AI work. Takes the current session and optional user input,
@@ -272,35 +281,19 @@ export type HandleEventFn = (
  * Dependencies injected into the tool-loop harness at construction time.
  */
 export interface ToolLoopHarnessConfig {
+  readonly steeringSignal?: AbortSignal;
   /** Cancellation signal for the active turn. */
   readonly abortSignal?: AbortSignal;
   /**
    * Session-level capabilities. The harness reads
-   * {@link SessionCapabilities.requestInput} when assembling the
-   * per-step toolset to decide whether `ask_question` is available.
+   * {@link SessionCapabilities.requestInput} to decide whether a session-limit
+   * continuation prompt may park the session.
    */
   readonly capabilities?: SessionCapabilities;
   /** Clears model-message history without running a model turn. */
   readonly clearOnly?: boolean;
   /** Forces one context-compaction pass without running a model turn. */
   readonly compactOnly?: boolean;
-  /**
-   * Exposes the `Workflow` orchestration tool — an isolated JavaScript sandbox
-   * whose only callable operations are this agent's subagents and remote
-   * agents. Resolved from the `experimental_workflow(...)` definition exported
-   * by `agent/tools/workflow.ts`. Only root sessions ever see the tool.
-   * Defaults to `false`.
-   */
-  readonly workflow?: boolean;
-  /**
-   * Maximum subagent calls one `Workflow` invocation may dispatch, from the
-   * authored Workflow tool definition. Advertised in the tool description;
-   * the dispatch step enforces it. Defaults to
-   * {@link import("#harness/workflow-subagent-limit.js").DEFAULT_WORKFLOW_MAX_SUBAGENTS}.
-   */
-  readonly workflowMaxSubagents?: number;
-  /** AI Gateway provider selected for the framework `web_search` tool. */
-  readonly webSearchProvider?: WebSearchProvider;
   readonly handleEvent?: HandleEventFn;
   /** Projects raw durable history before it crosses a message-bearing boundary. */
   readonly historyProjector?: HistoryViewProjector;
@@ -311,25 +304,22 @@ export interface ToolLoopHarnessConfig {
    * Omitted in production until an instrumentation runtime opts in.
    */
   readonly instrumentation?: SessionInstrumentation;
+  /** Attribute work that must finish before cumulative model usage is persisted. */
+  readonly titleAttributeWrite?: Promise<void>;
   /**
-   * Execution mode for the current harness.
-   *
-   * Conversation mode parks after a final assistant reply so the runtime can
-   * await the next user message. Task mode must return `{ done: true, output }`
-   * for terminal assistant text inside the current invocation.
+   * Sign-in callbacks the step's delivery carried. Each completes before anything else runs, and
+   * a connection's sign-in resumes the turn that asked for it.
    */
-  readonly mode: RunMode;
-  /**
-   * Called after compaction to let the execution layer re-apply
-   * framework-owned state preservation (read-before-write reset, todo
-   * re-injection). The harness appends the returned messages to the
-   * compacted history.
-   */
-  readonly onCompaction?: () => readonly ModelMessage[];
-  /** Resolves step-scoped dynamic tools once for approval policy and model work. */
+  readonly signInCompletions?: readonly AuthorizationChallenge[];
+  /** Restores runtime resources for the originating turn before approval work. */
+  readonly prepareApprovalTurn?: (event: {
+    readonly sequence: number;
+    readonly turnId: string;
+  }) => Promise<void>;
+  /** Resolves persisted step-scoped tools before an approval policy reads them. */
   readonly resolveStepDynamicTools?: (input: {
     readonly ctx: AlsContext;
-    readonly event: UnstampedMessageStreamEvent;
+    readonly event: StepStartedStreamEvent;
     readonly messages: readonly ModelMessage[];
   }) => Promise<void>;
   readonly dispatchDynamicModelEvent?: (input: {

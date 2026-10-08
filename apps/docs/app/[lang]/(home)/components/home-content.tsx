@@ -9,7 +9,7 @@ import { FileTree } from "./file-tree";
 import { HeroAudience } from "./hero-audience";
 import { NextjsInterop } from "./nextjs-interop";
 
-const tagline = "Like Next.js for agents. Build durable agents with one folder.";
+const tagline = "Like Next.js for agents. File system based and production ready.";
 const titleMetadata = pageTitleMetadata(siteTitle);
 
 export const homeMetadata: Metadata = {
@@ -31,14 +31,14 @@ export const homeMetadata: Metadata = {
 };
 
 export const HomeContent = () => (
-  <div className="mx-auto w-full max-w-[1080px] pb-32">
+  <div className="mx-auto w-full max-w-[1080px] pb-8">
     <section className="relative isolate flex min-h-[80vh] flex-col items-center justify-center gap-y-5 px-4 pt-24 pb-12 text-center sm:px-12 sm:pb-16 sm:pt-42">
       <HeroAudience tagline={tagline} />
     </section>
     <FileTree />
     <NextjsInterop />
     <ArchitectureDiagram />
-    <FeatureGrid />
     <CTA />
+    <FeatureGrid />
   </div>
 );

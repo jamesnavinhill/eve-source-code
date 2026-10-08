@@ -1,3 +1,4 @@
+import { TEST_USAGE } from "#internal/testing/events.js";
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
 import {
@@ -9,6 +10,8 @@ import {
 } from "../src/client/index.js";
 import {
   EVE_SESSION_ID_HEADER,
+  EVE_MESSAGE_STREAM_VERSION,
+  EVE_STREAM_VERSION_HEADER,
   createMessageCompletedEvent,
   createMessageReceivedEvent,
   createResultCompletedEvent,
@@ -17,6 +20,7 @@ import {
   createSessionWaitingEvent,
   createTurnCompletedEvent,
   createTurnStartedEvent,
+  stampMessageStreamEvent,
   type UnstampedMessageStreamEvent,
 } from "../src/protocol/message.js";
 import { createTestAgentInfoResult } from "../src/internal/testing/agent-info-fixture.js";
@@ -25,10 +29,10 @@ import { createTestAgentInfoResult } from "../src/internal/testing/agent-info-fi
 // Helpers
 // ---------------------------------------------------------------------------
 
-function createControlledStreamResponse(): {
+function createControlledStreamResponse(deliveryId = "delivery_turn_001"): {
   close(): void;
   error(error: Error): void;
-  pushEvent(event: unknown): void;
+  pushEvent(event: UnstampedMessageStreamEvent): void;
   response: Response;
 } {
   const encoder = new TextEncoder();
@@ -42,7 +46,9 @@ function createControlledStreamResponse(): {
       controller?.error(error);
     },
     pushEvent(event) {
-      controller?.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+      controller?.enqueue(
+        encoder.encode(`${JSON.stringify(stampMessageStreamEvent(event, [deliveryId]))}\n`),
+      );
     },
     response: new Response(
       new ReadableStream<Uint8Array>({
@@ -50,12 +56,18 @@ function createControlledStreamResponse(): {
           controller = streamController;
         },
       }),
+      {
+        headers: { [EVE_STREAM_VERSION_HEADER]: EVE_MESSAGE_STREAM_VERSION },
+      },
     ),
   };
 }
 
-function createStartedMessageResponse(sessionId: string): Response {
-  return new Response(JSON.stringify({ ok: true, sessionId }), {
+function createStartedMessageResponse(
+  sessionId: string,
+  deliveryId = "delivery_turn_001",
+): Response {
+  return new Response(JSON.stringify({ ok: true, sessionId, deliveryId }), {
     headers: {
       "content-type": "application/json",
       [EVE_SESSION_ID_HEADER]: sessionId,
@@ -64,25 +76,43 @@ function createStartedMessageResponse(sessionId: string): Response {
   });
 }
 
-function createResumedMessageResponse(): Response {
-  return new Response(JSON.stringify({ ok: true }), {
+function createResumedMessageResponse(deliveryId = "delivery_turn_002"): Response {
+  return new Response(JSON.stringify({ ok: true, deliveryId }), {
     headers: { "content-type": "application/json" },
     status: 200,
   });
 }
 
-function createEagerStreamResponse(events: readonly unknown[]): Response {
+function createEagerStreamResponse(
+  events: readonly UnstampedMessageStreamEvent[],
+  deliveryId?: string,
+): Response {
+  let turnId = "turn_001";
+  for (const event of events) {
+    if ("data" in event && event.data !== undefined && "turnId" in event.data) {
+      turnId = event.data.turnId;
+      break;
+    }
+  }
+  const acceptedDeliveryId = deliveryId ?? `delivery_${turnId}`;
   const encoder = new TextEncoder();
 
   return new Response(
     new ReadableStream<Uint8Array>({
       start(controller) {
         for (const event of events) {
-          controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+          controller.enqueue(
+            encoder.encode(
+              `${JSON.stringify(stampMessageStreamEvent(event, [acceptedDeliveryId]))}\n`,
+            ),
+          );
         }
         controller.close();
       },
     }),
+    {
+      headers: { [EVE_STREAM_VERSION_HEADER]: EVE_MESSAGE_STREAM_VERSION },
+    },
   );
 }
 
@@ -105,7 +135,7 @@ function singleTurnEvents(input: {
       turnId: input.turnId,
     }),
     createTurnCompletedEvent({ sequence: input.sequence, turnId: input.turnId }),
-    createSessionWaitingEvent(),
+    createSessionWaitingEvent(TEST_USAGE),
   ];
 }
 
@@ -163,49 +193,6 @@ describe("Client.health", () => {
 
     const headers = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
     expect(headers.get("authorization")).toBe("Bearer my-token");
-  });
-
-  it("resolves bearer auth via callback on each request", async () => {
-    let callCount = 0;
-    const fetchMock = vi
-      .spyOn(globalThis, "fetch")
-      .mockImplementation(() =>
-        Promise.resolve(Response.json({ ok: true, status: "ready", workflowId: "wf_001" })),
-      );
-
-    const client = new Client({
-      auth: {
-        bearer: () => {
-          callCount += 1;
-          return `token_${callCount}`;
-        },
-      },
-      host: "http://localhost:3000",
-    });
-
-    await client.health();
-    await client.health();
-
-    const firstHeaders = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
-    const secondHeaders = new Headers(fetchMock.mock.calls[1]?.[1]?.headers);
-    expect(firstHeaders.get("authorization")).toBe("Bearer token_1");
-    expect(secondHeaders.get("authorization")).toBe("Bearer token_2");
-    expect(callCount).toBe(2);
-  });
-
-  it("sends basic auth header", async () => {
-    const fetchMock = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(Response.json({ ok: true, status: "ready", workflowId: "wf_001" }));
-
-    const client = new Client({
-      auth: { basic: { password: "secret", username: "admin" } },
-      host: "http://localhost:3000",
-    });
-    await client.health();
-
-    const headers = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
-    expect(headers.get("authorization")).toBe(`Basic ${btoa("admin:secret")}`);
   });
 
   it("sends custom headers", async () => {
@@ -284,7 +271,7 @@ describe("Session.send (result)", () => {
     expect(result.message).toBe("Reply: Hello");
     expect(result.sessionId).toBe("session_001");
     expect(result.status).toBe("waiting");
-    expect(result.events).toEqual(events);
+    expect(result.events.map(({ meta: _meta, ...event }) => event)).toEqual(events);
   });
 
   it("sends follow-up messages through the fixed session ID", async () => {
@@ -299,8 +286,8 @@ describe("Session.send (result)", () => {
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(createStartedMessageResponse("session_001"))
       .mockResolvedValueOnce(createEagerStreamResponse(firstEvents))
-      .mockResolvedValueOnce(createResumedMessageResponse())
-      .mockResolvedValueOnce(createEagerStreamResponse(secondEvents));
+      .mockResolvedValueOnce(createResumedMessageResponse("delivery_follow_up"))
+      .mockResolvedValueOnce(createEagerStreamResponse(secondEvents, "delivery_follow_up"));
 
     const session = new Client({ host: "http://localhost:3000" }).sessions.attach("session_001");
     await (await session.send("Hello")).result();
@@ -326,6 +313,7 @@ describe("Session.send (result)", () => {
     const events: UnstampedMessageStreamEvent[] = [
       createTurnStartedEvent({ sequence: 1, turnId: "turn_001" }),
       createSessionFailedEvent({
+        usage: TEST_USAGE,
         code: "internal_error",
         message: "Something went wrong",
         sessionId: "session_001",
@@ -341,7 +329,7 @@ describe("Session.send (result)", () => {
 
     expect(result.status).toBe("failed");
     expect(result.message).toBeUndefined();
-    expect(result.events).toEqual(events);
+    expect(result.events.map(({ meta: _meta, ...event }) => event)).toEqual(events);
   });
 
   it("returns status 'completed' when the session completes", async () => {
@@ -354,7 +342,7 @@ describe("Session.send (result)", () => {
         turnId: "turn_001",
       }),
       createTurnCompletedEvent({ sequence: 1, turnId: "turn_001" }),
-      createSessionCompletedEvent(),
+      createSessionCompletedEvent(TEST_USAGE),
     ];
 
     vi.spyOn(globalThis, "fetch")
@@ -394,7 +382,7 @@ describe("Session.send (result)", () => {
         turnId: "turn_001",
       }),
       createTurnCompletedEvent({ sequence: 1, turnId: "turn_001" }),
-      createSessionWaitingEvent(),
+      createSessionWaitingEvent(TEST_USAGE),
     ];
 
     const fetchMock = vi
@@ -423,7 +411,7 @@ describe("Session.send (result)", () => {
         stepIndex: 0,
         turnId: "turn_001",
       }),
-      createSessionCompletedEvent(),
+      createSessionCompletedEvent(TEST_USAGE),
     ];
     const secondEvents = singleTurnEvents({
       message: "New conversation",
@@ -435,8 +423,8 @@ describe("Session.send (result)", () => {
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(createStartedMessageResponse("session_001"))
       .mockResolvedValueOnce(createEagerStreamResponse(firstEvents))
-      .mockResolvedValueOnce(createResumedMessageResponse())
-      .mockResolvedValueOnce(createEagerStreamResponse(secondEvents));
+      .mockResolvedValueOnce(createResumedMessageResponse("delivery_follow_up"))
+      .mockResolvedValueOnce(createEagerStreamResponse(secondEvents, "delivery_follow_up"));
 
     const session = new Client({ host: "http://localhost:3000" }).sessions.attach("session_001");
     await (await session.send("Task")).result();
@@ -472,7 +460,7 @@ describe("Session.send (stream)", () => {
 
     const session = new Client({ host: "http://localhost:3000" }).sessions.attach("session_001");
     const res = await session.send("Hello");
-    const collected: UnstampedMessageStreamEvent[] = [];
+    const collected: MessageStreamEvent[] = [];
 
     const iterationPromise = (async () => {
       for await (const event of res) {
@@ -490,7 +478,7 @@ describe("Session.send (stream)", () => {
           turnId: "turn_001",
         }),
       );
-      stream.pushEvent(createSessionWaitingEvent());
+      stream.pushEvent(createSessionWaitingEvent(TEST_USAGE));
     }, 0);
 
     await iterationPromise;
@@ -514,7 +502,7 @@ describe("Session.send (stream)", () => {
     expect(res.sessionId).toBe("session_001");
 
     setTimeout(() => {
-      stream.pushEvent(createSessionWaitingEvent());
+      stream.pushEvent(createSessionWaitingEvent(TEST_USAGE));
     }, 0);
 
     for await (const _ of res) {
@@ -558,7 +546,7 @@ describe("Session.send (reconnection)", () => {
         turnId: "turn_001",
       }),
       createTurnCompletedEvent({ sequence: 1, turnId: "turn_001" }),
-      createSessionWaitingEvent(),
+      createSessionWaitingEvent(TEST_USAGE),
     ];
 
     const fetchMock = vi
@@ -665,9 +653,9 @@ describe("Session state", () => {
     });
 
     vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(createStartedMessageResponse("session_a"))
+      .mockResolvedValueOnce(createStartedMessageResponse("session_a", "delivery_turn_a"))
       .mockResolvedValueOnce(createEagerStreamResponse(eventsA))
-      .mockResolvedValueOnce(createStartedMessageResponse("session_b"))
+      .mockResolvedValueOnce(createStartedMessageResponse("session_b", "delivery_turn_b"))
       .mockResolvedValueOnce(createEagerStreamResponse(eventsB));
 
     const client = new Client({ host: "http://localhost:3000" });
@@ -728,7 +716,7 @@ describe("Session.stream", () => {
         stepIndex: 0,
         turnId: "turn_002",
       }),
-      createSessionWaitingEvent(),
+      createSessionWaitingEvent(TEST_USAGE),
     ];
 
     const fetchMock = vi
@@ -738,7 +726,7 @@ describe("Session.stream", () => {
     const client = new Client({ host: "http://localhost:3000" });
     const session = client.sessions.attach("session_001", { streamIndex: 10 });
 
-    const collected: UnstampedMessageStreamEvent[] = [];
+    const collected: MessageStreamEvent[] = [];
     for await (const event of session.stream()) {
       collected.push(event);
       // stream() follows the durable log across transport ends; the boundary
@@ -748,7 +736,7 @@ describe("Session.stream", () => {
       }
     }
 
-    expect(collected).toEqual(events);
+    expect(collected.map(({ meta: _meta, ...event }) => event)).toEqual(events);
     const url = String(fetchMock.mock.calls[0]?.[0]);
     expect(url).toContain("session_001/stream");
     expect(url).toContain("startIndex=10");

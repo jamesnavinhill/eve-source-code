@@ -3,9 +3,17 @@ import { describe, expect, it } from "vitest";
 import {
   coalesceDeliveries,
   coalesceTurnInputs,
+  createFrameworkUserMessage,
+  createUserMessage,
+  isFrameworkMessageKind,
+  isFrameworkUserMessage,
+  isUserMessageKind,
+  isUserModelMessage,
+  markFrameworkStepInput,
   normalizeModelMessages,
   normalizeUserContent,
   resolveAssistantStepText,
+  validateHarnessModelMessages,
 } from "#harness/messages.js";
 import type { StepInput } from "#harness/types.js";
 import { attachClientContext, readClientContext } from "#internal/client-context.js";
@@ -32,13 +40,13 @@ describe("coalesceDeliveries", () => {
   it("preserves the only caller in a delivery batch", () => {
     expect(
       coalesceDeliveries([
-        { kind: "deliver", payloads: [{ context: ["background"] }] },
+        { kind: "deliver", payloads: [{ context: ["earlier context"] }] },
         { caller, kind: "deliver", payloads: [{ message: "question" }] },
       ]),
     ).toEqual({
       caller,
       kind: "deliver",
-      payloads: [{ context: ["background"] }, { message: "question" }],
+      payloads: [{ context: ["earlier context"] }, { message: "question" }],
     });
   });
 
@@ -84,6 +92,22 @@ describe("coalesceDeliveries", () => {
 });
 
 describe("coalesceTurnInputs", () => {
+  it("keeps answers that carry their responder", () => {
+    const bob = {
+      attributes: {},
+      authenticator: "test",
+      principalId: "bob",
+      principalType: "user",
+    };
+    const saved = { inputResponses: [{ optionId: "approve", requestId: "approval-1" }] };
+    const answer = { auth: bob, response: { optionId: "cancel", requestId: "approval-2" } };
+
+    expect(coalesceTurnInputs(saved, { attributedInputResponses: [answer] })).toEqual({
+      ...saved,
+      attributedInputResponses: [answer],
+    });
+  });
+
   it("joins two messages with a double newline", () => {
     const result = coalesceTurnInputs({ message: "hello" }, { message: "world" });
 
@@ -95,6 +119,26 @@ describe("coalesceTurnInputs", () => {
     const result = messages.reduce(coalesceTurnInputs);
 
     expect(result).toEqual({ message: "a\n\nb\n\nc" });
+  });
+
+  it("preserves a framework kind only when all merged message content shares it", () => {
+    expect(
+      coalesceTurnInputs(
+        markFrameworkStepInput({ message: "first" }, "execution.continuation"),
+        markFrameworkStepInput({ message: "second" }, "execution.continuation"),
+      ),
+    ).toEqual(markFrameworkStepInput({ message: "first\n\nsecond" }, "execution.continuation"));
+    expect(
+      coalesceTurnInputs(markFrameworkStepInput({ message: "first" }, "execution.continuation"), {
+        message: "second",
+      }),
+    ).toEqual({ message: "first\n\nsecond" });
+    expect(
+      coalesceTurnInputs(
+        markFrameworkStepInput({ message: "first" }, "context.instruction"),
+        markFrameworkStepInput({ message: "second" }, "execution.continuation"),
+      ),
+    ).toEqual({ message: "first\n\nsecond" });
   });
 
   it("merges inputResponses from both payloads", () => {
@@ -254,6 +298,51 @@ describe("normalizeModelMessages", () => {
         visible,
       ]),
     ).toEqual([{ content: [toolCall], role: "assistant" }, visible]);
+  });
+});
+
+describe("createFrameworkUserMessage", () => {
+  it.each([
+    "context.instruction",
+    "context.state",
+    "context.compaction",
+    "memory.load",
+    "execution.continuation",
+    "execution.continuation",
+    "execution.retry",
+  ] as const)("recognizes %s as a framework message kind", (kind) => {
+    expect(isFrameworkMessageKind(kind)).toBe(true);
+  });
+
+  it("brands framework-authored user-role messages", () => {
+    const message = createFrameworkUserMessage(
+      "execution.continuation",
+      "Continue the interrupted turn.",
+    );
+
+    expect(message).toEqual({
+      content: "Continue the interrupted turn.",
+      kind: "execution.continuation",
+      role: "user",
+    });
+    expect(isFrameworkUserMessage(message)).toBe(true);
+    expect(isFrameworkUserMessage({ content: "A user message", role: "user" })).toBe(false);
+    expect(isFrameworkMessageKind("synthetic")).toBe(false);
+  });
+
+  it("brands real user messages with the user kind", () => {
+    const message = createUserMessage("user", "A user message");
+
+    expect(message).toEqual({ content: "A user message", kind: "user", role: "user" });
+    expect(isUserMessageKind("user")).toBe(true);
+    expect(isUserModelMessage(message)).toBe(true);
+    expect(isFrameworkUserMessage(message)).toBe(false);
+  });
+
+  it("rejects unclassified user messages before history retention", () => {
+    expect(() =>
+      validateHarnessModelMessages([{ content: "A user message", role: "user" }]),
+    ).toThrow("Expected every user-role model message to have a kind.");
   });
 });
 

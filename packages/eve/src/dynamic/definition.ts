@@ -3,6 +3,7 @@ import type { ModelMessage } from "ai";
 import type { SessionAuth } from "#context/keys.js";
 import { stampDefinitionKey } from "#internal/authored-definition/source-identity.js";
 import type { UnstampedMessageStreamEvent } from "#protocol/message.js";
+import type { ConversationContext } from "#shared/conversation-context.js";
 
 /**
  * Stream event types allowed for dynamic tool resolvers. Dispatch
@@ -45,9 +46,14 @@ export const ALLOWED_DYNAMIC_CONNECTION_EVENTS: ReadonlySet<string> = new Set<Dy
  * the session context inside tool `execute` functions.
  */
 export interface DynamicResolveContext {
+  /** Active cancellation signal when resolving a dynamic model. */
+  readonly abortSignal?: AbortSignal;
+  /** Effective model for this resolver, or `null` before dynamic model selection. */
+  readonly model: { readonly id: string } | null;
   readonly session: {
     readonly id: string;
     readonly auth: SessionAuth;
+    readonly schedule?: import("#context/session-schedule.js").SessionSchedule;
   };
   /** Channel metadata for the request that triggered this resolve. */
   readonly channel: {
@@ -58,6 +64,11 @@ export interface DynamicResolveContext {
     /** Free-form channel-specific metadata attached to the request. */
     readonly metadata?: Readonly<Record<string, unknown>>;
   };
+  /**
+   * Immutable classification and execution context for the active conversation.
+   * Absent on sessions persisted before this context key existed.
+   */
+  readonly conversation?: ConversationContext;
   /** Conversation history visible at this resolve point, oldest first. */
   readonly messages: readonly ModelMessage[];
 }

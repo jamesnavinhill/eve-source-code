@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { TEST_USAGE } from "#internal/testing/events.js";
+import { describe, expect, it, vi } from "vitest";
 
 import { ContextContainer, contextStorage } from "#context/container.js";
 import { ActiveChannelDeliveriesKey } from "#context/keys.js";
@@ -53,6 +54,7 @@ describe("createInstrumentationHandleEvent", () => {
         },
         policyAgentName: "weather",
         rootSessionId: "session-1",
+        traceSessionId: "session-1",
         sequence: 0,
         sessionId: "session-1",
         turnId: "turn_0",
@@ -118,7 +120,7 @@ describe("createInstrumentationHandleEvent", () => {
       }),
     );
     await handleEvent(createTurnCompletedEvent({ sequence: 0, turnId: "turn-1" }));
-    await handleEvent(createSessionWaitingEvent());
+    await handleEvent(createSessionWaitingEvent(TEST_USAGE));
 
     expect(order).toEqual([
       "durable:session.started",
@@ -132,6 +134,22 @@ describe("createInstrumentationHandleEvent", () => {
       "durable:session.waiting",
       "lifecycle:session.waiting",
     ]);
+  });
+
+  it("forwards the source event to the durable handler", async () => {
+    const source = createSessionStartedEvent();
+    let forwarded: unknown;
+    const handleEvent = createInstrumentationHandleEvent({
+      handleEvent: async (event) => {
+        forwarded = event;
+      },
+      hooks: { capturesContent: false, publish: async () => {} },
+      sessionId: "session-1",
+    })!;
+
+    await handleEvent(source);
+
+    expect(forwarded).toBe(source);
   });
 
   it("does not change execution mode when hooks have no durable handler", () => {
@@ -160,7 +178,7 @@ describe("createInstrumentationHandleEvent", () => {
       turnId: "turn-1",
     })!;
 
-    await handleEvent(createSessionWaitingEvent());
+    await handleEvent(createSessionWaitingEvent(TEST_USAGE));
 
     expect(events).toEqual([
       {
@@ -252,6 +270,13 @@ describe("createInstrumentationHandleEvent", () => {
           remoteAgentName: "analyst",
         },
         { callId: "add-1", input: { a: 1, b: 2 }, kind: "tool-call", toolName: "add" },
+        {
+          callId: "workflow-1",
+          input: { report: "weekly" },
+          kind: "workflow-tool-call",
+          toolName: "publish",
+          workflowId: "publish-workflow",
+        },
       ],
       sequence: 0,
       stepIndex: 0,
@@ -261,12 +286,19 @@ describe("createInstrumentationHandleEvent", () => {
     await contextStorage.run(context, async () => {
       const handleEvent = createInstrumentationHandleEvent({
         getAttemptScope: () => scope,
-        handleEvent: async () => {},
+        handleEvent: async () => {
+          clock.mockReturnValue(2_000);
+        },
         hooks: { capturesContent: true, publish: async (event) => void events.push(event) },
         sessionId: "session-1",
       })!;
-      await handleEvent(requested);
-      await handleEvent(requested);
+      const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+      try {
+        await handleEvent(requested);
+        await handleEvent(requested);
+      } finally {
+        clock.mockRestore();
+      }
     });
 
     const restored = await deserializeContext(await serializeContext(context));
@@ -281,11 +313,29 @@ describe("createInstrumentationHandleEvent", () => {
         createActionResultEvent({
           result: {
             callId: "delegate-1",
-            kind: "subagent-result",
-            origin: "dispatch",
-            output: "unavailable",
             isError: true,
+            kind: "subagent-result",
+            origin: "child",
+            outcome: {
+              kind: "terminal",
+              result: { kind: "failed", error: "unavailable" },
+              usageDelta: {
+                cacheReadTokens: 1,
+                cacheWriteTokens: 2,
+                costUsd: 0.003,
+                inputTokens: 4,
+                outputTokens: 2,
+              },
+            },
+            output: "unavailable",
             subagentName: "worker",
+            usage: {
+              cacheReadTokens: 1,
+              cacheWriteTokens: 2,
+              costUsd: 0.003,
+              inputTokens: 4,
+              outputTokens: 2,
+            },
           },
           sequence: 0,
           stepIndex: 0,
@@ -313,6 +363,7 @@ describe("createInstrumentationHandleEvent", () => {
             usage: {
               cacheReadTokens: 3,
               cacheWriteTokens: 4,
+              costUsd: 0.012,
               inputTokens: 10,
               outputTokens: 5,
             },
@@ -337,74 +388,108 @@ describe("createInstrumentationHandleEvent", () => {
       );
     });
 
-    expect(events.slice(0, 4)).toEqual([
+    expect(events.slice(0, 5)).toEqual([
       {
         callId: "delegate-1",
+        frameworkTool: false,
+        startedAtMs: 1_000,
         idempotencyKey: actionIdempotencyKey("session-1", "turn-1", "delegate-1"),
         input: { task: "research" },
         kind: "subagent-call",
-        name: "delegate",
+        toolName: "delegate",
+        isWorkflowTool: true,
         scope,
-        type: "action.started",
+        type: "tool.call.started",
       },
       {
         callId: "skill-1",
+        frameworkTool: false,
+        startedAtMs: 1_000,
         idempotencyKey: actionIdempotencyKey("session-1", "turn-1", "skill-1"),
         input: { name: "research" },
         kind: "load-skill",
-        name: "load_skill",
+        toolName: "load_skill",
         scope,
-        type: "action.started",
+        type: "tool.call.started",
       },
       {
         callId: "remote-1",
+        frameworkTool: false,
+        startedAtMs: 1_000,
         idempotencyKey: actionIdempotencyKey("session-1", "turn-1", "remote-1"),
         input: { task: "analyze" },
         kind: "remote-agent-call",
-        name: "remote",
+        toolName: "remote",
+        isWorkflowTool: true,
         scope,
-        type: "action.started",
+        type: "tool.call.started",
       },
       {
         callId: "add-1",
+        frameworkTool: false,
+        startedAtMs: 1_000,
         idempotencyKey: actionIdempotencyKey("session-1", "turn-1", "add-1"),
         input: { a: 1, b: 2 },
         kind: "tool-call",
-        name: "add",
+        toolName: "add",
         scope,
-        type: "action.started",
+        type: "tool.call.started",
+      },
+      {
+        callId: "workflow-1",
+        frameworkTool: false,
+        startedAtMs: 1_000,
+        idempotencyKey: actionIdempotencyKey("session-1", "turn-1", "workflow-1"),
+        input: { report: "weekly" },
+        isWorkflowTool: true,
+        kind: "tool-call",
+        toolName: "publish",
+        scope,
+        type: "tool.call.started",
       },
     ]);
-    expect(events[4]).toMatchObject({
+    const terminals = events.filter(
+      (event) =>
+        (event as { type: string }).type === "tool.call.failed" ||
+        (event as { type: string }).type === "tool.call.completed",
+    );
+    expect(terminals[0]).toMatchObject({
       errorCode: "ACTION_RESULT_FAILED",
       idempotencyKey: actionIdempotencyKey("session-1", "turn-1", "delegate-1"),
       outcome: "failed",
       scope,
-      type: "action.failed",
+      type: "tool.call.failed",
+      usage: {
+        costUsd: 0.003,
+        inputTokenDetails: { cacheReadTokens: 1, cacheWriteTokens: 2 },
+        inputTokens: 4,
+        outputTokens: 2,
+      },
     });
-    expect(events[5]).toEqual({
+    expect(terminals[1]).toEqual({
       acceptedAtMs: 1_234,
       idempotencyKey: actionIdempotencyKey("session-1", "turn-1", "remote-1"),
       outcome: "completed",
       output: { output: "done", type: "result" },
       scope,
-      type: "action.completed",
+      type: "tool.call.completed",
       usage: {
+        costUsd: 0.012,
         inputTokenDetails: { cacheReadTokens: 3, cacheWriteTokens: 4 },
         inputTokens: 10,
         outputTokens: 5,
       },
     });
-    expect(events[6]).toEqual({
+    expect(terminals[2]).toEqual({
       acceptedAtMs: undefined,
       idempotencyKey: actionIdempotencyKey("session-1", "turn-1", "add-1"),
       outcome: "completed",
       output: { output: 3, type: "result" },
       scope,
-      type: "action.completed",
+      type: "tool.call.completed",
       usage: undefined,
     });
-    expect(events).toHaveLength(7);
+    expect(events).toHaveLength(8);
     expect(events.every(Object.isFrozen)).toBe(true);
   });
 

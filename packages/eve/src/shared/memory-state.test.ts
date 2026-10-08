@@ -7,7 +7,7 @@ import {
   clearMemorySessionState,
   createMemoryLock,
   projectMemoryHistory,
-  readMemoryLocks,
+  projectMemoryHistoryFromSessionState,
   shouldCanonicalizeMemory,
   validateMemoryRecallResult,
 } from "#shared/memory-state.js";
@@ -135,11 +135,11 @@ describe("memory record state", () => {
 
     expect(identical.history).toHaveLength(second.history.length);
     expect(
-      projectMemoryHistory({ locks: readMemoryLocks(second.state), messages: second.history }),
+      projectMemoryHistoryFromSessionState({ messages: second.history, state: second.state }),
     ).toEqual([
-      { content: "first note", role: "user" },
-      { content: "new profile", role: "user" },
-      { content: "second note", role: "user" },
+      { content: "first note", kind: "memory.load", role: "user" },
+      { content: "new profile", kind: "memory.load", role: "user" },
+      { content: "second note", kind: "memory.load", role: "user" },
     ]);
   });
 
@@ -171,7 +171,7 @@ describe("memory record state", () => {
         locks: { profile: lock("user_2", "session") },
         messages: sessionVisible.history,
       }),
-    ).toEqual([{ content: "sticky", role: "user" }]);
+    ).toEqual([{ content: "sticky", kind: "memory.load", role: "user" }]);
   });
 
   it("canonicalizes private records independently", () => {

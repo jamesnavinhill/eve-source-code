@@ -17,8 +17,12 @@ export class AgentSpanIdGenerator {
 
   /** Derives one span id for a replay-stable instrumentation event. */
   deriveSpanId(key: string): string {
-    const spanId = createHash("sha256").update(key).digest("hex").slice(0, 16);
-    return /^0+$/u.test(spanId) ? "0000000000000001" : spanId;
+    return deriveAgentSpanId(key);
+  }
+
+  deriveTraceId(key: string): string {
+    const traceId = createHash("sha256").update(key).digest("hex").slice(0, 32);
+    return /^0+$/u.test(traceId) ? "00000000000000000000000000000001" : traceId;
   }
 
   generateSpanId(): string {
@@ -57,6 +61,11 @@ export class AgentSpanIdGenerator {
       this.#primedTraceId = undefined;
     }
   }
+}
+
+function deriveAgentSpanId(key: string): string {
+  const spanId = createHash("sha256").update(key).digest("hex").slice(0, 16);
+  return /^0+$/u.test(spanId) ? "0000000000000001" : spanId;
 }
 
 const HEX_DIGITS = "0123456789abcdef";

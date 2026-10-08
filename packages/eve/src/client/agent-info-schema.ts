@@ -1,10 +1,16 @@
 import { z } from "#compiled/zod/index.js";
+import { mountIdSchema } from "#shared/extension-mount.js";
 
 const owner = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("application") }).strict(),
   z.object({ feature: z.string(), kind: z.literal("framework") }).strict(),
   z
-    .object({ kind: z.literal("extension"), namespace: z.string(), packageName: z.string() })
+    .object({
+      kind: z.literal("extension"),
+      mountId: mountIdSchema.optional(),
+      namespace: z.string(),
+      packageName: z.string(),
+    })
     .strict(),
 ]);
 
@@ -17,6 +23,7 @@ const moduleBacking = z.discriminatedUnion("kind", [
         .strict()
         .optional(),
       kind: z.literal("filesystem"),
+      mountId: z.string().optional(),
       sourcePath: z.string(),
     })
     .strict(),
@@ -24,6 +31,7 @@ const moduleBacking = z.discriminatedUnion("kind", [
     .object({
       dependencies: z.record(z.string(), z.string()).optional(),
       kind: z.literal("programmatic"),
+      mountId: z.string().optional(),
       moduleId: z.string(),
       parameters: z.record(z.string(), z.unknown()).optional(),
       registryId: z.string(),
@@ -83,7 +91,8 @@ const modelEndpoint = z.union([
     .object({
       kind: z.literal("gateway"),
       connected: z.literal(true),
-      credential: z.enum(["api-key", "oidc"]),
+      credential: z.enum(["api-key", "oidc", "oauth"]),
+      team: z.optional(z.string()),
     })
     .strict(),
   z.object({ kind: z.literal("gateway"), connected: z.literal(false) }).strict(),
@@ -211,12 +220,9 @@ const memory = source
 
 const sandbox = source
   .extend({
-    backendKind: z.string().optional(),
-    description: z.string().optional(),
-    hasBootstrap: z.boolean(),
-    hasOnSession: z.boolean(),
-    revalidationKey: z.string().optional(),
-    sourceHash: z.string().optional(),
+    provider: z.string().optional(),
+    environmentExportName: z.string().optional(),
+    revisionHash: z.string(),
   })
   .strict();
 
@@ -252,19 +258,21 @@ const remoteAgent = entry
   })
   .strict();
 
+// Kernel effects are inspection metadata only. Deployments can retain removed
+// effects across framework versions, so preserve the response and identify an
+// option this client cannot interpret instead of rejecting agent info entirely.
 const kernelEffect = z
   .object({
-    action: z.enum(["subagent-call", "task-update", "task-cancel"]).optional(),
+    action: z
+      .union([z.enum(["subagent-call", "workflow-tool-call"]), z.literal("unrecognized")])
+      .catch("unrecognized")
+      .optional(),
     audience: z.array(
-      z.enum([
-        "root-session",
-        "delegated-task-child",
-        "requires-request-input",
-        "requires-loadable-skill",
-        "below-subagent-depth",
-      ]),
+      z.union([z.literal("root-session"), z.literal("unrecognized")]).catch("unrecognized"),
     ),
-    kind: z.enum(["request-input", "dispatch", "provider-tool"]),
+    kind: z
+      .union([z.enum(["dispatch", "provider-tool"]), z.literal("unrecognized")])
+      .catch("unrecognized"),
     sourceId: z.string(),
   })
   .strict();
@@ -279,12 +287,7 @@ const compositionDiagnostic = z
   })
   .strict();
 
-const workflow = z.discriminatedUnion("enabled", [
-  z.object({ enabled: z.literal(false), toolName: z.string() }).strict(),
-  z.object({ enabled: z.literal(true), source, toolName: z.string() }).strict(),
-]);
-
-/** Runtime contract for the authoritative `/eve/v1/info` v4 response. */
+/** Runtime contract for the authoritative `/eve/v1/info` v5 response. */
 export const AgentInfoResultSchema = z
   .object({
     agent: z
@@ -326,8 +329,7 @@ export const AgentInfoResultSchema = z
     skills: z.object({ dynamic: z.array(dynamicResolver), static: z.array(skill) }).strict(),
     subagents: z.object({ local: z.array(subagent), total: z.number() }).strict(),
     tools: z.object({ dynamic: z.array(dynamicResolver), static: z.array(tool) }).strict(),
-    version: z.literal(4),
-    workflow,
+    version: z.literal(5),
     workspace: z.object({ resourceRoot: z.unknown(), rootEntries: z.array(z.string()) }).strict(),
   })
   .strict()
@@ -424,9 +426,6 @@ export const AgentInfoResultSchema = z
       ),
       ...value.tools.dynamic.map((entry, index) => [entry, ["tools", "dynamic", index]] as const),
       ...value.tools.static.map((entry, index) => [entry, ["tools", "static", index]] as const),
-      ...(value.workflow.enabled
-        ? ([[value.workflow.source, ["workflow", "source"]]] as const)
-        : []),
       [value.sandbox, ["sandbox"]],
     ];
     for (const [entry, path] of boundSources) {

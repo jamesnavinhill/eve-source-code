@@ -12,6 +12,8 @@ export interface GatewayCredentialPresence {
   readonly apiKey: boolean;
   /** A Vercel OIDC token is available (`VERCEL_OIDC_TOKEN` or a linked project). */
   readonly oidc: boolean;
+  readonly account?: boolean;
+  readonly team?: string;
 }
 
 /** True when an environment value is present and non-blank. */
@@ -27,7 +29,7 @@ export type GatewayCredentialSource = { kind: "env-file"; path: string } | { kin
  * whatever their vantage point can see — env files on disk, the process
  * environment, an SDK token lookup — and the resolver ranks it.
  */
-export interface GatewayCredentialEvidence {
+interface GatewayCredentialEvidence {
   /** `AI_GATEWAY_API_KEY` found in an app env file (the file's name). */
   readonly apiKeyFile?: string;
   /** `AI_GATEWAY_API_KEY` present in the process environment. */
@@ -90,6 +92,13 @@ export function resolveModelEndpointStatus(
     }
     return { kind: "external", provider: routing.provider };
   }
+  if (credentials.account)
+    return {
+      kind: "gateway",
+      connected: true,
+      credential: "oauth",
+      team: credentials.team,
+    };
   const resolution = resolveGatewayCredential({
     apiKeyInEnv: credentials.apiKey,
     oidcAvailable: credentials.oidc,

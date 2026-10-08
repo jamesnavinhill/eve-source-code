@@ -8,8 +8,6 @@ import {
   type AgentLimitsDefinition,
   type AgentReasoningDefinition,
 } from "#shared/agent-definition.js";
-import type { JsonObject } from "#shared/json.js";
-import { serializeOutputSchema } from "#tools/schema.js";
 
 export interface DynamicSubagentAgentConfig {
   readonly compaction?: {
@@ -19,8 +17,8 @@ export interface DynamicSubagentAgentConfig {
   readonly description: string;
   readonly limits?: AgentLimitsDefinition;
   readonly model: DynamicSubagentModelReference;
-  readonly outputSchema?: JsonObject;
   readonly reasoning?: AgentReasoningDefinition;
+  readonly tool?: boolean;
 }
 
 export type DynamicSubagentModelReference = RuntimeModelReference;
@@ -40,6 +38,9 @@ export async function normalizeDynamicSubagentAgentConfig(input: {
   if (definition.build !== undefined) {
     throw new Error(`${message} The "build" field cannot be selected at runtime.`);
   }
+  if (definition.defaultTools !== undefined) {
+    throw new Error(`${message} The "defaultTools" field cannot be selected at runtime.`);
+  }
   if (definition.experimental !== undefined) {
     throw new Error(`${message} The "experimental" field cannot be selected at runtime.`);
   }
@@ -52,8 +53,8 @@ export async function normalizeDynamicSubagentAgentConfig(input: {
     description: string;
     limits?: AgentLimitsDefinition;
     model: DynamicSubagentModelReference;
-    outputSchema?: JsonObject;
     reasoning?: AgentReasoningDefinition;
+    tool?: boolean;
   } = {
     description: definition.description,
     model: await normalizeDurableModelSelection({
@@ -91,11 +92,11 @@ export async function normalizeDynamicSubagentAgentConfig(input: {
   if (definition.limits !== undefined) {
     config.limits = definition.limits;
   }
-  if (definition.outputSchema !== undefined) {
-    config.outputSchema = serializeOutputSchema(definition.outputSchema);
-  }
   if (definition.reasoning !== undefined) {
     config.reasoning = definition.reasoning;
+  }
+  if (definition.tool !== undefined) {
+    config.tool = definition.tool;
   }
 
   return config;

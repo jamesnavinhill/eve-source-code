@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { EveProjectContext } from "#internal/project-context.js";
 import { createFakePrompter } from "#internal/testing/fake-prompter.js";
 import { InteractionRequired, select } from "#setup/ask.js";
 import { ensureVercelProject } from "#setup/flows/ensure-vercel-project.js";
@@ -8,7 +9,14 @@ import { runIntegrationSetup } from "#setup/integrations/runner.js";
 import { runIntegrationSetupCommand } from "./integration-setup.js";
 import type { RegistryCommandLogger } from "./registry.js";
 
-const { isEveProject } = vi.hoisted(() => ({ isEveProject: vi.fn(async () => true) }));
+const { isEveProject, resolveEveProjectContext } = vi.hoisted(() => ({
+  isEveProject: vi.fn(async () => true),
+  resolveEveProjectContext: vi.fn(async (appRoot: string): Promise<EveProjectContext> => ({
+    appRoot,
+    environmentRoot: appRoot,
+    kind: "standalone",
+  })),
+}));
 
 class SetupProcess {
   connected = true;
@@ -27,6 +35,7 @@ vi.mock("#setup/scaffold/index.js", async (importOriginal) => ({
   isEveProject,
 }));
 vi.mock("#setup/integrations/runner.js", () => ({ runIntegrationSetup: vi.fn() }));
+vi.mock("#internal/project-context.js", () => ({ resolveEveProjectContext }));
 vi.mock("#setup/flows/ensure-vercel-project.js", () => ({ ensureVercelProject: vi.fn() }));
 
 function logger(): RegistryCommandLogger & { errors: string[] } {
@@ -34,8 +43,11 @@ function logger(): RegistryCommandLogger & { errors: string[] } {
   return { errors, error: (message) => errors.push(message), log: () => {} };
 }
 
+const fakePrompterDeps = { createPrompter: () => createFakePrompter().prompter };
+
 afterEach(() => {
   process.exitCode = undefined;
+  vi.unstubAllEnvs();
   vi.clearAllMocks();
 });
 
@@ -69,13 +81,70 @@ describe("runIntegrationSetupCommand", () => {
     );
     const resolveVercelProject =
       vi.mocked(runIntegrationSetup).mock.calls[0]?.[1].resolveVercelProject;
-    await resolveVercelProject?.("GitHub");
+    await resolveVercelProject?.("Web Chat sign-in");
     expect(ensureVercelProject).toHaveBeenCalledWith({
       appRoot: "/project",
       prompter: fake.prompter,
       signal: undefined,
+      teamRequirement: expect.objectContaining({
+        permissions: expect.objectContaining({ oauth2Application: ["create", "update"] }),
+      }),
     });
     expect(output.errors).toEqual([]);
+  });
+
+  it("rediscovers the shared project root from a workspace agent", async () => {
+    resolveEveProjectContext.mockResolvedValueOnce({
+      environmentRoot: "/workspace",
+      kind: "workspace-member",
+      member: { appRoot: "/workspace/agents/support", name: "support" },
+      workspace: {
+        root: "/workspace",
+        members: [{ appRoot: "/workspace/agents/support", name: "support" }],
+      },
+    });
+    vi.mocked(runIntegrationSetup).mockResolvedValue({
+      kind: "done",
+      completion: { facts: [] },
+    });
+
+    await runIntegrationSetupCommand(
+      logger(),
+      "/workspace/agents/support",
+      "slack",
+      {},
+      fakePrompterDeps,
+    );
+
+    expect(runIntegrationSetup).toHaveBeenCalledWith(
+      "slack",
+      expect.objectContaining({
+        appRoot: "/workspace/agents/support",
+        projectRoot: "/workspace",
+      }),
+      undefined,
+    );
+  });
+
+  it("passes force to the integration runner", async () => {
+    vi.mocked(runIntegrationSetup).mockResolvedValue({
+      kind: "done",
+      completion: { facts: [] },
+    });
+
+    await runIntegrationSetupCommand(
+      logger(),
+      "/project",
+      "photon",
+      { force: true },
+      fakePrompterDeps,
+    );
+
+    expect(runIntegrationSetup).toHaveBeenCalledWith(
+      "photon",
+      expect.objectContaining({ force: true }),
+      undefined,
+    );
   });
 
   it("assumes recommended setup answers with --yes in interactive mode", async () => {
@@ -94,7 +163,7 @@ describe("runIntegrationSetupCommand", () => {
       return { kind: "done", completion: { facts: [] } };
     });
 
-    await runIntegrationSetupCommand(logger(), "/project", "web", { yes: true });
+    await runIntegrationSetupCommand(logger(), "/project", "web", { yes: true }, fakePrompterDeps);
   });
 
   it("passes answer-backed headless setup to the runner", async () => {

@@ -7,7 +7,12 @@ import type { Approval } from "#public/definitions/approval.js";
 import type { SessionContext } from "#public/definitions/callback-context.js";
 import type { ExactDefinition } from "#public/definitions/exact.js";
 import type { DynamicResolveContext } from "#dynamic/definition.js";
+import { EVE_INTERNAL_AGENT_WORKSPACE_MEMBER_ENV } from "#internal/application/build-output-environment.js";
 import { MEMORY_DEFINITION_BRAND } from "#shared/memory-definition.js";
+import {
+  EVE_PUBLIC_ROUTE_PREFIX_ENV,
+  normalizePublicRoutePrefix,
+} from "#shared/public-route-prefix.js";
 import { resolveVercelProjectIdFromEnvironment } from "#shared/vercel-project.js";
 import type { ToolContext, ToolModelOutput } from "#tools/definition.js";
 
@@ -116,7 +121,6 @@ export interface MemoryToolsContext extends DynamicResolveContext {
 export interface MemoryToolDefinition {
   readonly approval?: Approval<never>;
   readonly description: string;
-  readonly execution?: never;
   execute(input: never, context: ToolContext): unknown | Promise<unknown> | AsyncIterable<unknown>;
   readonly inputSchema: unknown;
   readonly outputSchema?: unknown;
@@ -186,12 +190,17 @@ export function defaultNamespace(context: MemoryNamespaceContext): string {
         process.env.VERCEL_URL?.trim() ||
         "unknown-preview"
       : null;
+  const publicRoutePrefix =
+    process.env[EVE_INTERNAL_AGENT_WORKSPACE_MEMBER_ENV] === "1"
+      ? normalizePublicRoutePrefix(process.env[EVE_PUBLIC_ROUTE_PREFIX_ENV])
+      : undefined;
   return JSON.stringify([
     "eve-memory-default-namespace-v1",
     "vercel",
     projectId,
     environment,
     previewIdentity,
+    ...(publicRoutePrefix === undefined ? [] : [publicRoutePrefix]),
     context.node,
     context.slot,
   ]);

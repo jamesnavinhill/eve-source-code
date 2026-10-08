@@ -22,14 +22,10 @@ export function withInstrumentationDecision(
   decision: Extract<InstrumentationDecision, { action: "record" }>,
 ): InstrumentationEvent {
   switch (event.type) {
+    case "session.started":
+      return decision.recordInputs ? event : Object.freeze({ ...event, title: undefined });
     case "channel.delivery.started":
       return decision.recordInputs ? event : Object.freeze({ ...event, input: undefined });
-    case "action.started":
-      return decision.recordInputs ? event : Object.freeze({ ...event, input: undefined });
-    case "action.completed":
-      return decision.recordOutputs
-        ? event
-        : Object.freeze({ ...event, output: Object.freeze({ type: event.output.type }) });
     case "input.requested":
       return decision.recordOutputs ? event : Object.freeze({ ...event, request: undefined });
     case "input.resolved":
@@ -50,6 +46,8 @@ export function withInstrumentationDecision(
       return decision.recordInputs ? event : Object.freeze({ ...event, input: undefined });
     case "model.call.completed":
       return decision.recordOutputs ? event : Object.freeze({ ...event, content: undefined });
+    case "memory.operation.completed":
+      return decision.recordInputs ? event : Object.freeze({ ...event, outputRecords: undefined });
     case "step.attempt.metadata":
       return decision.recordOutputs
         ? event
@@ -57,8 +55,8 @@ export function withInstrumentationDecision(
             ...event,
             providerMetadata: structuralProviderMetadata(event.providerMetadata),
           });
-    case "action.failed":
     case "model.call.failed":
+    case "memory.operation.failed":
     case "session.failed":
     case "step.attempt.failed":
     case "tool.call.failed":

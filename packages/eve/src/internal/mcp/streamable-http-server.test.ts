@@ -5,10 +5,13 @@ import { z } from "#compiled/zod/index.js";
 import {
   createMcpStreamableHttpServer,
   defineMcpTool,
-  MCP_LEGACY_PROTOCOL_VERSION,
   MCP_PROTOCOL_VERSION,
+  MCP_REQUEST_BODY_MAX_BYTES,
+  McpToolOperationError,
 } from "#internal/mcp/streamable-http-server.js";
+import { captureLogRecords } from "#internal/testing/log-records.js";
 
+const MCP_LEGACY_PROTOCOL_VERSION = "2025-11-25";
 const MCP_PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
 const MCP_CLIENT_INFO_META_KEY = "io.modelcontextprotocol/clientInfo";
 const MCP_CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities";
@@ -250,7 +253,7 @@ describe("stateless MCP Streamable HTTP server", () => {
     );
   });
 
-  it("enforces the advertised tool input schema before dispatch", async () => {
+  it("rejects arguments outside the advertised input schema as invalid_input before dispatch", async () => {
     const { call, handle } = server();
     const response = await handle(
       modernRequest({
@@ -264,11 +267,113 @@ describe("stateless MCP Streamable HTTP server", () => {
     expect(await jsonRpcResponse(response)).toMatchObject({
       id: "invalid-call",
       result: {
-        content: [{ text: expect.stringContaining("Input validation error"), type: "text" }],
+        content: [
+          { text: expect.stringContaining("Invalid arguments for tool echo"), type: "text" },
+        ],
         isError: true,
+        structuredContent: {
+          error: {
+            code: "invalid_input",
+            message: expect.stringContaining("value"),
+            retryable: false,
+          },
+        },
       },
     });
     expect(call).not.toHaveBeenCalled();
+  });
+
+  it("returns structured operation errors for expected tool failures", async () => {
+    const handle = createMcpStreamableHttpServer({
+      authenticate: async () => auth,
+      name: "eve-test",
+      tools: [
+        defineMcpTool({
+          call: async () => {
+            throw new McpToolOperationError("conflict", "Invocation is not waiting for input.");
+          },
+          definition: { inputSchema: z.strictObject({}), name: "conflicting" },
+        }),
+      ],
+      version: "0.0.0",
+    });
+
+    for (const request_ of [
+      modernRequest({
+        id: "modern",
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: { arguments: {}, name: "conflicting" },
+      }),
+      request({
+        id: "legacy",
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: { arguments: {}, name: "conflicting" },
+      }),
+    ]) {
+      await expect(jsonRpcResponse(await handle(request_))).resolves.toMatchObject({
+        result: {
+          content: [{ text: "Invocation is not waiting for input.", type: "text" }],
+          isError: true,
+          structuredContent: {
+            error: {
+              code: "conflict",
+              message: "Invocation is not waiting for input.",
+              retryable: true,
+            },
+          },
+        },
+      });
+    }
+  });
+
+  it("sanitizes unexpected tool failures behind an error id", async () => {
+    const logs = captureLogRecords();
+    const handle = createMcpStreamableHttpServer({
+      authenticate: async () => auth,
+      name: "eve-test",
+      tools: [
+        defineMcpTool({
+          call: async () => {
+            throw new Error("ECONNREFUSED 10.0.0.7:5432 while reading secret=abc");
+          },
+          definition: { inputSchema: z.strictObject({}), name: "exploding" },
+        }),
+      ],
+      version: "0.0.0",
+    });
+
+    const body = (await jsonRpcResponse(
+      await handle(
+        modernRequest({
+          id: "boom",
+          jsonrpc: "2.0",
+          method: "tools/call",
+          params: { arguments: {}, name: "exploding" },
+        }),
+      ),
+    )) as {
+      result: {
+        content: Array<{ text: string }>;
+        isError: boolean;
+        structuredContent: { error: Record<string, unknown> };
+      };
+    };
+    expect(body.result.isError).toBe(true);
+    expect(body.result.structuredContent.error).toMatchObject({
+      code: "internal",
+      errorId: expect.any(String),
+      retryable: false,
+    });
+    expect(JSON.stringify(body.result)).not.toContain("ECONNREFUSED");
+    expect(JSON.stringify(body.result)).not.toContain("secret=");
+    expect(body.result.content[0]?.text).toContain(
+      String(body.result.structuredContent.error.errorId),
+    );
+    expect(logs.records).toContainEqual(
+      expect.objectContaining({ level: "error", message: "MCP tool call failed" }),
+    );
   });
 
   it("returns JSON-RPC errors and acknowledges notifications", async () => {
@@ -350,18 +455,70 @@ describe("stateless MCP Streamable HTTP server", () => {
     expect(await jsonRpcResponse(response)).toMatchObject({ error: { code: -32000 } });
   });
 
-  it("bounds compatibility preflight parsing before the transport reads the body", async () => {
+  it("bounds every POST body before the transport reads it", async () => {
+    const { call, handle } = server();
+    const padding = "x".repeat(MCP_REQUEST_BODY_MAX_BYTES + 1);
+    const oversized = [
+      // Legacy-era request without a protocol version header.
+      request({ id: 1, jsonrpc: "2.0", method: "tools/list", params: { padding } }),
+      // Legacy-era request that declares the 2025 header.
+      request(
+        { id: 2, jsonrpc: "2.0", method: "tools/list", params: { padding } },
+        { "mcp-protocol-version": MCP_LEGACY_PROTOCOL_VERSION },
+      ),
+      // Modern-era request with a complete envelope and header.
+      modernRequest({
+        id: 3,
+        jsonrpc: "2.0",
+        method: "tools/call",
+        params: { arguments: { value: 1, padding }, name: "echo" },
+      }),
+    ];
+
+    for (const oversizedRequest of oversized) {
+      const response = await handle(oversizedRequest);
+      expect(response.status).toBe(413);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: -32_000, message: "Request body too large" },
+        id: null,
+        jsonrpc: "2.0",
+      });
+    }
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it("fails fast on an oversized declared content length", async () => {
     const { handle } = server();
     const response = await handle(
-      request({ padding: "x".repeat(4 * 1024 * 1024), method: "tools/list" }),
+      new Request("https://agent.example/mcp", {
+        body: JSON.stringify({ id: 1, jsonrpc: "2.0", method: "tools/list" }),
+        headers: {
+          accept: "application/json, text/event-stream",
+          "content-length": String(MCP_REQUEST_BODY_MAX_BYTES + 1),
+          "content-type": "application/json",
+          "mcp-protocol-version": MCP_PROTOCOL_VERSION,
+        },
+        method: "POST",
+      }),
     );
-
     expect(response.status).toBe(413);
-    await expect(response.json()).resolves.toMatchObject({
-      error: { code: -32_000, message: "Request body too large" },
-      id: null,
-      jsonrpc: "2.0",
-    });
+  });
+
+  it("rejects malformed JSON on every POST path with a parse error", async () => {
+    const { handle } = server();
+    const response = await handle(
+      new Request("https://agent.example/mcp", {
+        body: "{not json",
+        headers: {
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+          "mcp-protocol-version": MCP_PROTOCOL_VERSION,
+        },
+        method: "POST",
+      }),
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: -32_700 } });
   });
 
   it("rejects duplicate tool names at construction", () => {

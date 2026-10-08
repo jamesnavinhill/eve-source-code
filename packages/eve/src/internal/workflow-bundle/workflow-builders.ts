@@ -1,10 +1,15 @@
-import { existsSync, readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { STABLE_WORKFLOW_NAMES } from "#execution/workflow-runtime.js";
+import { STABLE_WORKFLOW_NAMES } from "#execution/stable-workflow-names.js";
 import { EVE_PACKAGE_NAME } from "#internal/package-name.js";
-import { transformWorkflowDirectives } from "./workflow-transformer.js";
+import { AGENT_TOOL_SERVE_WORKFLOW_NAME } from "#runtime/subagents/workflow-reference.js";
+import { prepareAuthoredWorkflowDirectives } from "#internal/workflow-bundle/authored-workflow-directives.js";
+import {
+  findWorkflowDirectiveFunctions,
+  stripJavaScriptExtension,
+  transformWorkflowDirectives,
+} from "#internal/workflow-bundle/workflow-transformer.js";
 
 export type WorkflowManifest = {
   steps?: {
@@ -45,10 +50,13 @@ const projectDepsCache = new Map<string, Set<string>>();
 export async function applyWorkflowTransform(
   filename: string,
   source: string,
-  mode: "workflow" | "step" | "client" | false,
+  mode: "workflow" | "step" | "client" | "metadata" | false,
   absolutePath?: string,
   projectRoot?: string,
-  stableWorkflowNames: ReadonlySet<string> = STABLE_WORKFLOW_NAMES,
+  stableWorkflowNames: ReadonlySet<string> = new Set([
+    ...STABLE_WORKFLOW_NAMES,
+    AGENT_TOOL_SERVE_WORKFLOW_NAME,
+  ]),
 ): Promise<{
   code: string;
   workflowManifest: WorkflowManifest;
@@ -63,9 +71,34 @@ export async function applyWorkflowTransform(
   const { moduleSpecifier, stableModuleSpecifier } = resolveModuleSpecifier(
     absoluteFilename,
     resolvedProjectRoot,
+    mode === "metadata",
   );
 
+  if (
+    absolutePath !== undefined &&
+    isAuthoredApplicationModule(absolutePath, resolvedProjectRoot)
+  ) {
+    const prepared =
+      mode === false
+        ? undefined
+        : await prepareAuthoredWorkflowDirectives({ filePath: absolutePath, source });
+    // Ids derive from the app root so the driver bundle (built from eve's
+    // package directory) and the server bundle (built from the app) agree.
+    return transformWorkflowDirectives({
+      authored: true,
+      authorizeSteps: true,
+      filename: authoredRelativePath(absolutePath, resolvedProjectRoot),
+      mode: prepared?.hasDirectives === true ? mode : false,
+      moduleSpecifier: authoredModuleIdBase(absolutePath, resolvedProjectRoot),
+      source: prepared?.source ?? source,
+      stableModuleSpecifier: undefined,
+      stableWorkflowNames,
+    });
+  }
+
   return transformWorkflowDirectives({
+    // The test harness authors workflow tools inside eve's own package.
+    authorizeSteps: isPackageTestFixtureModule(absoluteFilename),
     filename,
     mode,
     moduleSpecifier,
@@ -75,19 +108,78 @@ export async function applyWorkflowTransform(
   });
 }
 
-export function detectWorkflowPatterns(source: string): {
+function isPackageTestFixtureModule(absolutePath: string): boolean {
+  return absolutePath.replace(/\\/g, "/").includes("/src/internal/testing/");
+}
+
+export function isAuthoredApplicationModule(absolutePath: string, appRoot: string): boolean {
+  // Bundler virtual ids such as `\0rolldown/runtime.js` would otherwise resolve against the cwd.
+  if (!isAbsolute(absolutePath)) return false;
+  const normalizedRoot = toRealPath(appRoot).replace(/\\/g, "/").replace(/\/$/, "");
+  const normalizedPath = toRealPath(absolutePath).replace(/\\/g, "/");
+  if (isInNodeModules(normalizedPath)) return false;
+  if (!normalizedPath.startsWith(`${normalizedRoot}/`)) {
+    // An app root without its own package.json, such as a workspace member,
+    // shares the enclosing package, so that package's other modules are application code.
+    const appPackageRoot = findPackageRoot(normalizedRoot);
+    if (appPackageRoot === null || findPackageRoot(dirname(normalizedPath)) !== appPackageRoot) {
+      return false;
+    }
+  }
+  return findPackageJson(normalizedPath)?.name !== EVE_PACKAGE_NAME;
+}
+
+function authoredRelativePath(absolutePath: string, appRoot: string): string {
+  return toRelativeImportPath(toRealPath(absolutePath), toRealPath(appRoot)).replace(/^\.\//, "");
+}
+
+function authoredModuleIdBase(absolutePath: string, appRoot: string): string {
+  const idBase = stripJavaScriptExtension(authoredRelativePath(absolutePath, appRoot));
+  return idBase.startsWith("../") ? idBase : `./${idBase}`;
+}
+
+const packageRootCache = new Map<string, string | null>();
+
+function findPackageRoot(directory: string): string | null {
+  const cached = packageRootCache.get(directory);
+  if (cached !== undefined) return cached;
+  const parent = dirname(directory);
+  const packageRoot = existsSync(join(directory, "package.json"))
+    ? directory
+    : parent === directory
+      ? null
+      : findPackageRoot(parent);
+  packageRootCache.set(directory, packageRoot);
+  return packageRoot;
+}
+
+// Bundlers hand back real paths while configuration carries the spelled
+// path (for example macOS `/var` → `/private/var`); compare like with like.
+function toRealPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+export async function findWorkflowPatterns(
+  filename: string,
+  source: string,
+): Promise<{
   hasSerde: boolean;
   hasUseStep: boolean;
   hasUseWorkflow: boolean;
-} {
+}> {
+  const directives = await findWorkflowDirectiveFunctions(filename, source);
   return {
     hasSerde:
       source.includes("workflow.serde") ||
       source.includes("@serde") ||
       source.includes("workflowSerde") ||
       source.includes("__workflow_serde"),
-    hasUseStep: /["']use step["']/.test(source),
-    hasUseWorkflow: /["']use workflow["']/.test(source),
+    hasUseStep: directives.some((fn) => fn.directive === "use step"),
+    hasUseWorkflow: directives.some((fn) => fn.directive === "use workflow"),
   };
 }
 
@@ -129,6 +221,7 @@ export function getImportPath(
 function resolveModuleSpecifier(
   filePath: string,
   projectRoot: string,
+  packageBuild: boolean = false,
 ): {
   moduleSpecifier: string | undefined;
   stableModuleSpecifier: string | undefined;
@@ -136,6 +229,13 @@ function resolveModuleSpecifier(
   const inNodeModules = isInNodeModules(filePath);
   const inWorkspace = !inNodeModules && isWorkspacePackage(filePath, projectRoot);
   const pkg = findPackageJson(filePath);
+
+  if (packageBuild && pkg !== null) {
+    return {
+      moduleSpecifier: `${pkg.name}@${pkg.version}`,
+      stableModuleSpecifier: pkg.name,
+    };
+  }
 
   if (!inNodeModules && !inWorkspace) {
     return {
@@ -424,8 +524,4 @@ function isRootEntrypointFile(filePath: string, pkg: PackageInfo): boolean {
   );
 
   return rootCandidates.includes(relativeFilePath);
-}
-
-export async function readSourceFile(path: string): Promise<string> {
-  return await readFile(path, "utf8");
 }

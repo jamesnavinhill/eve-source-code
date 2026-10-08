@@ -1,7 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SessionAuthContext } from "#channel/types.js";
-import { INTERNAL_CHANNEL_DELIVER } from "#channel/channel-operations.js";
 import {
   buildInvocationAttributes,
   INVOCATION_OWNER_ATTRIBUTE,
@@ -15,18 +14,11 @@ import { normalizeEveAttributes } from "#runtime/attributes/normalize.js";
 
 const runsGet = vi.fn();
 const cancel = vi.fn();
-const returnValue = vi.fn();
 const getReadable = vi.fn();
 
 vi.mock("#internal/workflow/runtime.js", () => ({
   getWorld: async () => ({ runs: { get: runsGet } }),
-  getRun: () => ({
-    cancel,
-    get returnValue() {
-      return returnValue();
-    },
-    getReadable,
-  }),
+  getRun: () => ({ cancel, getReadable }),
 }));
 
 const auth: SessionAuthContext = {
@@ -37,10 +29,14 @@ const auth: SessionAuthContext = {
 };
 
 const createSession = vi.fn<RouteSessionCreator>();
-const deliver = vi.fn();
-const from = vi.fn(() => ({ [INTERNAL_CHANNEL_DELIVER]: deliver }) as never);
+const respond = vi.fn();
+const from = vi.fn(() => ({ respond }) as never);
 
 describe("WorkflowAgentInvocationExecution", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     getReadable.mockReturnValue(eventStream([]));
@@ -62,7 +58,6 @@ describe("WorkflowAgentInvocationExecution", () => {
         capabilities: { requestInput: true },
         continuationToken: expect.stringMatching(/^invocation:/),
         externalInvocation: expect.objectContaining({ continuationToken: expect.any(String) }),
-        mode: "task",
       }),
     );
     const createInput = createSession.mock.calls[0]?.[0];
@@ -154,6 +149,7 @@ describe("WorkflowAgentInvocationExecution", () => {
           },
           meta: { at: "2026-07-20T00:00:01.000Z", id: "event_2" },
         } as HandleMessageStreamEvent,
+        ...turnSettledEvents("turn_1"),
       ]),
     );
 
@@ -197,7 +193,7 @@ describe("WorkflowAgentInvocationExecution", () => {
       } as HandleMessageStreamEvent,
     ];
     getReadable.mockImplementation(() => eventStream(events));
-    deliver.mockResolvedValue({ sessionId: "wrun_invocation" });
+    respond.mockResolvedValue({ sessionId: "wrun_invocation" });
 
     await expect(
       execution().update({
@@ -210,10 +206,7 @@ describe("WorkflowAgentInvocationExecution", () => {
       type: "success",
     });
     expect(from).toHaveBeenCalledWith("invocation:token");
-    expect(deliver).toHaveBeenCalledWith(
-      { inputResponses: [{ optionId: "yes", requestId: "question" }] },
-      { auth },
-    );
+    expect(respond).toHaveBeenCalledWith([{ optionId: "yes", requestId: "question" }], { auth });
     expect(getReadable).toHaveBeenCalledWith({ startIndex: -64 });
   });
 
@@ -223,7 +216,7 @@ describe("WorkflowAgentInvocationExecution", () => {
     getReadable.mockImplementation(() =>
       eventStream([inputRequestedEvent("event_split", ["one", "two"])]),
     );
-    deliver.mockResolvedValue({ sessionId: "wrun_invocation" });
+    respond.mockResolvedValue({ sessionId: "wrun_invocation" });
 
     const one = invocationInputRequestId("event_split", "one");
     const two = invocationInputRequestId("event_split", "two");
@@ -247,13 +240,11 @@ describe("WorkflowAgentInvocationExecution", () => {
         ],
       }),
     ).resolves.toMatchObject({ type: "success" });
-    expect(deliver).toHaveBeenCalledExactlyOnceWith(
-      {
-        inputResponses: [
-          { optionId: "yes", requestId: "one" },
-          { optionId: "yes", requestId: "two" },
-        ],
-      },
+    expect(respond).toHaveBeenCalledExactlyOnceWith(
+      [
+        { optionId: "yes", requestId: "one" },
+        { optionId: "yes", requestId: "two" },
+      ],
       expect.objectContaining({ auth }),
     );
   });
@@ -263,7 +254,7 @@ describe("WorkflowAgentInvocationExecution", () => {
     runsGet.mockResolvedValue(pendingRun);
     let events: HandleMessageStreamEvent[] = [inputRequestedEvent("event_first", ["question"])];
     getReadable.mockImplementation(() => eventStream(events));
-    deliver.mockResolvedValue({ sessionId: "wrun_invocation" });
+    respond.mockResolvedValue({ sessionId: "wrun_invocation" });
 
     const firstRequestId = invocationInputRequestId("event_first", "question");
     await execution().update({
@@ -299,7 +290,82 @@ describe("WorkflowAgentInvocationExecution", () => {
       }),
     ).resolves.toMatchObject({ type: "success" });
 
-    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(respond).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops reporting input_required once the answer is resolved", async () => {
+    runsGet.mockResolvedValue(run({ status: "running" }));
+    getReadable.mockReturnValue(
+      eventStream([
+        inputRequestedEvent("event_1", ["question"]),
+        inputResolvedEvent("event_2", [{ optionId: "yes", requestId: "question" }]),
+      ]),
+    );
+
+    await expect(
+      execution().read({ auth, invocationId: "wrun_invocation" }),
+    ).resolves.toMatchObject({ status: "working" });
+  });
+
+  it("acknowledges a repeated answer that eve already accepted", async () => {
+    runsGet.mockResolvedValue(run({ status: "running" }));
+    const requestId = invocationInputRequestId("event_1", "question");
+    getReadable.mockImplementation(() =>
+      eventStream([
+        inputRequestedEvent("event_1", ["question"]),
+        inputResolvedEvent("event_2", [{ optionId: "yes", requestId: "question" }]),
+      ]),
+    );
+
+    await expect(
+      execution().update({
+        auth,
+        invocationId: "wrun_invocation",
+        responses: [{ optionId: "yes", requestId }],
+      }),
+    ).resolves.toMatchObject({ invocation: { status: "working" }, type: "success" });
+    expect(respond).not.toHaveBeenCalled();
+
+    await expect(
+      execution().update({
+        auth,
+        invocationId: "wrun_invocation",
+        responses: [{ optionId: "no", requestId }],
+      }),
+    ).resolves.toEqual({ message: "Invocation is not waiting for input.", type: "conflict" });
+    await expect(
+      execution().update({
+        auth,
+        invocationId: "wrun_invocation",
+        responses: [{ requestId, text: "yes" }],
+      }),
+    ).resolves.toMatchObject({ type: "conflict" });
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges a repeated answer after the turn completes", async () => {
+    runsGet.mockResolvedValue(run({ status: "running" }));
+    const requestId = invocationInputRequestId("event_1", "question");
+    getReadable.mockImplementation(() =>
+      eventStream([
+        inputRequestedEvent("event_1", ["question"]),
+        inputResolvedEvent("event_2", [{ requestId: "question", text: "go" }]),
+        messageCompletedEvent("done"),
+        ...turnSettledEvents("turn_1"),
+      ]),
+    );
+
+    await expect(
+      execution().update({
+        auth,
+        invocationId: "wrun_invocation",
+        responses: [{ requestId, text: "go" }],
+      }),
+    ).resolves.toMatchObject({
+      invocation: { result: "done", status: "completed" },
+      type: "success",
+    });
+    expect(respond).not.toHaveBeenCalled();
   });
 
   it("projects and clears pending connection authorization", async () => {
@@ -320,7 +386,7 @@ describe("WorkflowAgentInvocationExecution", () => {
       },
       meta: { at: "2026-07-20T00:00:00.000Z", id: "event_1" },
     } as HandleMessageStreamEvent;
-    getReadable.mockReturnValue(eventStream([required]));
+    getReadable.mockReturnValue(eventStream([required, ...turnSettledEvents("turn_1")]));
 
     await expect(
       execution().read({ auth, invocationId: "wrun_invocation" }),
@@ -342,6 +408,7 @@ describe("WorkflowAgentInvocationExecution", () => {
     getReadable.mockReturnValue(
       eventStream([
         required,
+        ...turnSettledEvents("turn_1"),
         {
           type: "authorization.completed",
           data: {
@@ -358,6 +425,38 @@ describe("WorkflowAgentInvocationExecution", () => {
     await expect(
       execution().read({ auth, invocationId: "wrun_invocation" }),
     ).resolves.toMatchObject({ status: "working" });
+  });
+
+  it.each([
+    {
+      events: [inputRequestedEvent("event_1", ["question"])],
+      expected: { status: "completed" },
+      runStatus: "completed",
+    },
+    {
+      events: [
+        {
+          data: {
+            description: "Sign in to Linear",
+            name: "linear",
+            sequence: 0,
+            stepIndex: 0,
+            turnId: "turn_1",
+          },
+          meta: { at: "2026-07-20T00:00:00.000Z", id: "event_1" },
+          type: "authorization.required",
+        } as HandleMessageStreamEvent,
+      ],
+      expected: { error: { message: "Invocation failed." }, status: "failed" },
+      runStatus: "failed",
+    },
+  ])("reports a $runStatus run over a batch its session can no longer answer", async (input) => {
+    runsGet.mockResolvedValue(run({ status: input.runStatus }));
+    getReadable.mockReturnValue(eventStream([...input.events, ...turnSettledEvents("turn_1")]));
+
+    await expect(
+      execution().read({ auth, invocationId: "wrun_invocation" }),
+    ).resolves.toMatchObject(input.expected);
   });
 
   it("does not project intermediate tool-call narration as a result", async () => {
@@ -410,15 +509,152 @@ describe("WorkflowAgentInvocationExecution", () => {
     ).resolves.toMatchObject({ result: "Done.", status: "working" });
   });
 
-  it("uses workflow return value as terminal result", async () => {
-    runsGet.mockResolvedValue(run({ status: "completed" }));
-    getReadable.mockReturnValue(eventStream([{ type: "session.completed" }]));
-    returnValue.mockResolvedValue({ output: { answer: 42 } });
+  it("completes with the final message even when the model hit its output limit", async () => {
+    runsGet.mockResolvedValue(run({ status: "running" }));
+    getReadable.mockReturnValue(
+      eventStream([
+        messageCompletedEvent("# Migration guide\n\n1. Upgrade", "length"),
+        ...turnSettledEvents("turn_1"),
+      ]),
+    );
 
     await expect(
       execution().read({ auth, invocationId: "wrun_invocation" }),
-    ).resolves.toMatchObject({ result: { answer: 42 }, status: "completed" });
-    expect(getReadable).not.toHaveBeenCalled();
+    ).resolves.toMatchObject({ result: "# Migration guide\n\n1. Upgrade", status: "completed" });
+  });
+
+  it("projects the workflow run reference without private error data", async () => {
+    const privateError = Object.assign(new Error("private provider detail"), {
+      apiKey: "secret",
+    });
+    runsGet.mockResolvedValue(run({ error: privateError, status: "failed" }));
+    getReadable.mockReturnValue(
+      eventStream([
+        {
+          type: "session.failed",
+          data: {
+            code: "MODEL_CALL_FAILED",
+            details: {
+              errorId: "err_123",
+              hint: "Try again shortly.",
+              message: "AI Gateway rate-limited the request.",
+              name: "AI Gateway rate limit exceeded",
+              semanticErrorId: "gateway-rate-limited",
+              upstreamMessage: "private provider detail",
+            },
+            message: "AI Gateway rate-limited the request.",
+            sessionId: "wrun_invocation",
+          },
+          meta: { at: "2026-07-20T00:00:00.000Z", id: "event_1" },
+        } as HandleMessageStreamEvent,
+      ]),
+    );
+
+    await expect(execution().read({ auth, invocationId: "wrun_invocation" })).resolves.toEqual({
+      createdAt: "2026-07-20T00:00:00.000Z",
+      error: {
+        code: -32603,
+        data: {
+          errorId: "err_123",
+          eveCode: "MODEL_CALL_FAILED",
+          hint: "Try again shortly.",
+          name: "AI Gateway rate limit exceeded",
+          runId: "wrun_invocation",
+          semanticErrorId: "gateway-rate-limited",
+        },
+        message: "AI Gateway rate-limited the request.",
+      },
+      invocationId: "wrun_invocation",
+      status: "failed",
+    });
+  });
+
+  it("fails with a bounded message and correlation id when the turn fails and the session parks", async () => {
+    runsGet.mockResolvedValue(run({ status: "running" }));
+    getReadable.mockReturnValue(
+      eventStream([
+        {
+          type: "turn.failed",
+          data: {
+            code: "MODEL_CALL_FAILED",
+            details: { errorId: "err_unknown", upstreamMessage: "private provider detail" },
+            message: "private provider detail",
+            sequence: 0,
+            turnId: "turn_1",
+          },
+          meta: { at: "2026-07-20T00:00:00.000Z", id: "event_1" },
+        } as HandleMessageStreamEvent,
+        {
+          data: {},
+          meta: { at: "2026-07-20T00:00:01.000Z", id: "event_2" },
+          type: "session.waiting",
+        } as HandleMessageStreamEvent,
+      ]),
+    );
+
+    await expect(
+      execution().read({ auth, invocationId: "wrun_invocation" }),
+    ).resolves.toMatchObject({
+      error: {
+        data: {
+          errorId: "err_unknown",
+          eveCode: "MODEL_CALL_FAILED",
+          runId: "wrun_invocation",
+        },
+        message: "private provider detail",
+      },
+      status: "failed",
+    });
+  });
+
+  it("truncates an unknown failure message to Slack's display bound", async () => {
+    const message = "x".repeat(200);
+    runsGet.mockResolvedValue(run({ status: "failed" }));
+    getReadable.mockReturnValue(
+      eventStream([
+        {
+          type: "session.failed",
+          data: { code: "MODEL_CALL_FAILED", message, sessionId: "wrun_invocation" },
+          meta: { at: "2026-07-20T00:00:00.000Z", id: "event_1" },
+        } as HandleMessageStreamEvent,
+      ]),
+    );
+
+    const invocation = await execution().read({ auth, invocationId: "wrun_invocation" });
+    expect(invocation?.status === "failed" ? invocation.error.message : undefined).toBe(
+      `${"x".repeat(159)}…`,
+    );
+  });
+
+  it("includes the Vercel deployment reference only on Vercel", async () => {
+    vi.stubEnv("VERCEL", "1");
+    vi.stubEnv("VERCEL_DEPLOYMENT_ID", "dpl_123");
+    runsGet.mockResolvedValue(run({ status: "failed" }));
+
+    await expect(
+      execution().read({ auth, invocationId: "wrun_invocation" }),
+    ).resolves.toMatchObject({
+      error: {
+        data: { runId: "wrun_invocation", vercelDeploymentId: "dpl_123" },
+        message: "Invocation failed.",
+      },
+      status: "failed",
+    });
+  });
+
+  it("keeps terminal failures generic when no failure event was persisted", async () => {
+    runsGet.mockResolvedValue(run({ status: "failed" }));
+
+    await expect(
+      execution().read({ auth, invocationId: "wrun_invocation" }),
+    ).resolves.toMatchObject({
+      error: {
+        code: -32603,
+        data: { runId: "wrun_invocation" },
+        message: "Invocation failed.",
+      },
+      status: "failed",
+    });
   });
 
   it("terminally cancels the workflow run", async () => {
@@ -438,7 +674,7 @@ function execution(): WorkflowAgentInvocationExecution {
   return new WorkflowAgentInvocationExecution({ createSession, from });
 }
 
-function run(input: { ownerKey?: string; status: string }) {
+function run(input: { error?: unknown; ownerKey?: string; status: string }) {
   const attributes: Record<string, string> = {
     "$eve.invocation_owner": input.ownerKey ?? invocationOwnerKey(auth),
     "$eve.invocation_token": "invocation:token",
@@ -446,6 +682,7 @@ function run(input: { ownerKey?: string; status: string }) {
   return {
     attributes,
     createdAt: new Date("2026-07-20T00:00:00.000Z"),
+    error: input.error,
     input: [{ serializedContext: { "eve.initiatorAuth": auth } }],
     runId: "wrun_invocation",
     status: input.status,
@@ -472,6 +709,53 @@ function inputRequestedEvent(id: string, requestIds: readonly string[]): HandleM
     },
     meta: { at: "2026-07-20T00:00:00.000Z", id },
     type: "input.requested",
+  };
+}
+
+function messageCompletedEvent(
+  message: string,
+  finishReason: "length" | "stop" = "stop",
+): HandleMessageStreamEvent {
+  return {
+    data: { finishReason, message, sequence: 0, stepIndex: 0, turnId: "turn_1" },
+    meta: { at: "2026-07-20T00:00:00.000Z", id: "event_message" },
+    type: "message.completed",
+  };
+}
+
+function turnSettledEvents(turnId: string): HandleMessageStreamEvent[] {
+  return [
+    {
+      data: { sequence: 0, turnId },
+      meta: { at: "2026-07-20T00:00:02.000Z", id: "event_turn_completed" },
+      type: "turn.completed",
+    },
+    {
+      data: {},
+      meta: { at: "2026-07-20T00:00:02.000Z", id: "event_session_waiting" },
+      type: "session.waiting",
+    } as HandleMessageStreamEvent,
+  ];
+}
+
+function inputResolvedEvent(
+  id: string,
+  responses: readonly { optionId?: string; requestId: string; text?: string }[],
+): HandleMessageStreamEvent {
+  return {
+    data: {
+      resolutions: responses.map((response) => ({
+        kind: "question" as const,
+        outcome: "answered" as const,
+        requestId: response.requestId,
+        response,
+      })),
+      sequence: 0,
+      stepIndex: 0,
+      turnId: "turn_1",
+    },
+    meta: { at: "2026-07-20T00:00:01.000Z", id },
+    type: "input.resolved",
   };
 }
 

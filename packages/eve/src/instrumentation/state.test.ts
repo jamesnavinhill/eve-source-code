@@ -8,6 +8,7 @@ import {
 } from "#instrumentation/lifecycle.js";
 import {
   abandonInstrumentationState,
+  findInstrumentationActionScopeForCall,
   instrumentationStateSlot,
   isInstrumentationStateAbandoned,
   rememberInstrumentationActionScope,
@@ -69,6 +70,27 @@ describe("instrumentation state", () => {
       expect(takeInstrumentationActionScopeForCall(first.sessionId, "call-1")).toEqual({
         idempotencyKey: firstKey,
         scope: first,
+      });
+    });
+  });
+
+  it("deserializes the previous scope-only action state", async () => {
+    const scope: InstrumentationAttemptScope = {
+      attemptId: "session-1:turn-1:0:0",
+      attemptIndex: 0,
+      sessionId: "session-1",
+      stepIndex: 0,
+      turnId: "turn-1",
+    };
+    const actionKey = actionIdempotencyKey(scope.sessionId, scope.turnId, "call-1");
+    const restored = await deserializeContext({
+      "eve.harness.instrumentationActionScopes": { [actionKey]: scope },
+    });
+
+    contextStorage.run(restored, () => {
+      expect(findInstrumentationActionScopeForCall(scope.sessionId, "call-1")).toEqual({
+        idempotencyKey: actionKey,
+        scope,
       });
     });
   });

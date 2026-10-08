@@ -3,7 +3,6 @@ import { isAbsolute, relative, resolve } from "node:path";
 import type { AgentSourceManifest } from "#discover/manifest.js";
 import { normalizeLogicalPath } from "#discover/filesystem.js";
 import { normalizeAgentDefinition } from "#internal/authored-definition/core.js";
-import { serializeOutputSchema } from "#tools/schema.js";
 import { formatLanguageModelGatewayId } from "#internal/runtime-model.js";
 import { classifyModelRouting } from "#internal/classify-model-routing.js";
 import { isChatGptModelRouting } from "#shared/chatgpt-model.js";
@@ -49,6 +48,7 @@ export async function compileAgentConfig(
           displayPath: configModulePath,
           kind: "agent config",
           loadNamespace: createCompiledBindingNamespaceLoader({
+            appRoot: manifest.appRoot,
             bindings: { [configModule.sourceId]: options.binding },
             registries: context.registries,
           }),
@@ -82,18 +82,23 @@ export async function compileAgentConfig(
       model?: CompiledRuntimeModelReference;
       thresholdPercent?: number;
     };
+    defaultTools?: boolean;
     description?: string;
     experimental?: CompiledAgentDefinition["experimental"];
     name: string;
-    outputSchema?: JsonObject;
     reasoning?: CompiledAgentDefinition["reasoning"];
     source: ModuleSourceRef;
+    tool?: boolean;
     limits?: CompiledAgentDefinition["limits"];
   } = {
     compaction,
     name: manifest.agentId,
     source: { ...configModule },
   };
+
+  if (definition.defaultTools !== undefined) {
+    compiledConfig.defaultTools = definition.defaultTools;
+  }
 
   if (definition.description !== undefined) {
     compiledConfig.description = definition.description;
@@ -124,18 +129,19 @@ export async function compileAgentConfig(
     };
   }
 
-  if (definition.outputSchema !== undefined) {
-    compiledConfig.outputSchema = serializeOutputSchema(definition.outputSchema);
-  }
-
   if (definition.reasoning !== undefined) {
     compiledConfig.reasoning = definition.reasoning;
+  }
+
+  if (definition.tool !== undefined) {
+    compiledConfig.tool = definition.tool;
   }
 
   if (definition.limits !== undefined) {
     compiledConfig.limits = {
       maxInputTokensPerSession: definition.limits.maxInputTokensPerSession,
       maxOutputTokensPerSession: definition.limits.maxOutputTokensPerSession,
+      maxTokenCostUsdPerSession: definition.limits.maxTokenCostUsdPerSession,
       sessionTimeoutMs: definition.limits.sessionTimeoutMs,
     };
   }
@@ -176,16 +182,10 @@ function normalizeExperimentalDefinition(
 
   const compiledExperimental: Mutable<NonNullable<CompiledAgentDefinition["experimental"]>> = {};
 
-  if (experimental.instrumentationProviders !== undefined) {
-    compiledExperimental.instrumentationProviders = experimental.instrumentationProviders;
-  }
-
-  if (experimental.tasks !== undefined) {
-    compiledExperimental.tasks = experimental.tasks;
-  }
-
   if (experimental.workflow !== undefined) {
     compiledExperimental.workflow = {
+      modelCallsPerStep: experimental.workflow.modelCallsPerStep,
+      retention: experimental.workflow.retention,
       world: experimental.workflow.world,
     };
   }

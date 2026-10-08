@@ -9,6 +9,7 @@ import { TEST_DEFAULT_MODEL_ID } from "../../src/internal/testing/app-harness.js
 import { resolveBootstrapRuntimeModel } from "../../src/runtime/agent/bootstrap-model.js";
 import { createMockAuthoredRuntimeModel } from "../../src/runtime/agent/mock-model-adapter.js";
 import { resolveRuntimeModelReference } from "../../src/runtime/agent/resolve-model.js";
+import { MODEL_HELPERS } from "../../src/shared/model-helper.js";
 import { createAuthoredSourceRuntimeCompiledArtifactsSource } from "../../src/internal/application/runtime-compiled-artifacts-source.js";
 import { getCompiledRuntimeAgentBundle } from "../../src/runtime/sessions/compiled-agent-cache.js";
 import { useTemporaryAppRoots } from "../../src/internal/testing/use-temporary-app-roots.js";
@@ -22,6 +23,34 @@ afterEach(() => {
 });
 
 describe("runtime model resolution", () => {
+  it.each(["openai", "anthropic"] as const)(
+    "compiles and rehydrates the eve %s helper without capturing credentials",
+    async (helper) => {
+      const { module, defaultModel } = MODEL_HELPERS[helper];
+      vi.stubEnv("NODE_ENV", "development");
+      vi.stubEnv(
+        helper === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY",
+        "compile-must-not-capture-this-key",
+      );
+      const { agentRoot, appRoot } = await createAppRoot("eve-direct-model-", APP_ROOT_OPTIONS);
+      await writeFile(
+        join(agentRoot, "agent.ts"),
+        `import { defineAgent } from "eve";\nimport { ${helper} } from "${module}";\nexport default defineAgent({ model: ${helper}(), modelContextWindowTokens: 100000 });\n`,
+      );
+      await writeFile(join(agentRoot, "instructions.md"), "Help Alice get started.\n");
+      await compileAgent({ startPath: appRoot });
+      const compiledArtifactsSource = createAuthoredSourceRuntimeCompiledArtifactsSource(appRoot);
+      const bundle = await getCompiledRuntimeAgentBundle({ compiledArtifactsSource });
+      expect(JSON.stringify(bundle.turnAgent)).not.toContain("compile-must-not-capture-this-key");
+      if (!bundle.turnAgent.model) throw new Error("Expected a compiled model");
+      const model = await resolveRuntimeModelReference(bundle.turnAgent.model, {
+        moduleMap: bundle.moduleMap,
+        nodeId: bundle.nodeId,
+      });
+      expect(model).toMatchObject({ modelId: defaultModel });
+    },
+  );
+
   it("keeps the bootstrap sentinel separate from the default authored runtime model", () => {
     expect(BOOTSTRAP_RUNTIME_MODEL_ID).not.toBe(TEST_DEFAULT_MODEL_ID);
     expect(

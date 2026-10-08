@@ -4,13 +4,13 @@ import type {
   ChatSdkChannelState,
   ChatSdkInstrumentationMetadata,
 } from "#public/channels/chat-sdk/chatSdkChannel.js";
+import type { AudienceContext } from "#shared/conversation-context.js";
 
-export function chatSdkInstrumentationMetadata(
+function chatSdkInstrumentationMetadata(
   state: ChatSdkChannelState,
 ): ChatSdkInstrumentationMetadata {
   return {
     adapterName: state.thread?.adapterName ?? null,
-    audience: chatSdkAudience(state.thread),
     channelId: state.thread?.channelId ?? null,
     isDM: state.thread?.isDM ?? null,
     threadId: state.thread?.id ?? null,
@@ -25,3 +25,8 @@ function chatSdkAudience(thread: SerializedThread | null): ChannelAudience {
   }
   return "unknown";
 }
+
+export const chatSdkInstrumentation = {
+  audience: (input: AudienceContext<ChatSdkChannelState>) => chatSdkAudience(input.state.thread),
+  metadata: chatSdkInstrumentationMetadata,
+} as const;

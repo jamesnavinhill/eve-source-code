@@ -1,23 +1,28 @@
 import { execFile, spawn } from "node:child_process";
-import { readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
-import { CODING_AGENT_ENV_MARKERS } from "../../src/cli/agent-detection.js";
-import { DEFAULT_AGENT_MODEL_ID } from "../../src/shared/default-agent-model.js";
+import { CODING_AGENT_ENV_MARKERS } from "../../src/setup/primitives/coding-agent-env.js";
+import { stripAnsi } from "../../src/cli/ui/terminal-text.js";
+import { loadYaml } from "../../src/evals/loaders/yaml.js";
 import { pathExists } from "../../src/setup/path-exists.js";
+import { eveDevArguments } from "../../src/setup/primitives/index.js";
+import { ensureScenarioEveTarballPath } from "../../src/internal/testing/scenario-app.js";
 import { useTemporaryDirectories } from "../../src/internal/testing/use-temporary-app-roots.js";
 
 const EVE_BIN_PATH = fileURLToPath(new URL("../../bin/eve.js", import.meta.url));
 const runFile = promisify(execFile);
-const RELEASE_AGE_MINUTES = "2880";
-// Changesets opens Version Packages PRs on `changeset-release/<base>`. Those
-// PRs bump package.json before npm has that version, so a real registry
-// install of the scaffolded eve range cannot succeed yet.
-const isChangesetReleasePr = process.env.GITHUB_HEAD_REF?.startsWith("changeset-release/") === true;
+const RELEASE_AGE_MINUTES = 100_000_000;
+const PNPM_INIT_INSTALL_ARGUMENTS = [
+  "install",
+  "--no-frozen-lockfile",
+  "--yes",
+  "--config.minimum-release-age=0",
+] as const;
 
 const createScratchDirectory = useTemporaryDirectories();
 
@@ -115,89 +120,91 @@ async function createFakePnpmEnvironment(scratch: string): Promise<{
   };
 }
 
-async function createFakeNpmEnvironment(scratch: string): Promise<{
-  env: NodeJS.ProcessEnv;
-  readCalls(): Promise<PackageManagerCall[]>;
-}> {
-  const fakeNpmPath = join(scratch, "fake-npm.cjs");
-  const logPath = join(scratch, "npm-calls.jsonl");
-  await writeFile(
-    fakeNpmPath,
-    [
-      'const { appendFileSync, writeFileSync } = require("node:fs");',
-      'const { join } = require("node:path");',
-      "const args = process.argv.slice(2);",
-      "appendFileSync(",
-      "  process.env.EVE_INIT_NPM_LOG,",
-      "  `${JSON.stringify({ args, cwd: process.cwd() })}\\n`,",
-      ");",
-      'if (args.includes("install")) {',
-      '  writeFileSync(join(process.cwd(), "package-lock.json"), "{}\\n");',
-      "}",
-    ].join("\n"),
-  );
-
-  const { PNPM_HOME: _pnpmHome, ...baseEnv } = process.env;
-  const env = {
-    ...withoutCodingAgentMarkers(baseEnv),
-    EVE_INIT_NPM_LOG: logPath,
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: "commit.gpgsign",
-    GIT_CONFIG_VALUE_0: "false",
-    GIT_AUTHOR_EMAIL: "eve-init@example.com",
-    GIT_AUTHOR_NAME: "eve Init",
-    GIT_COMMITTER_EMAIL: "eve-init@example.com",
-    GIT_COMMITTER_NAME: "eve Init",
-    npm_config_user_agent: "npm/11.0.0 node/v24.0.0 darwin arm64",
-    npm_execpath: fakeNpmPath,
-  };
-
-  return {
-    env,
-    async readCalls() {
-      const content = await readFile(logPath, "utf8");
-      return content
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as PackageManagerCall);
-    },
-  };
-}
-
 describe("eve init smoke", () => {
-  it.skipIf(isChangesetReleasePr)(
-    "resolves a standalone pnpm scaffold under the release-age policy",
-    async () => {
-      const scratch = await createScratchDirectory("eve-init-release-age-");
-      const env = {
-        ...withoutCodingAgentMarkers(process.env),
-        // The agent path skips the interactive dev handoff, which cannot run
-        // against the real pnpm install this scenario performs.
-        AI_AGENT: "claude",
-        CI: "true",
-        PNPM_CONFIG_MINIMUM_RELEASE_AGE: RELEASE_AGE_MINUTES,
-        // A fresh eve release is younger than the policy window, so resolution
-        // would rightly fail. Internal testing opts the framework package out
-        // through the environment instead of any scaffold-owned bypass.
-        PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE: '["eve"]',
-      };
+  it("installs and runs a standalone pnpm scaffold under an inherited release-age policy", async () => {
+    const scratch = await createScratchDirectory("eve-init-release-age-");
+    const eveTarball = `file:${await ensureScenarioEveTarballPath()}`;
+    const pnpmfile = join(scratch, "scaffold-pnpmfile.cjs");
+    // The package under test need not have reached npm; registry dependencies still use the policy.
+    await writeFile(
+      pnpmfile,
+      [
+        "module.exports = { hooks: { updateConfig(config) {",
+        `  return { ...config, overrides: { ...config.overrides, eve: ${JSON.stringify(eveTarball)} } };`,
+        "} } };\n",
+      ].join("\n"),
+    );
+    const configHome = join(scratch, "config");
+    await mkdir(join(configHome, "pnpm"), { recursive: true });
+    await writeFile(
+      join(configHome, "pnpm", "config.yaml"),
+      `minimumReleaseAge: ${RELEASE_AGE_MINUTES}\nverifyDepsBeforeRun: install\n`,
+    );
+    const env = {
+      ...withoutCodingAgentMarkers(process.env),
+      // Exercise the package-manager dev handoff separately without opening a TUI.
+      AI_AGENT: "claude",
+      CI: "true",
+      PNPM_CONFIG_GLOBAL_PNPMFILE: pnpmfile,
+      XDG_CONFIG_HOME: configHome,
+    };
 
-      const result = await runEveBin(scratch, ["init", "policy-agent"], env);
+    const result = await runEveBin(scratch, ["init", "policy-agent"], env);
 
-      expect(result.exitCode, result.stderr).toBe(0);
-      const projectDir = join(scratch, "policy-agent");
-      await expect(
-        readFile(join(projectDir, "pnpm-workspace.yaml"), "utf8"),
-      ).resolves.not.toContain("minimumReleaseAgeExclude:");
-      await expect(
-        runFile("pnpm", ["add", "--ignore-scripts", "--lockfile-only", "is-number@7.0.0"], {
-          cwd: projectDir,
-          env,
-        }),
-      ).resolves.toMatchObject({ stderr: expect.any(String) });
-    },
-  );
+    expect(result.exitCode, result.stderr).toBe(0);
+    const projectDir = join(scratch, "policy-agent");
+    await expect(readFile(join(projectDir, "pnpm-workspace.yaml"), "utf8")).resolves.not.toContain(
+      "minimumReleaseAgeExclude:",
+    );
+    await expect(readFile(join(projectDir, "pnpm-workspace.yaml"), "utf8")).resolves.toContain(
+      "minimumReleaseAgeStrict: true",
+    );
+
+    // pnpm checks the installed lockfile before exec/run and may reinstall.
+    // A one-time install flag must not leave the next command rejecting it.
+    const devArguments = ["--reporter=silent", ...eveDevArguments("pnpm")];
+    const dev = await runFile("pnpm", [...devArguments, "--help"], {
+      cwd: projectDir,
+      env,
+    });
+    expect(dev.stdout).toContain("Usage: eve dev");
+    expect(dev.stdout).not.toMatch(/Lockfile|Already up to date|Done in/u);
+    await expect(
+      runFile("pnpm", [...devArguments, "--unknown-init-test-option"], {
+        cwd: projectDir,
+        env,
+      }),
+    ).rejects.toMatchObject({ stderr: expect.stringContaining("unknown option") });
+    await expect(
+      runFile("pnpm", ["install", "--frozen-lockfile"], { cwd: projectDir, env }),
+    ).resolves.toMatchObject({ stdout: expect.any(String) });
+
+    // Exercise the unpublished eve override independently of the initial
+    // scaffold install's release-age bypass.
+    const manifestPath = join(projectDir, "package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      dependencies: Record<string, string>;
+    };
+    manifest.dependencies.eve = "0.0.0-eve-init-unpublished";
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await expect(
+      runFile(
+        "pnpm",
+        [
+          "add",
+          "--ignore-scripts",
+          "--lockfile-only",
+          "--config.minimum-release-age=0",
+          "is-number@7.0.0",
+        ],
+        { cwd: projectDir, env },
+      ),
+    ).resolves.toMatchObject({ stderr: expect.any(String) });
+    const lockfile = (await loadYaml(join(projectDir, "pnpm-lock.yaml"))) as {
+      overrides?: Record<string, string>;
+    };
+    expect(lockfile.overrides?.eve).toBe(eveTarball);
+  });
 
   it("creates the base template with the default model and no Vercel state", async () => {
     const scratch = await createScratchDirectory("eve-init-");
@@ -220,7 +227,8 @@ describe("eve init smoke", () => {
     const packageJson = JSON.parse(await readFile(join(projectDir, "package.json"), "utf8")) as {
       engines?: { node?: string };
     };
-    expect(agentSource).toContain(DEFAULT_AGENT_MODEL_ID);
+    expect(agentSource).toContain('model: "openai/gpt-6-luna-fast"');
+    expect(agentSource).toContain('reasoning: "high"');
     expect(packageJson.engines?.node).toBe("24.x");
     await expect(readFile(join(projectDir, "pnpm-workspace.yaml"), "utf8")).resolves.toContain(
       "minimumReleaseAgeStrict: true",
@@ -230,18 +238,16 @@ describe("eve init smoke", () => {
     await expect(pathExists(join(projectDir, "vercel.json"))).resolves.toBe(false);
     expect(await fakePnpm.readCalls()).toEqual([
       {
-        args: ["--dir", canonicalProjectDir, "install", "--no-frozen-lockfile"],
-        cwd: canonicalProjectDir,
-      },
-      {
-        args: ["--dir", canonicalProjectDir, "exec", "eve", "dev", "--input", "/model"],
+        args: ["--dir", canonicalProjectDir, ...PNPM_INIT_INSTALL_ARGUMENTS],
         cwd: canonicalProjectDir,
       },
     ]);
-    expect(result.stdout).toContain("Created an eve agent in ");
-    expect(result.stdout).toContain("Preparing project...");
-    expect(result.stdout).toContain("Installed dependencies");
-    expect(result.stdout).not.toContain("Progress: resolved");
+    const output = stripAnsi(result.stdout);
+    expect(output).toContain(`Created an eve agent in ${canonicalProjectDir} in `);
+    expect(output).toContain("Creating agent...");
+    expect(output).toContain("Installing dependencies...");
+    expect(output).toContain("Initializing Git...");
+    expect(output).not.toContain("Progress: resolved");
     await expect(pathExists(join(projectDir, ".git"))).resolves.toBe(true);
     await expect(
       runFile("git", ["log", "-1", "--pretty=%s"], { cwd: projectDir }),
@@ -252,116 +258,6 @@ describe("eve init smoke", () => {
     await expect(
       runFile("git", ["status", "--porcelain"], { cwd: projectDir }),
     ).resolves.toMatchObject({ stdout: "" });
-  });
-
-  it("adds Web Chat without Vercel configuration", async () => {
-    const scratch = await createScratchDirectory("eve-init-web-");
-    const fakePnpm = await createFakePnpmEnvironment(scratch);
-
-    const result = await runEveBin(
-      scratch,
-      ["init", "web-agent", "--channel-web-nextjs"],
-      fakePnpm.env,
-    );
-
-    expect(result.exitCode, result.stderr).toBe(0);
-    const projectDir = join(scratch, "web-agent");
-    await expect(pathExists(join(projectDir, "app/page.tsx"))).resolves.toBe(true);
-    await expect(pathExists(join(projectDir, "vercel.json"))).resolves.toBe(false);
-    expect(await readFile(join(projectDir, "next.config.ts"), "utf8")).toContain(
-      "export default withEve(nextConfig);",
-    );
-    const [installCall, devCall] = await fakePnpm.readCalls();
-    expect(installCall?.args.slice(-2)).toEqual(["install", "--no-frozen-lockfile"]);
-    expect(devCall?.args.slice(-5)).toEqual(["exec", "eve", "dev", "--input", "/model"]);
-  });
-
-  it("adds Web Chat through npm without writing pnpm configuration", async () => {
-    const scratch = await createScratchDirectory("eve-init-web-npm-");
-    const fakeNpm = await createFakeNpmEnvironment(scratch);
-
-    const result = await runEveBin(
-      scratch,
-      ["init", "web-agent", "--channel-web-nextjs"],
-      fakeNpm.env,
-    );
-
-    expect(result.exitCode, result.stderr).toBe(0);
-    const projectDir = join(scratch, "web-agent");
-    const canonicalProjectDir = await realpath(projectDir);
-    await expect(pathExists(join(projectDir, "app/page.tsx"))).resolves.toBe(true);
-    await expect(pathExists(join(projectDir, "pnpm-workspace.yaml"))).resolves.toBe(false);
-    await expect(pathExists(join(projectDir, "package-lock.json"))).resolves.toBe(true);
-    expect(await fakeNpm.readCalls()).toEqual([
-      {
-        args: ["install"],
-        cwd: canonicalProjectDir,
-      },
-      {
-        args: ["exec", "--", "eve", "dev", "--input", "/model"],
-        cwd: canonicalProjectDir,
-      },
-    ]);
-  });
-
-  it("adds an agent to an existing pnpm project targeted as a directory", async () => {
-    const scratch = await createScratchDirectory("eve-init-dir-");
-    const fakePnpm = await createFakePnpmEnvironment(scratch);
-    await writeFile(
-      join(scratch, "package.json"),
-      `${JSON.stringify(
-        {
-          name: "host-app",
-          dependencies: { zod: "^3.25.0" },
-          engines: { node: ">=24" },
-        },
-        null,
-        2,
-      )}\n`,
-    );
-    await writeFile(join(scratch, "pnpm-lock.yaml"), "lockfileVersion: 9.0\n");
-
-    const result = await runEveBin(scratch, ["init", "."], fakePnpm.env);
-
-    expect(result.exitCode, result.stderr).toBe(0);
-    expect(result.stdout).toContain("Added an eve agent to ");
-    const agentSource = await readFile(join(scratch, "agent/agent.ts"), "utf8");
-    expect(agentSource).toContain(DEFAULT_AGENT_MODEL_ID);
-    await expect(pathExists(join(scratch, "agent/instructions.md"))).resolves.toBe(true);
-    expect(JSON.parse(await readFile(join(scratch, "package.json"), "utf8"))).toMatchObject({
-      dependencies: { zod: "^3.25.0" },
-      engines: { node: "24.x" },
-    });
-    expect(result.stdout).toContain('Overrode package.json engines.node from ">=24" to "24.x"');
-    await expect(readFile(join(scratch, "pnpm-workspace.yaml"), "utf8")).resolves.toContain(
-      "minimumReleaseAgeStrict: true",
-    );
-    const calls = await fakePnpm.readCalls();
-    expect(calls[0]?.args.slice(-2)).toEqual(["install", "--no-frozen-lockfile"]);
-    expect(calls[1]?.args.slice(-3)).toEqual(["exec", "eve", "dev"]);
-  });
-
-  it("scaffolds the current directory for a coding agent that omits the target", async () => {
-    const scratch = await createScratchDirectory("eve-init-agent-bare-");
-    const fakePnpmRoot = await createScratchDirectory("eve-init-agent-bare-pnpm-");
-    const fakePnpm = await createFakePnpmEnvironment(fakePnpmRoot);
-
-    const result = await runEveBin(scratch, ["init"], { ...fakePnpm.env, AI_AGENT: "claude" });
-
-    expect(result.exitCode, result.stderr).toBe(0);
-    const canonicalProjectDir = await realpath(scratch);
-    expect(await readFile(join(scratch, "agent/agent.ts"), "utf8")).toContain(
-      DEFAULT_AGENT_MODEL_ID,
-    );
-    await expect(pathExists(join(scratch, ".git"))).resolves.toBe(true);
-    expect(await fakePnpm.readCalls()).toEqual([
-      {
-        args: ["--dir", canonicalProjectDir, "install", "--no-frozen-lockfile"],
-        cwd: canonicalProjectDir,
-      },
-    ]);
-    expect(result.stdout).toContain("Created an eve agent in ");
-    expect(result.stdout).toContain("eve dev --no-ui");
   });
 
   it("warns and continues when a coding agent passes the compatibility yes flag", async () => {
@@ -378,60 +274,6 @@ describe("eve init smoke", () => {
     expect(result.stderr).toContain("warning: --yes has no effect for eve init.");
     expect(result.stdout).toContain("eve dev --no-ui");
     await expect(pathExists(join(scratch, "fumble-agent", "agent/agent.ts"))).resolves.toBe(true);
-  });
-
-  it("scaffolds the current empty directory when the target is omitted", async () => {
-    const scratch = await createScratchDirectory("eve-init-human-bare-");
-    const fakePnpmRoot = await createScratchDirectory("eve-init-human-bare-pnpm-");
-    const fakePnpm = await createFakePnpmEnvironment(fakePnpmRoot);
-
-    const result = await runEveBin(scratch, ["init"], fakePnpm.env);
-
-    expect(result.exitCode, result.stderr).toBe(0);
-    const canonicalProjectDir = await realpath(scratch);
-    expect(await readFile(join(scratch, "agent/agent.ts"), "utf8")).toContain(
-      DEFAULT_AGENT_MODEL_ID,
-    );
-    await expect(pathExists(join(scratch, ".git"))).resolves.toBe(true);
-    expect(await fakePnpm.readCalls()).toEqual([
-      {
-        args: ["--dir", canonicalProjectDir, "install", "--no-frozen-lockfile"],
-        cwd: canonicalProjectDir,
-      },
-      {
-        args: ["--dir", canonicalProjectDir, "exec", "eve", "dev", "--input", "/model"],
-        cwd: canonicalProjectDir,
-      },
-    ]);
-  });
-
-  it("scaffolds for a coding agent but prints the dev command instead of starting the TUI", async () => {
-    const scratch = await createScratchDirectory("eve-init-agent-named-");
-    const fakePnpm = await createFakePnpmEnvironment(scratch);
-
-    const result = await runEveBin(scratch, ["init", "smoke-agent"], {
-      ...fakePnpm.env,
-      AI_AGENT: "claude",
-    });
-
-    expect(result.exitCode, result.stderr).toBe(0);
-    const projectDir = join(scratch, "smoke-agent");
-    const canonicalProjectDir = await realpath(projectDir);
-    expect(await readFile(join(projectDir, "agent/agent.ts"), "utf8")).toContain(
-      DEFAULT_AGENT_MODEL_ID,
-    );
-    await expect(pathExists(join(projectDir, ".git"))).resolves.toBe(true);
-    // Install runs through the real binary, but the dev server is handed off as
-    // text rather than spawned: the only package-manager call is the install
-    // itself. The handoff supplies a headless command the coding agent can run
-    // later in a controllable background process.
-    expect(await fakePnpm.readCalls()).toEqual([
-      {
-        args: ["--dir", canonicalProjectDir, "install", "--no-frozen-lockfile"],
-        cwd: canonicalProjectDir,
-      },
-    ]);
-    expect(result.stdout).toContain("eve dev --no-ui");
   });
 
   it("rejects path-like names without writing outside the current directory", async () => {

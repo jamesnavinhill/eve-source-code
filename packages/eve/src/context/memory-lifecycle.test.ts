@@ -11,7 +11,14 @@ import {
   prepareMemoryCompaction,
   prepareMemoryPreamble,
 } from "#context/memory-lifecycle.js";
-import { AuthKey, SessionIdKey, SessionKey, TurnMemoryLocksKey } from "#context/keys.js";
+import {
+  AuthKey,
+  SessionIdKey,
+  SessionKey,
+  StaticModelReferenceKey,
+  TurnMemoryLocksKey,
+} from "#context/keys.js";
+import { type MemoryInstrumentation } from "#instrumentation/memory.js";
 import {
   defineMemory,
   type MemoryDefinition,
@@ -37,6 +44,7 @@ function createContext() {
     principalType: "user",
   };
   const ctx = new ContextContainer();
+  ctx.set(StaticModelReferenceKey, null);
   ctx.set(AuthKey, auth);
   ctx.set(SessionIdKey, "session_1");
   ctx.set(SessionKey, {
@@ -132,11 +140,12 @@ describe("memory lifecycle", () => {
     expect(seen).toEqual([[history[0]!], [history[0]!]]);
     expect(projected).toEqual([
       history[0],
-      { content: "alpha memory", role: "user" },
-      { content: "bravo memory", role: "user" },
+      { content: "alpha memory", kind: "memory.load", role: "user" },
+      { content: "bravo memory", kind: "memory.load", role: "user" },
       input[0],
     ]);
-    expect(JSON.stringify(commit.history)).toContain("eve.memory");
+    expect(commit.recalledMessages).toHaveLength(2);
+    expect(JSON.stringify(commit.recalledMessages)).toContain("eve.memory");
   });
 
   it("commits no slot when one turn-wide recall batch is invalid", async () => {
@@ -199,7 +208,64 @@ describe("memory lifecycle", () => {
 
     expect(namespace).not.toHaveBeenCalled();
     expect(recall).not.toHaveBeenCalled();
-    expect(drainMemoryCommit(ctx)?.history).toEqual([]);
+    expect(drainMemoryCommit(ctx)?.recalledMessages).toEqual([]);
+  });
+
+  it("instruments recalls as memory searches with validated result records", async () => {
+    const ctx = createContext();
+    const operations: unknown[] = [];
+    const results: unknown[] = [];
+    const instrumentation: MemoryInstrumentation = {
+      execute: async (operation, execute) => {
+        operations.push(operation);
+        const result = await execute();
+        results.push(result);
+        return result.value;
+      },
+    };
+    prepareMemoryPreamble(ctx, { history: [], input: [] });
+
+    await contextStorage.run(
+      ctx,
+      async () =>
+        await dispatchMemoryTurnStarted({
+          appRoot: "/app",
+          ctx,
+          event: turnStarted,
+          instrumentation,
+          memories: [
+            memory("profile", {
+              provider: {
+                recall: {
+                  "turn.started": async () => ({
+                    messages: [{ content: "The user prefers dark mode.", id: "preference" }],
+                  }),
+                },
+              },
+              scope: "user_1",
+            }),
+          ],
+          nodeId: "__root__",
+        }),
+    );
+
+    expect(operations).toEqual([
+      {
+        idempotencyKey: "eve-memory-operation-v1:session_1:0:turn_0:turn.started:profile",
+        operationName: "search_memory",
+        phase: "turn.started",
+        slot: "profile",
+        storeId: expect.stringMatching(/^memscope1_/),
+        turnId: "turn_0",
+      },
+    ]);
+    expect(results).toEqual([
+      {
+        outputRecords: [{ content: "The user prefers dark mode.", id: "preference" }],
+        recordCount: 1,
+        value: [{ content: "The user prefers dark mode.", itemKey: expect.any(String) }],
+      },
+    ]);
   });
 
   it("captures only the settled projected history for a successful turn", async () => {
@@ -230,7 +296,7 @@ describe("memory lifecycle", () => {
     );
     const commit = drainMemoryCommit(ctx)!;
     const settled = [
-      ...commit.history,
+      ...commit.recalledMessages,
       { content: "hello", role: "user" as const },
       { content: "hi", role: "assistant" as const },
     ];
@@ -258,6 +324,97 @@ describe("memory lifecycle", () => {
     expect(capture.mock.calls[0]?.[0]).not.toHaveProperty("phase");
     expect(capture.mock.calls[0]?.[0]).not.toHaveProperty("compaction");
     expect(JSON.stringify(capture.mock.calls[0]?.[0].messages)).not.toContain("eve.memory");
+  });
+
+  it("waits for sibling captures before propagating a failure", async () => {
+    const ctx = createContext();
+    const failure = new Error("alpha capture failed");
+    let releaseBravo!: () => void;
+    const bravoBlocked = new Promise<void>((resolve) => {
+      releaseBravo = resolve;
+    });
+    const bravoCapture = vi.fn(async () => await bravoBlocked);
+    const memories = [
+      memory("alpha", {
+        provider: {
+          capture: {
+            "turn.completed": async () => {
+              throw failure;
+            },
+          },
+          recall: { "turn.started": async () => null },
+        },
+        scope: "user_1",
+      }),
+      memory("bravo", {
+        provider: {
+          capture: { "turn.completed": bravoCapture },
+          recall: { "turn.started": async () => null },
+        },
+        scope: "user_1",
+      }),
+    ];
+    const turn = { id: "turn_0", input: [], sequence: 0 };
+    ctx.set(TurnMemoryLocksKey, {
+      alpha: createMemoryLock({
+        namespace: "app",
+        scope: "user_1",
+        slot: "alpha",
+        turn,
+        visibility: "scope",
+      }),
+      bravo: createMemoryLock({
+        namespace: "app",
+        scope: "user_1",
+        slot: "bravo",
+        turn,
+        visibility: "scope",
+      }),
+    });
+    const terminals: string[] = [];
+    const instrumentation: MemoryInstrumentation = {
+      async execute(operation, execute) {
+        try {
+          const result = await execute();
+          terminals.push(`${operation.slot}:completed`);
+          return result.value;
+        } catch (error) {
+          terminals.push(`${operation.slot}:failed`);
+          throw error;
+        }
+      },
+    };
+
+    const pending = contextStorage.run(
+      ctx,
+      async () =>
+        await dispatchMemoryTurnCompleted({
+          ctx,
+          event: { data: { sequence: 0, turnId: "turn_0" }, type: "turn.completed" },
+          instrumentation,
+          memories,
+          messages: [],
+        }),
+    );
+    let outcome:
+      | { readonly error?: unknown; readonly status: "fulfilled" | "rejected" }
+      | undefined;
+    const observed = pending.then(
+      () => {
+        outcome = { status: "fulfilled" };
+      },
+      (error: unknown) => {
+        outcome = { error, status: "rejected" };
+      },
+    );
+
+    await vi.waitFor(() => expect(bravoCapture).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(terminals).toEqual(["alpha:failed"]));
+    expect(outcome).toBeUndefined();
+    releaseBravo();
+    await observed;
+    expect(outcome).toEqual({ error: failure, status: "rejected" });
+    expect(terminals).toEqual(["alpha:failed", "bravo:completed"]);
   });
 
   it("captures before compaction and recalls again after the checkpoint", async () => {
@@ -319,6 +476,7 @@ describe("memory lifecycle", () => {
         modelId: "openai/test",
         sequence: 0,
         sessionId: "session_1",
+        stepIndex: 0,
         turnId: "turn_0",
         usageInputTokens: 100,
       },
@@ -349,6 +507,7 @@ describe("memory lifecycle", () => {
               modelId: "openai/test",
               sequence: 0,
               sessionId: "session_1",
+              stepIndex: 0,
               turnId: "turn_0",
             },
             type: "compaction.completed",
@@ -361,8 +520,75 @@ describe("memory lifecycle", () => {
     expect(phases).toEqual(["compaction.requested", "compaction.completed"]);
     expect(projected).toEqual([
       { content: "ordinary", role: "user" },
-      { content: "new profile", role: "user" },
+      { content: "new profile", kind: "memory.load", role: "user" },
     ]);
-    expect(drainMemoryCommit(ctx)?.history).toHaveLength(3);
+    expect(drainMemoryCommit(ctx)?.recalledMessages).toHaveLength(1);
+  });
+
+  it("gives each completed compaction within one turn a distinct recall operation id", async () => {
+    const ctx = createContext();
+    const operationIds: string[] = [];
+    const definition = memory("register", {
+      provider: {
+        recall: {
+          "compaction.completed": async (context) => {
+            operationIds.push(context.operationId);
+            return {
+              messages: [{ content: `findings revision ${operationIds.length}`, id: "register" }],
+            };
+          },
+          "turn.started": async () => null,
+        },
+      },
+      scope: "user_1",
+    });
+    const memoryLock = createMemoryLock({
+      namespace: "app",
+      scope: "user_1",
+      slot: "register",
+      turn: { id: "turn_0", input: [], sequence: 0 },
+      visibility: "scope",
+    });
+    ctx.set(TurnMemoryLocksKey, { register: memoryLock });
+    let history: ModelMessage[] = [{ content: "ordinary", role: "user" }];
+    let state: Readonly<Record<string, unknown>> | undefined;
+    let stepIndex = 0;
+
+    const completeCompaction = async () => {
+      prepareMemoryCompaction(ctx, { history, state });
+      const projected = await contextStorage.run(
+        ctx,
+        async () =>
+          await dispatchMemoryCompactionCompleted({
+            ctx,
+            event: {
+              data: {
+                modelId: "openai/test",
+                sequence: 0,
+                sessionId: "session_1",
+                stepIndex: stepIndex++,
+                turnId: "turn_0",
+              },
+              type: "compaction.completed",
+            },
+            memories: [definition],
+            messages: history,
+          }),
+      );
+      const commit = drainMemoryCommit(ctx)!;
+      history = [...history, ...commit.recalledMessages];
+      state = commit.state;
+      return projected;
+    };
+
+    await completeCompaction();
+    const second = await completeCompaction();
+
+    expect(operationIds).toHaveLength(2);
+    expect(operationIds[1]).not.toBe(operationIds[0]);
+    expect(second).toEqual([
+      { content: "ordinary", role: "user" },
+      { content: "findings revision 2", kind: "memory.load", role: "user" },
+    ]);
   });
 });

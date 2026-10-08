@@ -11,6 +11,7 @@ import {
   PendingAuthorizationResultKey,
   resolveActiveAuthorizationChallenges,
   setPendingAuthorization,
+  supersededChallenges,
 } from "#harness/authorization.js";
 import type { ConnectionPrincipal } from "#shared/connection-types.js";
 
@@ -26,7 +27,7 @@ describe("authorization callback URLs", () => {
     ctx.set(SessionIdKey, "session-1");
 
     expect(contextStorage.run(ctx, () => getHookUrl("linear", "attempt-1"))).toBe(
-      "https://agent.example.com/eve/v1/connections/linear/callback/attempt-1/session-1%3Aauth?x-vercel-protection-bypass=secret+value",
+      "https://agent.example.com/eve/v1/connections/linear/callback/attempt-1/eve%3Ainbox%3Av1%3Aeve%3Asession%3Asession-1%3Ainbox?x-vercel-protection-bypass=secret+value",
     );
   });
 });
@@ -138,6 +139,14 @@ describe("pending authorization state", () => {
       expect.objectContaining({ hookUrl: "https://eve.example/refreshed" }),
     ]);
   });
+
+  it("clears by candidate ID", () => {
+    const state = setPendingAuthorization(undefined, {
+      challenges: [candidateChallenge("github", "candidate-1")],
+    });
+
+    expect(clearPendingAuthorization(state, ["candidate-1"])).toBeUndefined();
+  });
 });
 
 describe("pending authorization attempts", () => {
@@ -197,6 +206,29 @@ describe("pending authorization attempts", () => {
         setPendingAuthorization(undefined, { challenges: [first, otherPrincipal, latest] }),
       )?.challenges,
     ).toEqual([otherPrincipal, latest]);
+  });
+
+  it("shows one sign-in per Vercel Connect grant across tools and connections", () => {
+    const alice = { id: "alice", issuer: "idp", type: "user" } as const;
+    const bob = { id: "bob", issuer: "idp", type: "user" } as const;
+    const grant = (name: string, attemptId: string, principal: ConnectionPrincipal = alice) => ({
+      ...challenge(name, attemptId, principal),
+      grant: "linear/myagent",
+    });
+    const pending = setPendingAuthorization(undefined, {
+      challenges: [grant("linear", "connection")],
+    });
+    const listTool = grant("list_issues__linear_myagent", "list-tool");
+    const createTool = grant("create_issue__linear_myagent", "create-tool");
+    const bobTool = grant("create_issue__linear_myagent", "bob-tool", bob);
+    const approval = { ...grant("candidate-1:linear", "approval"), candidateId: "candidate-1" };
+
+    expect(resolveActiveAuthorizationChallenges([listTool, createTool, bobTool, approval])).toEqual(
+      [createTool, bobTool, approval],
+    );
+    expect(
+      supersededChallenges(getPendingAuthorization(pending)?.challenges ?? [], [createTool]),
+    ).toEqual([grant("linear", "connection")]);
   });
 
   it("clears by exact attempt identity", () => {

@@ -18,8 +18,10 @@ const KNOWN_TOP_LEVEL_KEYS = [
   "approval",
   "auth",
   "description",
+  "forwardPrincipal",
   "headers",
   "instanceKey",
+  "protocolVersionDiscovery",
   "toolCall",
   "tools",
   "url",
@@ -37,6 +39,7 @@ const KNOWN_OPENAPI_TOP_LEVEL_KEYS = [
 ] as const;
 const KNOWN_AUTHORIZATION_KEYS = [
   "completeAuthorization",
+  "credentialOwner",
   "evict",
   "getToken",
   "principalType",
@@ -92,6 +95,20 @@ export function normalizeMcpClientConnectionDefinition(
     description: record.description as string,
     url: record.url as string,
   };
+
+  if (record.protocolVersionDiscovery !== undefined) {
+    if (typeof record.protocolVersionDiscovery !== "boolean") {
+      throw new Error(`${message} "protocolVersionDiscovery" must be a boolean.`);
+    }
+    result.protocolVersionDiscovery = record.protocolVersionDiscovery;
+  }
+
+  if (record.forwardPrincipal !== undefined) {
+    if (typeof record.forwardPrincipal !== "boolean") {
+      throw new Error(`${message} "forwardPrincipal" must be a boolean.`);
+    }
+    result.forwardPrincipal = record.forwardPrincipal;
+  }
 
   if (record.instanceKey !== undefined) {
     result.instanceKey = record.instanceKey as string;

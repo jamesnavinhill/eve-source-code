@@ -9,7 +9,7 @@ import {
   type ProgrammaticModuleNamespace,
 } from "#compiler/source-graph.js";
 
-const revision = `eve@${resolveInstalledPackageInfo().version}:compiled-manifest-v44`;
+const revision = `eve@${resolveInstalledPackageInfo().version}:compiled-manifest-v52`;
 
 const localDefaults = defineProgrammaticAgentSource({
   id: "eve:defaults",
@@ -34,10 +34,6 @@ const localDefaults = defineProgrammaticAgentSource({
       loadNamespace: () => import("#tools/provided/write-file.js"),
     },
     {
-      logicalPath: "tools/todo.ts",
-      loadNamespace: () => import("#tools/provided/todo.js"),
-    },
-    {
       logicalPath: "tools/web_fetch.ts",
       loadNamespace: () => import("#tools/provided/web-fetch.js"),
     },
@@ -46,12 +42,8 @@ const localDefaults = defineProgrammaticAgentSource({
       loadNamespace: () => import("#tools/provided/load-skill.js"),
     },
     {
-      logicalPath: "tools/connection_search.ts",
-      loadNamespace: () => import("#tools/framework/connection-search.js"),
-    },
-    {
-      logicalPath: "tools/ask_question.ts",
-      loadNamespace: () => import("#tools/framework/ask-question.js"),
+      logicalPath: "tools/connection_tools.ts",
+      loadNamespace: () => import("#tools/framework/connection-tools.js"),
     },
     {
       logicalPath: "tools/web_search.ts",
@@ -69,20 +61,27 @@ const rootDefaults = defineProgrammaticAgentSource({
       loadNamespace: () => import("#tools/framework/agent.js"),
     },
     {
-      logicalPath: "tools/task_update.ts",
-      loadNamespace: () => import("#tools/framework/task-update.js"),
-    },
-    {
-      logicalPath: "tools/task_cancel.ts",
-      loadNamespace: () => import("#tools/framework/task-cancel.js"),
-    },
-    {
       logicalPath: "channels/eve.ts",
       loadNamespace: () => import("#framework/sources/modules/eve-channel.js"),
     },
     {
       logicalPath: "channels/home.ts",
       loadNamespace: () => import("#framework/sources/modules/home-channel.js"),
+    },
+  ],
+});
+
+const scheduleCollectionWrapperTemplateSource = defineProgrammaticAgentSource({
+  id: "eve:schedule-collection-wrapper",
+  revision,
+  modules: [
+    {
+      logicalPath: "tools/schedule-collection-wrapper.ts",
+      loadNamespace: async (context) => {
+        const { loadScheduleCollectionWrapperNamespace } =
+          await import("#framework/sources/modules/schedule-collection-wrapper.js");
+        return await loadScheduleCollectionWrapperNamespace(context);
+      },
     },
   ],
 });
@@ -107,11 +106,14 @@ export const frameworkAgentSourceRegistry: AgentSourceRegistry = createAgentSour
     { applyTo: "all-local-nodes", source: localDefaults },
     { applyTo: "root", source: rootDefaults },
   ],
-  { templates: [memoryWrapperTemplateSource] },
+  { templates: [memoryWrapperTemplateSource, scheduleCollectionWrapperTemplateSource] },
 );
 
 export const memoryWrapperTemplate = frameworkAgentSourceRegistry.templates.get(
   memoryWrapperTemplateSource.id,
+)!;
+export const scheduleCollectionWrapperTemplate = frameworkAgentSourceRegistry.templates.get(
+  scheduleCollectionWrapperTemplateSource.id,
 )!;
 
 export async function loadFrameworkProgrammaticModule(

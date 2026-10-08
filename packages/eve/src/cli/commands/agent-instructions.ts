@@ -61,13 +61,19 @@ export function initAgentInstructions(): string {
 }
 
 /** Concise scaffold facts printed only when a coding agent launched `eve init`. */
-export function initAgentReadySummary(model: string | undefined, projectPath: string): string {
+export function initAgentReadySummary(
+  model: string | undefined,
+  projectPath: string,
+  options: { workspace?: boolean } = {},
+): string {
   const selectedModel = model ?? DEFAULT_AGENT_MODEL_ID;
   const defaultLabel = model === undefined ? pc.dim(" (eve default)") : "";
-  return [
-    `${pc.green("✓")} Model ${pc.bold(selectedModel)}${defaultLabel}`,
-    `${pc.green("✓")} Instructions ${pc.bold(join(projectPath, "agent/instructions.md"))}`,
-  ].join("\n");
+  const authoredFiles = options.workspace
+    ? `${pc.green("✓")} Agents ${pc.bold(join(projectPath, "agents"))}`
+    : `${pc.green("✓")} Instructions ${pc.bold(join(projectPath, "agent/instructions.md"))}`;
+  return [`${pc.green("✓")} Model ${pc.bold(selectedModel)}${defaultLabel}`, authoredFiles].join(
+    "\n",
+  );
 }
 
 /** The post-scaffold handoff printed after a coding agent runs `eve init`. */
@@ -75,14 +81,6 @@ export function initAgentDevHandoff(options: { projectPath: string; devCommand: 
   return compose(HANDOFF_SECTIONS, {
     devCommand: options.devCommand,
     workingDirectory: options.projectPath,
-  });
-}
-
-/** The initial prompt for a coding-agent REPL opened inside the scaffolded project. */
-export function initAgentReplPrompt(options: { devCommand: string }): string {
-  return compose(HANDOFF_SECTIONS, {
-    devCommand: options.devCommand,
-    workingDirectory: ".",
   });
 }
 

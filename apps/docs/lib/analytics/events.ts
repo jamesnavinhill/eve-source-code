@@ -2,11 +2,13 @@ export const analyticsEvents = {
   askAiSubmitted: "Submitted docs question",
   gettingStartedOpened: "Opened getting started",
   installerCommandCopyClicked: "Clicked installer command copy",
+  vercelAgentCreationOpened: "Opened Vercel agent creation",
   installerCommandSelected: "Selected installer command",
   integrationCodeCopyClicked: "Clicked integration code copy",
   integrationDocsOpened: "Opened integration docs",
   integrationFilterSelected: "Selected integration filter",
   integrationOpened: "Opened integration",
+  integrationRelatedResourceOpened: "Opened integration related resource",
   integrationSetupOptionSelected: "Selected integration setup option",
   integrationsSearched: "Searched integrations",
   smartMarkdownNotFound: "Served smart Markdown 404",
@@ -20,7 +22,7 @@ export const analyticsEvents = {
 
 export type AnalyticsEventName = (typeof analyticsEvents)[keyof typeof analyticsEvents];
 
-export type DocsSurface = "docs" | "home" | "integrations" | "other" | "templates";
+type DocsSurface = "docs" | "home" | "integrations" | "other" | "templates";
 
 export const isQueryFreeUrl = (url: string): boolean => {
   try {

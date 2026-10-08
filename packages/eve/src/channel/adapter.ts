@@ -1,6 +1,7 @@
 import type { ContextAccessor } from "#context/key.js";
 import type { StepInput } from "#harness/types.js";
 import { attachClientContext, readClientContext } from "#internal/client-context.js";
+import { attachInputText, readInputText } from "#internal/input-text.js";
 import { createLogger } from "#internal/logging.js";
 import type { UnstampedMessageStreamEvent } from "#protocol/message.js";
 import type { SessionHandle } from "#channel/session.js";
@@ -10,7 +11,7 @@ import type {
   FetchFileResult,
   FetchFileFunction,
 } from "#shared/channel-definition.js";
-import type { ChannelAudienceMetadata } from "#shared/channel-audience.js";
+import type { ChannelAudienceProjector } from "#channel/audience.js";
 
 const log = createLogger("channel.adapter");
 
@@ -28,8 +29,8 @@ const log = createLogger("channel.adapter");
  * {@link ContextAccessor} that tools and providers use).
  *
  * `session` is a live handle to the current session — id, auth,
- * optional channel continuation address, including an imperative `rekey()`
- * for channels that need to re-key the session mid-turn (e.g. Slack's
+ * optional channel continuation address, including an imperative `alias()`
+ * for channels that need to add an alias for the session mid-turn (e.g. Slack's
  * auto-anchor on first post).
  */
 export interface ChannelAdapterContext<TState = Record<string, unknown>> {
@@ -49,6 +50,9 @@ export interface ChannelAdapterContext<TState = Record<string, unknown>> {
    * Live handle to the current session.
    */
   readonly session: SessionHandle;
+
+  /** @internal Independent source of a relayed child input batch. */
+  readonly inputSource?: string;
 }
 
 /**
@@ -103,9 +107,7 @@ export type ChannelEventHandlers<TCtx extends ChannelAdapterContext<any> = Chann
  */
 export type { FetchFileContext, FetchFileResult };
 
-export type ChannelInstrumentationMetadata = Readonly<
-  Record<string, unknown> & ChannelAudienceMetadata
->;
+export type ChannelInstrumentationMetadata = Readonly<Record<string, unknown>>;
 
 export type ChannelInstrumentationMetadataProjector = (
   state: Record<string, unknown> | undefined,
@@ -177,6 +179,7 @@ export type ChannelAdapter<TCtx extends ChannelAdapterContext<any> = ChannelAdap
    */
   readonly instrumentation?: {
     readonly metadata?: ChannelInstrumentationMetadataProjector;
+    readonly audience?: ChannelAudienceProjector;
   };
 } & ChannelEventHandlers<TCtx>;
 
@@ -195,12 +198,15 @@ export type ChannelAdapter<TCtx extends ChannelAdapterContext<any> = ChannelAdap
 export function defaultDeliverResult(payload: DeliverPayload): StepInput | undefined {
   if (payload.message !== undefined) {
     return attachClientContext(
-      {
-        inputResponses: payload.inputResponses,
-        message: payload.message,
-        context: payload.context,
-        outputSchema: payload.outputSchema,
-      },
+      attachInputText(
+        {
+          inputResponses: payload.inputResponses,
+          message: payload.message,
+          context: payload.context,
+          outputSchema: payload.outputSchema,
+        },
+        readInputText(payload),
+      ),
       readClientContext(payload),
     );
   }

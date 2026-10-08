@@ -1,5 +1,6 @@
 import { Command } from "#compiled/commander/index.js";
-import { applicationCommand, type CliApplicationContext } from "#cli/application-command.js";
+import type { CliApplicationContext } from "#cli/application-command.js";
+import { agentCommand } from "#cli/agent-command.js";
 import { loadDevelopmentEnvironmentFiles } from "#cli/dev/environment.js";
 import {
   parseDevelopmentHeaderOption,
@@ -23,7 +24,7 @@ export type RunAcpServer = (input: {
 export type ResolveVerifiedRemoteDevelopmentClient =
   typeof import("#setup/verified-remote-client.js").resolveVerifiedRemoteDevelopmentClient;
 
-export interface RegisterAcpCommandOptions {
+interface RegisterAcpCommandOptions {
   readonly applicationContext: CliApplicationContext;
   readonly eveVersion: string;
   readonly program: Command;
@@ -34,17 +35,11 @@ export interface RegisterAcpCommandOptions {
 
 /** Registers the ACP stdio bridge for local and deployed eve agents. */
 export function registerAcpCommand(options: RegisterAcpCommandOptions): void {
-  applicationCommand(options.program.command("acp"), options.applicationContext, (command) => {
+  agentCommand(options.program.command("acp"), options.applicationContext, (command) => {
     const commandOptions = command.opts<AcpCliOptions>();
-    return (
-      resolveDevelopmentUrlTarget(
-        commandOptions,
-        command.processedArgs[0] as string | undefined,
-      ) === undefined
-    );
+    return commandOptions.url === undefined;
   })
     .description("Serve an eve agent through stable ACP v1 over stdio.")
-    .argument("[url]", "Connect to an existing server URL", parseDevelopmentServerUrl)
     .option("-u, --url <url>", "Connect to an existing server URL", parseDevelopmentServerUrl)
     .option("--scope <team>", "Vercel team that owns the URL target")
     .option(
@@ -54,11 +49,11 @@ export function registerAcpCommand(options: RegisterAcpCommandOptions): void {
     )
     .addHelpText(
       "after",
-      "\nWithout a URL, eve supervises a local development server. You can also pass a bare URL, for example: eve acp https://example.com\nACP does not grant the agent access to the client's workspace or terminal.\n",
+      "\nWithout a URL, eve supervises a local development server. Pass --url to bridge an existing agent.\nACP does not grant the agent access to the client's workspace or terminal.\n",
     )
-    .action(async (positionalUrl: string | undefined, commandOptions: AcpCliOptions) => {
-      const target = resolveDevelopmentUrlTarget(commandOptions, positionalUrl);
-      loadDevelopmentEnvironmentFiles(options.applicationContext.root);
+    .action(async (commandOptions: AcpCliOptions) => {
+      const target = resolveDevelopmentUrlTarget(commandOptions, undefined);
+      await loadDevelopmentEnvironmentFiles(options.applicationContext.root);
       const lifecycle = installShutdownSignal({ exitAfterMs: FORCED_EXIT_BACKSTOP_MS });
 
       if (target !== undefined) {

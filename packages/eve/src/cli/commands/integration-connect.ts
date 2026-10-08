@@ -3,6 +3,7 @@ import { join } from "node:path";
 import {
   cleanupCreatedConnectionConnector,
   setupConnectionConnector,
+  type ConnectPrincipalType,
   type SetupConnectionConnectorOptions,
 } from "#setup/connection-connector.js";
 import {
@@ -10,11 +11,12 @@ import {
   type EnsureVercelProjectDeps,
 } from "#setup/flows/ensure-vercel-project.js";
 import { createHeadlessPrompter } from "#setup/headless.js";
-import { SetupPrerequisiteRequired } from "#setup/integrations/shared/prerequisite.js";
+import { setupPrerequisiteOf } from "#setup/integrations/shared/prerequisite.js";
 import { resolveIntegrationVercelProject } from "#setup/integrations/shared/vercel-project.js";
 import { readProjectLink } from "#setup/project-resolution.js";
 import { createPrompter, type Prompter } from "#setup/prompter.js";
 import { createRegistrySetupClient } from "#setup/registry-setup-client.js";
+import { requireAuth } from "#setup/vercel-project.js";
 import { updateConnectionConnectorUid } from "#setup/scaffold/update/update-connection-connector.js";
 import { WizardCancelledError } from "#setup/step.js";
 
@@ -24,6 +26,7 @@ import { serializeHeadlessSetupEvent } from "./setup-headless.js";
 export interface IntegrationConnectOptions {
   creationType?: string;
   connectionMethod?: "mcp" | "oauth";
+  principalType?: ConnectPrincipalType;
   nonInteractive?: boolean;
   signal?: AbortSignal;
 }
@@ -33,6 +36,7 @@ export interface IntegrationConnectDependencies {
   ensureVercelProject: typeof ensureVercelProject;
   ensureVercelProjectDeps?: Partial<EnsureVercelProjectDeps>;
   readProjectLink: typeof readProjectLink;
+  requireAuth: typeof requireAuth;
   setupConnectionConnector: typeof setupConnectionConnector;
   cleanupCreatedConnectionConnector: typeof cleanupCreatedConnectionConnector;
   updateConnectionConnectorUid: typeof updateConnectionConnectorUid;
@@ -41,6 +45,7 @@ export interface IntegrationConnectDependencies {
 const defaultDependencies: IntegrationConnectDependencies = {
   ensureVercelProject,
   readProjectLink,
+  requireAuth,
   setupConnectionConnector,
   cleanupCreatedConnectionConnector,
   updateConnectionConnectorUid,
@@ -64,7 +69,14 @@ export async function runIntegrationConnect(input: {
   prompter.intro(`Set up ${input.slug}`);
 
   let project = await dependencies.readProjectLink(input.appRoot);
-  if (project === undefined) {
+  if (project !== undefined) {
+    // An existing link skips project provisioning and its login check, so
+    // verify the CLI session here: otherwise a logged-out CLI surfaces only as
+    // an opaque `vercel connect` exit code instead of the `vercel login` action.
+    await dependencies.requireAuth(input.appRoot, nonInteractive ? undefined : prompter, {
+      signal,
+    });
+  } else {
     if (nonInteractive) {
       project = await resolveIntegrationVercelProject({
         appRoot: input.appRoot,
@@ -97,6 +109,7 @@ export async function runIntegrationConnect(input: {
     service: input.service,
     creationType: input.options?.creationType,
     connectionMethod: input.options?.connectionMethod,
+    principalType: input.options?.principalType,
     canonicalConnectorName: input.canonicalConnectorName ?? input.slug,
     project,
     signal,
@@ -149,13 +162,14 @@ export async function runIntegrationConnectCommand(
   } catch (error) {
     client?.fail(error);
     if (client !== undefined) return;
-    if (options.nonInteractive && error instanceof SetupPrerequisiteRequired) {
+    const prerequisite = setupPrerequisiteOf(error);
+    if (options.nonInteractive && prerequisite !== undefined) {
       logger.error(
         serializeHeadlessSetupEvent({
           version: 1,
           type: "blocked",
           status: "prerequisite_required",
-          prerequisite: error.prerequisite,
+          prerequisite,
         }),
       );
       process.exitCode = 2;

@@ -6,6 +6,7 @@ import {
   loadModuleBackedDefinition,
   type ModuleBackedDefinitionLoadOptions,
 } from "#compiler/normalize-helpers.js";
+import { TASK_TOOL_NAMES } from "#protocol/task-tools.js";
 
 /**
  * Compiled tool entry produced from one authored `tools/*.ts` file.
@@ -17,11 +18,9 @@ import {
 export type CompiledToolEntry =
   | { readonly kind: "tool"; readonly definition: CompiledToolDefinition }
   | { readonly kind: "disabled"; readonly name: string }
-  | { readonly kind: "workflow-tool"; readonly maxSubagents?: number }
   | {
       readonly definition: CompiledToolDefinition;
       readonly kind: "web-search-tool";
-      readonly provider: "exa" | "parallel";
     }
   | { readonly kind: "dynamic-tool"; readonly definition: CompiledDynamicToolDefinition };
 
@@ -55,12 +54,14 @@ export async function compileToolEntry(
     .replace(/^tools\//, "")
     .replaceAll("/", "-");
 
-  if (entry.kind === "disabled") {
-    return { kind: "disabled", name: toolName };
+  if (TASK_TOOL_NAMES.includes(toolName)) {
+    throw new Error(
+      `Tool "${source.logicalPath}" uses the reserved name "${toolName}". Rename its path; eve reserves "${toolName}" for its built-in task tool.`,
+    );
   }
 
-  if (entry.kind === "workflow-tool") {
-    return { kind: "workflow-tool", maxSubagents: entry.maxSubagents };
+  if (entry.kind === "disabled") {
+    return { kind: "disabled", name: toolName };
   }
 
   if (entry.kind === "web-search-tool") {
@@ -71,6 +72,10 @@ export async function compileToolEntry(
     }
     return {
       definition: {
+        behavior: {
+          availability: [],
+          handling: { kind: "provider-tool", provider: entry.provider },
+        },
         description:
           "Search the web for real-time information. Use this to find up-to-date information about current events, recent developments, or topics that may have changed since the knowledge cutoff.",
         exportName: source.exportName,
@@ -84,7 +89,6 @@ export async function compileToolEntry(
         requiresApproval: false,
       },
       kind: "web-search-tool",
-      provider: entry.provider,
     };
   }
 
@@ -103,21 +107,33 @@ export async function compileToolEntry(
     };
   }
 
+  const { workflow } = entry.definition;
+  const shape = {
+    suspend: workflow === undefined ? ("none" as const) : ("workflow" as const),
+  };
   return {
     kind: "tool",
     definition: {
+      availableInSubagents: entry.definition.availableInSubagents,
+      behavior:
+        workflow === undefined
+          ? entry.definition.behavior === undefined
+            ? { availability: [], shape }
+            : { ...entry.definition.behavior, shape }
+          : { availability: [], handling: { kind: "workflow-tool", ...workflow }, shape },
       description: entry.definition.description,
-      execution: entry.definition.execution,
       exportName: source.exportName,
-      hasExecute: true,
+      hasExecute: entry.definition.hasExecute,
       hasModelOutputProjection: entry.definition.hasModelOutputProjection,
       inputSchema: entry.definition.inputSchema ?? null,
       logicalPath: source.logicalPath,
+      modelInputSchema: entry.definition.modelInputSchema,
       name: toolName,
       outputSchema: entry.definition.outputSchema,
       requiresApproval: entry.definition.hasApproval,
       sourceId: source.sourceId,
       sourceKind: "module",
+      workflowProgram: entry.definition.workflowProgram,
     },
   };
 }

@@ -1,5 +1,5 @@
 /** Authoring and distribution roots declared by an extension package. */
-export interface ExtensionPackageRoots {
+interface ExtensionPackageRoots {
   /**
    * Authoring root. Optional so published packages can ship `dist` only;
    * `eve extension build` requires it.
@@ -27,6 +27,15 @@ export function parseExtensionPackageRoots(value: unknown): ExtensionPackageRoot
   return typeof record.source === "string" && record.source.length > 0
     ? { ...roots, source: record.source }
     : null;
+}
+
+/** Parses package-local extension distributions keyed by their export subpath. */
+export function parseBuiltInExtensionPackageRoots(
+  value: unknown,
+  subpath: string,
+): ExtensionPackageRoots | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  return parseExtensionPackageRoots((value as Record<string, unknown>)[subpath]);
 }
 
 function parseExternalDependencies(value: unknown): readonly string[] | undefined | null {

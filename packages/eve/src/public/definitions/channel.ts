@@ -1,4 +1,8 @@
 import type { ChannelAdapter, ChannelInstrumentationMetadata } from "#channel/adapter.js";
+import {
+  createMetadataAudienceProjector,
+  type ChannelAudienceProjector,
+} from "#channel/audience.js";
 import { defaultDeliverResult } from "#channel/adapter.js";
 import {
   CHANNEL_SENTINEL,
@@ -35,7 +39,14 @@ export type {
   TurnPolicy,
 } from "#channel/types.js";
 export type { Session, SessionHandle } from "#channel/session.js";
-export type { ChannelAudience, ChannelAudienceMetadata } from "#shared/channel-audience.js";
+export type { ChannelAudience } from "#shared/channel-audience.js";
+export type {
+  AudienceCaller,
+  AudienceContext,
+  AudienceInput,
+  AudiencePrincipal,
+  ConversationEnvironment,
+} from "#shared/conversation-context.js";
 export type { SessionRespondOptions, SessionSendOptions } from "#channel/session.js";
 export type {
   ChannelFrom,
@@ -46,6 +57,13 @@ export type {
   ChannelSource,
 };
 export type { ChannelCors, ChannelCorsOptions } from "#channel/cors.js";
+export type {
+  AgentDescription,
+  AgentSkillDescription,
+  AgentSkillFileDescription,
+  AgentToolDescription,
+} from "#channel/agent-description.js";
+export type { InvokeToolFn, InvokeToolOptions, InvokeToolResult } from "#channel/invoke-tool.js";
 export { DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT, WS } from "#channel/routes.js";
 export type {
   AttachSessionFn,
@@ -155,7 +173,7 @@ type EventData<T extends UnstampedMessageStreamEvent["type"]> =
 export interface ChannelContinuationOps {
   readonly continuation?: {
     readonly token: string;
-    rekey(token: string): void;
+    alias(token: string): void;
   };
 }
 
@@ -163,7 +181,7 @@ export interface ChannelContinuationOps {
  * Channel context passed to event handlers: `TCtx` intersected with
  * {@link ChannelContinuationOps}.
  */
-export type ChannelContext<TCtx> = TCtx & ChannelContinuationOps;
+type ChannelContext<TCtx> = TCtx & ChannelContinuationOps;
 
 type ChannelEventHandler<T extends UnstampedMessageStreamEvent["type"], TCtx> = (
   data: EventData<T>,
@@ -196,7 +214,13 @@ export interface ChannelEvents<TCtx = void> {
   readonly "message.appended"?: ChannelEventHandler<"message.appended", TCtx>;
   readonly "reasoning.appended"?: ChannelEventHandler<"reasoning.appended", TCtx>;
   readonly "reasoning.completed"?: ChannelEventHandler<"reasoning.completed", TCtx>;
+  readonly "step.started"?: ChannelEventHandler<"step.started", TCtx>;
+  readonly "step.completed"?: ChannelEventHandler<"step.completed", TCtx>;
   readonly "input.requested"?: ChannelEventHandler<"input.requested", TCtx>;
+  readonly "input.resolved"?: ChannelEventHandler<"input.resolved", TCtx>;
+  readonly "task.started"?: ChannelEventHandler<"task.started", TCtx>;
+  readonly "task.settled"?: ChannelEventHandler<"task.settled", TCtx>;
+  readonly "turn.waiting"?: ChannelEventHandler<"turn.waiting", TCtx>;
   readonly "turn.failed"?: ChannelEventHandler<"turn.failed", TCtx>;
   readonly "turn.completed"?: ChannelEventHandler<"turn.completed", TCtx>;
   readonly "turn.cancelled"?: ChannelEventHandler<"turn.cancelled", TCtx>;
@@ -306,7 +330,13 @@ const channelEventTypes: Record<keyof ChannelEvents, null> = {
   "message.appended": null,
   "reasoning.appended": null,
   "reasoning.completed": null,
+  "step.started": null,
+  "step.completed": null,
   "input.requested": null,
+  "input.resolved": null,
+  "task.started": null,
+  "task.settled": null,
+  "turn.waiting": null,
   "turn.failed": null,
   "turn.completed": null,
   "turn.cancelled": null,
@@ -327,10 +357,14 @@ function buildAdapter<TState, TCtx, TReceiveTarget, TMetadata extends Record<str
   const hasFetchFile = definition.fetchFile !== undefined;
   const metadata = definition.metadata;
   const hasMetadata = metadata !== undefined;
+  const audience = definition.audience;
   const hasBehavior = hasState || hasContext || hasMetadata;
 
   const eventHandlers: Record<string, unknown> = {};
   let hasEventHandlers = false;
+  const legacyAudienceSource = {
+    kind: definition.kindHint ?? "defineChannel",
+  };
 
   const events = definition.events;
   for (const eventType of eventTypes) {
@@ -346,7 +380,7 @@ function buildAdapter<TState, TCtx, TReceiveTarget, TMetadata extends Record<str
               ? undefined
               : {
                   token: session.continuation.token,
-                  rekey: (token: string) => session.continuation?.rekey(token),
+                  alias: (token: string) => session.continuation?.alias(token),
                 },
         };
         if (eventType === "session.failed") {
@@ -364,7 +398,16 @@ function buildAdapter<TState, TCtx, TReceiveTarget, TMetadata extends Record<str
   }
 
   if (!hasBehavior && !hasEventHandlers && !hasFetchFile) {
-    return { kind: definition.kindHint ?? HTTP_ADAPTER_KIND } as ChannelAdapter<any>;
+    return {
+      kind: definition.kindHint ?? HTTP_ADAPTER_KIND,
+      ...(audience === undefined
+        ? undefined
+        : {
+            instrumentation: {
+              audience: audience as ChannelAudienceProjector,
+            },
+          }),
+    } as ChannelAdapter<any>;
   }
 
   const adapter: ChannelAdapter<any> = {
@@ -372,12 +415,31 @@ function buildAdapter<TState, TCtx, TReceiveTarget, TMetadata extends Record<str
     state: hasState ? { ...(definition.state as Record<string, unknown>) } : {},
     fetchFile: definition.fetchFile,
     instrumentation:
-      metadata === undefined
+      metadata === undefined && audience === undefined
         ? undefined
         : {
-            metadata(state): ChannelInstrumentationMetadata {
-              return metadata(state as NonNullable<TState>);
-            },
+            ...(metadata === undefined
+              ? undefined
+              : {
+                  metadata(state): ChannelInstrumentationMetadata {
+                    const projected = metadata(state as NonNullable<TState>) as Record<
+                      string,
+                      unknown
+                    >;
+                    const { audience: _ignoredAudience, ...customMetadata } = projected;
+                    return customMetadata;
+                  },
+                }),
+            ...(audience === undefined
+              ? metadata !== undefined
+                ? {
+                    audience: createMetadataAudienceProjector(
+                      legacyAudienceSource,
+                      metadata as (state: Record<string, unknown> | undefined) => unknown,
+                    ),
+                  }
+                : undefined
+              : { audience: audience as ChannelAudienceProjector }),
           },
 
     createAdapterContext(base): any {

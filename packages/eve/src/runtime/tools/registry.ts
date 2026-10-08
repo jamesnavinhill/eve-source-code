@@ -2,6 +2,12 @@ import { RuntimeRegistry } from "#internal/runtime-registry.js";
 import type { PreparedRuntimeAuthoredTool } from "#runtime/sessions/turn.js";
 import type { ResolvedToolDefinition } from "#runtime/types.js";
 import { serializeInputSchema, serializeOutputSchema } from "#tools/schema.js";
+import { AGENT_TOOL_NAME } from "#tools/framework/agent-contract.js";
+import type {
+  CompiledToolBehavior,
+  PreparedToolBehavior,
+  PreparedToolHandling,
+} from "#tools/behavior.js";
 
 /**
  * One executable authored tool tracked by the runtime-owned registry.
@@ -28,6 +34,7 @@ export async function createRuntimeToolRegistry(
     readonly tools: readonly ResolvedToolDefinition[];
   },
   input: {
+    readonly nodeId?: string;
     readonly reservedToolNames?: readonly string[];
   } = {},
 ): Promise<RuntimeToolRegistry> {
@@ -38,7 +45,7 @@ export async function createRuntimeToolRegistry(
   );
 
   for (const toolDefinition of definitions.tools) {
-    const prepared = await createPreparedRuntimeTool(toolDefinition);
+    const prepared = await createPreparedRuntimeTool(toolDefinition, input.nodeId);
     registry.register(
       toolDefinition.name,
       { definition: toolDefinition, prepared },
@@ -72,8 +79,14 @@ export function findRegisteredRuntimeTool(
 
 async function createPreparedRuntimeTool(
   definition: ResolvedToolDefinition,
+  nodeId: string | undefined,
 ): Promise<PreparedRuntimeAuthoredTool> {
+  const isSelfAgent =
+    definition.behavior?.handling?.kind === "dispatch" &&
+    definition.behavior.handling.action === "self-agent";
   return {
+    availableInSubagents: definition.availableInSubagents,
+    behavior: prepareToolBehavior(definition.behavior, nodeId),
     description: definition.description,
     inputSchema: serializeInputSchema(definition.inputSchema),
     kind: "authored-tool",
@@ -81,6 +94,42 @@ async function createPreparedRuntimeTool(
     name: definition.name,
     owner: definition.owner,
     outputSchema: serializeOutputSchema(definition.outputSchema),
+    rootOnly: isSelfAgent || undefined,
     sourceId: definition.sourceId,
+  };
+}
+
+function prepareToolBehavior(
+  behavior: CompiledToolBehavior | undefined,
+  nodeId: string | undefined,
+): PreparedToolBehavior | undefined {
+  if (behavior === undefined) return undefined;
+
+  let handling: PreparedToolHandling | undefined;
+  if (behavior.handling?.kind === "dispatch") {
+    if (nodeId === undefined) {
+      throw new Error("The self-agent tool requires a concrete runtime node id.");
+    }
+    handling = {
+      kind: "dispatch",
+      target: { kind: "self-agent-call", nodeId, subagentName: AGENT_TOOL_NAME },
+    };
+  } else if (behavior.handling?.kind === "workflow-tool") {
+    handling = {
+      kind: "dispatch",
+      target: {
+        entryPoint: behavior.handling.entryPoint,
+        kind: "workflow-tool-call",
+        workflowId: behavior.handling.workflowId,
+      },
+    };
+  } else {
+    handling = behavior.handling;
+  }
+
+  return {
+    availability: behavior.availability,
+    handling,
+    presentation: behavior.presentation,
   };
 }

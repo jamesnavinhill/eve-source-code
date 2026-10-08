@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import {
+  attachEveAgentStore,
   detachEveAgentStore,
   EveAgentStore,
   type EveAgentStoreCallbacks,
@@ -11,7 +12,8 @@ import {
 import { resolveEveAgentHost } from "#client/agent-host.js";
 import type { EveAgentReducer } from "#client/reducer.js";
 import type { ClientSession } from "#client/session.js";
-import { defaultMessageReducer, type EveMessageData } from "#client/message-reducer.js";
+import { conversationReducer } from "#client/conversation-reducer.js";
+import type { ConversationState } from "#client/conversation-state.js";
 import type { MessageStreamEvent } from "#protocol/message.js";
 import type { UserContent } from "ai";
 import type {
@@ -37,9 +39,9 @@ export type { PrepareSend };
 export type UseEveAgentStatus = EveAgentStoreStatus;
 
 /**
- * Snapshot of an eve agent session: `data` (the reducer projection), `events`
- * (the authoritative server stream), `session` (resumable cursor), `status`,
- * and `error`.
+ * Snapshot of an eve agent session: `conversation` (canonical state), `data`
+ * (the selected view), `events` (the authoritative server stream), `session`
+ * (resumable cursor), `status`, and `error`.
  */
 export type UseEveAgentSnapshot<TData> = EveAgentStoreSnapshot<TData>;
 
@@ -51,7 +53,9 @@ export interface UseEveAgentHelpers<TData> extends UseEveAgentSnapshot<TData> {
   readonly cancel: () => Promise<CancelSessionResult>;
   /** Replays the attached durable session and follows its in-flight turn, if any. */
   readonly resume: () => Promise<void>;
-  /** Resets the session: detaches any local stream, recreates the owned session, and clears events and projected data. */
+  /** Creates the session without starting its first turn. */
+  readonly prewarm: () => Promise<void>;
+  /** Resets the session: detaches any local stream and clears events and projected data. */
   readonly reset: () => void;
   /** Sends a message. While a turn is active, pass `turnPolicy: "steer"` to replace it. */
   readonly send: <TOutput = unknown>(
@@ -80,7 +84,7 @@ export interface UseEveAgentOptions<TData> extends EveAgentStoreCallbacks<TData>
    * Named agent mounted by a framework integration such as `withEve({ agents })`.
    *
    * `agent: "support"` targets same-origin routes under
-   * `/eve/agents/support/eve/v1/...`. Do not combine with `host`.
+   * `/eve/support/v1/...`. Do not combine with `host`.
    */
   readonly agent?: string;
   readonly auth?: ClientAuth;
@@ -108,6 +112,19 @@ export interface UseEveAgentOptions<TData> extends EveAgentStoreCallbacks<TData>
    * @default true
    */
   readonly optimistic?: boolean;
+  /** Follow each subagent call's session into `conversation.agents` while mounted. @default false */
+  readonly followSubagents?: boolean;
+  /**
+   * Prewarm an owned session when true. React observes this value across renders;
+   * changing it from false to true prepares the current session, and reset checks
+   * the latest rendered value before preparing the next session.
+   *
+   * Changing the value to false does not discard an existing session or abort
+   * session creation already in flight.
+   *
+   * @default false
+   */
+  readonly prewarm?: boolean;
   readonly reducer?: EveAgentReducer<TData>;
   /**
    * Replay the attached durable session after mount and follow its in-flight
@@ -120,8 +137,8 @@ export interface UseEveAgentOptions<TData> extends EveAgentStoreCallbacks<TData>
 }
 
 export function useEveAgent(
-  options?: UseEveAgentOptions<EveMessageData>,
-): UseEveAgentHelpers<EveMessageData>;
+  options?: UseEveAgentOptions<ConversationState>,
+): UseEveAgentHelpers<ConversationState>;
 
 export function useEveAgent<TData>(
   options: UseEveAgentOptions<TData> & { readonly reducer: EveAgentReducer<TData> },
@@ -131,14 +148,14 @@ export function useEveAgent<TData>(
  * React hook that drives an eve session and projects its event stream into UI data.
  *
  * Returns the current snapshot (`data`, `events`, `session`, `status`, `error`)
- * plus the commands `send`, `respond`, `resume`, `cancel`, and `reset`. With no reducer, `data` is the
- * built-in `UIMessage` projection from {@link defaultMessageReducer} (`TData`
- * is {@link EveMessageData}); pass a reducer to project into your own shape and
+ * plus the commands `prewarm`, `send`, `respond`, `resume`, `cancel`, and `reset`. With no reducer, `data` is the
+ * built-in conversation projection (including UIMessage-compatible `messages`);
+ * pass a reducer to project into your own shape and
  * infer `TData`.
  *
  * Session-shaping options (`host`, `reducer`, `session`, `initialEvents`,
- * `initialSession`, `auth`, `headers`, `optimistic`, `resume`) are
- * read once when the store is created; remount to change them. Lifecycle
+ * `initialSession`, `auth`, `headers`, `optimistic`, `resume`) are read once
+ * when the store is created; remount to change them. `prewarm` and lifecycle
  * callbacks (`onError`, `onEvent`, `onFinish`, `onSessionChange`, `prepareSend`)
  * refresh on every render.
  */
@@ -146,8 +163,11 @@ export function useEveAgent<TData>(
   options: UseEveAgentOptions<TData> = {},
 ): UseEveAgentHelpers<TData> {
   const storeRef = useRef<EveAgentStore<TData> | undefined>(undefined);
+  const mountedRef = useRef(false);
   const resumeOnMountRef = useRef(options.resume ?? false);
   const [autoResumePending, setAutoResumePending] = useState(resumeOnMountRef.current);
+  const [prewarmResetGeneration, setPrewarmResetGeneration] = useState(0);
+  const shouldPrewarm = options.prewarm ?? false;
 
   if (!storeRef.current) {
     if (
@@ -157,7 +177,7 @@ export function useEveAgent<TData>(
     ) {
       throw new Error("useEveAgent({ resume: true }) requires initialSession or session.");
     }
-    const reducer = options.reducer ?? (defaultMessageReducer() as EveAgentReducer<TData>);
+    const reducer = options.reducer ?? (conversationReducer as EveAgentReducer<TData>);
     storeRef.current = new EveAgentStore({
       auth: options.auth,
       headers: options.headers,
@@ -165,6 +185,7 @@ export function useEveAgent<TData>(
       initialEvents: options.initialEvents,
       initialSession: options.initialSession,
       optimistic: options.optimistic,
+      followSubagents: options.followSubagents,
       reducer,
       session: options.session,
     });
@@ -189,7 +210,23 @@ export function useEveAgent<TData>(
     () => store.snapshot,
   );
 
-  useEffect(() => () => detachEveAgentStore(store), [store]);
+  useEffect(() => {
+    mountedRef.current = true;
+    const timeout = setTimeout(() => attachEveAgentStore(store), 0);
+    return () => {
+      mountedRef.current = false;
+      clearTimeout(timeout);
+      // Strict Mode and Fast Refresh replay this cleanup and setup in one synchronous commit.
+      queueMicrotask(() => {
+        if (!mountedRef.current) detachEveAgentStore(store);
+      });
+    };
+  }, [store]);
+  useEffect(() => {
+    if (!shouldPrewarm) return;
+    const timeout = setTimeout(() => void store.prewarm().catch(() => {}), 0);
+    return () => clearTimeout(timeout);
+  }, [prewarmResetGeneration, shouldPrewarm, store]);
   useEffect(() => {
     if (!resumeOnMountRef.current) return;
     let active = true;
@@ -204,7 +241,11 @@ export function useEveAgent<TData>(
   }, [store]);
 
   const cancel = useCallback(() => store.cancel(), [store]);
-  const reset = useCallback(() => store.reset(), [store]);
+  const reset = useCallback(() => {
+    store.reset();
+    setPrewarmResetGeneration((generation) => generation + 1);
+  }, [store]);
+  const prewarm = useCallback(() => store.prewarm(), [store]);
   const resume = useCallback(() => store.resume(), [store]);
   const send = useCallback(
     <TOutput = unknown>(message: string | UserContent, options?: SendTurnOptions<TOutput>) => {
@@ -228,11 +269,12 @@ export function useEveAgent<TData>(
     () => ({
       ...visibleSnapshot,
       cancel,
+      prewarm,
       reset,
       respond,
       resume,
       send,
     }),
-    [cancel, reset, respond, resume, send, visibleSnapshot],
+    [cancel, prewarm, reset, respond, resume, send, visibleSnapshot],
   );
 }

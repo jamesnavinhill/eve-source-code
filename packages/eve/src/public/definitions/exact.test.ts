@@ -18,28 +18,27 @@ import {
   defineDynamic as defineDynamicInstructions,
   defineInstructions,
 } from "#public/definitions/instructions.js";
-import {
-  defineInstrumentation,
-  type ProviderDefinition,
-} from "#public/definitions/instrumentation.js";
+import { defineInstrumentation, type ProviderDefinition } from "#public/instrumentation/index.js";
 import { defineSandbox } from "#public/definitions/sandbox.js";
+import { DockerSandbox, VercelSandbox } from "#sandbox/providers.js";
 import { defineSchedule } from "#public/definitions/schedule.js";
 import { defineSkill } from "#public/definitions/skill.js";
-import {
-  defineTool,
-  type TaskReceipt,
-  type TaskExec,
-  type ToolDefinition,
-} from "#public/tools/index.js";
-import { experimental_workflow } from "#public/tools/workflow.js";
+import { defineTool, type ToolDefinition } from "#public/tools/index.js";
 
 describe("definition helper exact inputs", () => {
   it("preserves literal inference for valid definitions", () => {
     const agent = defineAgent({
       description: "type-test",
+      experimental: {
+        workflow: {
+          modelCallsPerStep: 4,
+          retention: 0,
+        },
+      },
       limits: {
         maxInputTokensPerSession: 200_000,
         maxOutputTokensPerSession: 20_000,
+        maxTokenCostUsdPerSession: 1.5,
         sessionTimeoutMs: 86_400_000,
       },
       model: "anthropic/claude-sonnet-5",
@@ -51,15 +50,29 @@ describe("definition helper exact inputs", () => {
     });
 
     expect(agent.description).toBe("type-test");
+    expect(defineAgent({ model: "openai/gpt-5.5", tool: false }).tool).toBe(false);
+    expect(agent.experimental.workflow.modelCallsPerStep).toBe(4);
+    expect(agent.experimental.workflow.retention).toBe(0);
     expect(agent.limits.maxInputTokensPerSession).toBe(200_000);
     expect(agent.limits.maxOutputTokensPerSession).toBe(20_000);
+    expect(agent.limits.maxTokenCostUsdPerSession).toBe(1.5);
     expect(agent.limits.sessionTimeoutMs).toBe(86_400_000);
-    expect(experimental_workflow({ maxSubagents: 6 }).maxSubagents).toBe(6);
     expect(schedule.cron).toBe("0 9 * * *");
   });
 
   it("accepts async-generator tool executors", () => {
     const streamedTool = defineTool({
+      label: {
+        start: () => "Build report",
+        complete(_input, output) {
+          expectTypeOf(output.phase).toEqualTypeOf<string>();
+          return `Report ${output.phase}`;
+        },
+        delta(_input, partial) {
+          expectTypeOf(partial.phase).toEqualTypeOf<string>();
+          return partial.phase;
+        },
+      },
       description: "Stream report progress.",
       inputSchema: { type: "object" },
       async *execute() {
@@ -78,6 +91,7 @@ describe("definition helper exact inputs", () => {
 
   it("preserves ordinary async tool executor return types", () => {
     const ordinaryTool = defineTool({
+      label: { start: (input) => `React with ${input.reaction}` },
       description: "React to a message.",
       inputSchema: z.object({ reaction: z.string() }),
       async execute(input) {
@@ -88,28 +102,6 @@ describe("definition helper exact inputs", () => {
     expectTypeOf<ReturnType<typeof ordinaryTool.execute>>().toEqualTypeOf<
       Promise<{ ok: boolean }>
     >();
-  });
-
-  it("types background tools in terms of the durable task capability", () => {
-    const backgroundTool = defineTool({
-      description: "Start a durable export.",
-      execution: "background",
-      inputSchema: z.object({ jobId: z.string() }),
-      execute(input, _ctx, task) {
-        expectTypeOf(task).toEqualTypeOf<TaskExec>();
-        expectTypeOf(task.binding.taskId).toEqualTypeOf<string>();
-        return task.delegated({
-          executor: { data: { jobId: input.jobId }, kind: "export" },
-          receipt: { jobId: input.jobId },
-        });
-      },
-    });
-
-    expectTypeOf(backgroundTool.execution).toEqualTypeOf<"background">();
-    expectTypeOf<Parameters<NonNullable<typeof backgroundTool.toModelOutput>>[0]>().toEqualTypeOf<
-      TaskReceipt<{ jobId: string }>
-    >();
-    expect(backgroundTool.execution).toBe("background");
   });
 
   it("infers tool input from Zod 3 schemas", () => {
@@ -131,16 +123,6 @@ describe("definition helper exact inputs", () => {
 });
 
 function typeOnlyFixtures(): void {
-  defineTool({
-    description: "Invalid streaming background tool.",
-    // @ts-expect-error Background executors settle once; streamed output is unsupported.
-    execution: "background",
-    inputSchema: { type: "object" },
-    async *execute() {
-      yield { status: "working" };
-    },
-  });
-
   defineDynamic({
     // @ts-expect-error defineDynamic is resolver-only.
     fallback: "anthropic/claude-sonnet-5",
@@ -229,15 +211,10 @@ function typeOnlyFixtures(): void {
 
   defineAgent({
     limits: {
-      // @ts-expect-error Workflow fan-out is configured by experimental_workflow.
+      // @ts-expect-error Generated-program fan-out is configured by the workflow factory.
       maxSubagents: 6,
     },
     model: "anthropic/claude-sonnet-5",
-  });
-
-  experimental_workflow({
-    // @ts-expect-error Workflow maxSubagents must be a number.
-    maxSubagents: "6",
   });
 
   const agentWithName = {
@@ -286,45 +263,26 @@ function typeOnlyFixtures(): void {
   });
 
   defineInstrumentation({
-    isEnabled: true,
+    // @ts-expect-error Content capture is configured through tracePolicy.
     recordInputs: true,
   });
 
-  // Unlike the helpers above, `defineInstrumentation` takes a generic union — a
-  // config and a provider overlap on `events` and `setup` — so it cannot use
-  // `ExactDefinition`. Excess keys reach `eve build` instead.
-  const instrumentationWithEnabled = {
-    isEnabled: true,
-    recordInputs: true,
+  const providerWithCapture: ProviderDefinition = {
+    // @ts-expect-error Content capture is configured through tracePolicy.
+    capture: "content",
   };
-  defineInstrumentation(instrumentationWithEnabled);
-
-  defineInstrumentation({
-    events: {
-      "step.started"(input) {
-        const sessionId: string = input.session.id;
-        return { runtimeContext: { "test.session_id": sessionId } };
-      },
-    },
-  });
-
-  const providerWithCapture: ProviderDefinition = { capture: "content" };
   void providerWithCapture;
 
   defineInstrumentation({
-    // @ts-expect-error Instrumentation event hooks are authored through `events`.
-    runtimeContext: {
-      "step.started"() {
-        return { runtimeContext: {} };
-      },
-    },
+    // @ts-expect-error OpenTelemetry settings are configured with otel().
+    functionId: "support",
   });
 
   defineInstrumentation({
-    // @ts-expect-error Instrumentation event hooks are authored through `events`.
-    metadata: {
-      "step.started"() {
-        return { runtimeContext: { "test.session_id": "test-session" } };
+    events: {
+      "turn.started"(event) {
+        const sessionId: string = event.sessionId;
+        void sessionId;
       },
     },
   });
@@ -455,40 +413,20 @@ function typeOnlyFixtures(): void {
     },
   });
 
-  defineSandbox({
-    async onSession({ ctx, use }) {
-      const sessionId: string = ctx.session.id;
-      // @ts-expect-error Sandbox lifecycle access is unavailable during session initialization.
-      void ctx.getSandbox;
-      // @ts-expect-error Skill access is unavailable during session initialization.
-      void ctx.getSkill;
-      const sandbox = await use();
-      // @ts-expect-error Runtime lifecycle access is unavailable during session initialization.
-      void sandbox.delete;
-      void sandbox;
-      void sessionId;
-    },
+  const environment = VercelSandbox.environment();
+  defineSandbox(async ({ session }) => {
+    const sandbox = await environment.open({
+      mounts: {},
+      networkPolicy: "deny-all",
+      resources: { vcpus: 4 },
+    });
+    const sessionId: string = session.id;
+    await sandbox.setNetworkPolicy("allow-all");
+    void sessionId;
+    return sandbox;
   });
-
-  defineSandbox({
-    async bootstrap({ use }) {
-      const sandbox = await use();
-      void sandbox;
-    },
-  });
-
-  defineSandbox({
-    revalidationKey: () => "bootstrap-v1",
-    async bootstrap({ use }) {
-      const sandbox = await use();
-      void sandbox;
-    },
-  });
-
-  // @ts-expect-error Sandbox revalidation keys are only valid with bootstrap.
-  defineSandbox({
-    revalidationKey: () => "unused",
-  });
+  const dockerEnvironment = DockerSandbox.environment();
+  defineSandbox(() => dockerEnvironment.open({ networkPolicy: "deny-all" }));
 
   defineTool({
     description: "Fetch current weather for a city.",

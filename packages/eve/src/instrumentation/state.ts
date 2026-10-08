@@ -1,8 +1,10 @@
 import { contextStorage, loadContext } from "#context/container.js";
 import { ContextKey } from "#context/key.js";
-import { ActiveChannelDeliveriesKey } from "#context/keys.js";
 import { type JsonValue, parseJsonValue } from "#shared/json.js";
 import type { InstrumentationAttemptScope } from "#instrumentation/lifecycle.js";
+import { SERIALIZED_INSTRUMENTATION_STATE_KEYS } from "#shared/serialized-observability-state.js";
+
+export { preserveSerializedInstrumentationState } from "#shared/serialized-observability-state.js";
 
 /**
  * What every provider has staged, flattened into one durable slot.
@@ -26,15 +28,20 @@ export interface InstrumentationStateOwner {
 }
 
 type InstrumentationStateMap = Readonly<Record<string, InstrumentationStateRecord>>;
+interface InstrumentationActionState {
+  readonly toolCall?: import("#instrumentation/lifecycle.js").InstrumentationToolCallStartedEvent;
+  readonly scope: InstrumentationAttemptScope;
+}
+type InstrumentationActionStateMap = Readonly<Record<string, InstrumentationActionState>>;
 type InstrumentationScopeMap = Readonly<Record<string, InstrumentationAttemptScope>>;
 
 /**
  * Provider state lives in serialized Workflow context, not in the harness, so a
- * value staged by `action.started` in one process is still there when
- * `action.completed` runs in another.
+ * value staged by `tool.call.started` in one process is still there when
+ * `tool.call.completed` runs in another.
  */
 const InstrumentationStateKey = new ContextKey<InstrumentationStateMap>(
-  "eve.harness.instrumentationState",
+  SERIALIZED_INSTRUMENTATION_STATE_KEYS.providerState,
   {
     codec: {
       deserialize: deserializeState,
@@ -43,18 +50,18 @@ const InstrumentationStateKey = new ContextKey<InstrumentationStateMap>(
   },
 );
 
-const InstrumentationActionScopeKey = new ContextKey<InstrumentationScopeMap>(
-  "eve.harness.instrumentationActionScopes",
+const InstrumentationActionStateKey = new ContextKey<InstrumentationActionStateMap>(
+  SERIALIZED_INSTRUMENTATION_STATE_KEYS.actionScopes,
   {
     codec: {
-      deserialize: deserializeScopes,
+      deserialize: deserializeActionStates,
       serialize: (state) => state,
     },
   },
 );
 
 const InstrumentationInputScopeKey = new ContextKey<InstrumentationScopeMap>(
-  "eve.harness.instrumentationInputScopes",
+  SERIALIZED_INSTRUMENTATION_STATE_KEYS.inputScopes,
   {
     codec: {
       deserialize: deserializeScopes,
@@ -62,24 +69,6 @@ const InstrumentationInputScopeKey = new ContextKey<InstrumentationScopeMap>(
     },
   },
 );
-
-/** Keeps only provider state needed to settle an interrupted operation. */
-export function preserveSerializedInstrumentationState(
-  original: Record<string, unknown>,
-  interrupted: Record<string, unknown>,
-): Record<string, unknown> {
-  let preserved = original;
-  for (const key of [
-    InstrumentationStateKey,
-    InstrumentationActionScopeKey,
-    InstrumentationInputScopeKey,
-    ActiveChannelDeliveriesKey,
-  ]) {
-    const state = interrupted[key.name];
-    if (state !== undefined) preserved = { ...preserved, [key.name]: state };
-  }
-  return preserved;
-}
 
 /** One provider's view of its own state for one operation. */
 export interface InstrumentationStateSlot {
@@ -88,7 +77,7 @@ export interface InstrumentationStateSlot {
   set(value: JsonValue | undefined): void;
 }
 
-export interface InstrumentationStateLease extends InstrumentationStateSlot {
+interface InstrumentationStateLease extends InstrumentationStateSlot {
   /** Makes later reads empty and writes no-ops. */
   revoke(): void;
 }
@@ -203,10 +192,11 @@ function releaseMatchingInstrumentationState(
 export function rememberInstrumentationActionScope(
   idempotencyKey: string,
   scope: InstrumentationAttemptScope,
+  toolCall?: InstrumentationActionState["toolCall"],
 ): void {
-  writeContextKey(InstrumentationActionScopeKey, (state) => ({
+  writeContextKey(InstrumentationActionStateKey, (state) => ({
     ...state,
-    [idempotencyKey]: scope,
+    [idempotencyKey]: { scope, toolCall },
   }));
 }
 
@@ -235,7 +225,8 @@ export function takeInstrumentationInputScope(
   return scope;
 }
 
-export interface InstrumentationActionCorrelation {
+interface InstrumentationActionCorrelation {
+  readonly toolCall?: InstrumentationActionState["toolCall"];
   readonly idempotencyKey: string;
   readonly scope: InstrumentationAttemptScope;
 }
@@ -244,12 +235,13 @@ export function findInstrumentationActionScopeForCall(
   sessionId: string,
   callId: string,
 ): InstrumentationActionCorrelation | undefined {
-  const scopes = contextStorage.getStore()?.get(InstrumentationActionScopeKey);
-  if (scopes === undefined) return undefined;
-  for (const candidate of Object.values(scopes)) {
-    const idempotencyKey = `action:${sessionId}:${candidate.turnId}:${callId}`;
-    const scope = scopes[idempotencyKey];
-    if (scope !== undefined) return { idempotencyKey, scope };
+  const actions = contextStorage.getStore()?.get(InstrumentationActionStateKey);
+  if (actions === undefined) return undefined;
+  for (const candidate of Object.values(actions)) {
+    const idempotencyKey = `action:${sessionId}:${candidate.scope.turnId}:${callId}`;
+    const action = actions[idempotencyKey];
+    if (action !== undefined)
+      return { idempotencyKey, scope: action.scope, toolCall: action.toolCall };
   }
   return undefined;
 }
@@ -261,11 +253,7 @@ export function takeInstrumentationActionScopeForCall(
 ): InstrumentationActionCorrelation | undefined {
   const correlation = findInstrumentationActionScopeForCall(sessionId, callId);
   if (correlation === undefined) return undefined;
-  writeContextKey(InstrumentationActionScopeKey, (state) => {
-    const next = { ...state };
-    delete next[correlation.idempotencyKey];
-    return next;
-  });
+  releaseInstrumentationActionCorrelation(correlation.idempotencyKey);
   return correlation;
 }
 
@@ -274,22 +262,35 @@ export function takeInstrumentationActionScopes(
   sessionId: string,
   turnId?: string,
 ): readonly InstrumentationActionCorrelation[] {
-  const current = contextStorage.getStore()?.get(InstrumentationActionScopeKey);
+  const current = contextStorage.getStore()?.get(InstrumentationActionStateKey);
   if (current === undefined) return [];
   const correlations = Object.entries(current)
     .filter(
-      ([, scope]) =>
-        scope.sessionId === sessionId && (turnId === undefined || scope.turnId === turnId),
+      ([, action]) =>
+        action.scope.sessionId === sessionId &&
+        (turnId === undefined || action.scope.turnId === turnId),
     )
-    .map(([idempotencyKey, scope]) => ({ idempotencyKey, scope }));
+    .map(([idempotencyKey, action]) => ({
+      idempotencyKey,
+      scope: action.scope,
+      toolCall: action.toolCall,
+    }));
   if (correlations.length === 0) return [];
   const keys = new Set(correlations.map((correlation) => correlation.idempotencyKey));
-  writeContextKey(InstrumentationActionScopeKey, (state) => {
+  writeContextKey(InstrumentationActionStateKey, (state) => {
     const next = { ...state };
     for (const key of keys) delete next[key];
     return next;
   });
   return correlations;
+}
+
+function releaseInstrumentationActionCorrelation(idempotencyKey: string): void {
+  writeContextKey(InstrumentationActionStateKey, (state) => {
+    const next = { ...state };
+    delete next[idempotencyKey];
+    return next;
+  });
 }
 
 function writeSlot(
@@ -368,4 +369,24 @@ function cloneAndFreezeJson(value: JsonValue): JsonValue {
 function deserializeScopes(data: unknown): InstrumentationScopeMap {
   if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
   return data as InstrumentationScopeMap;
+}
+
+function deserializeActionStates(data: unknown): InstrumentationActionStateMap {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
+  const actions: Record<string, InstrumentationActionState> = {};
+  for (const [idempotencyKey, value] of Object.entries(data)) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+    const record = value as Record<string, unknown>;
+    const scope =
+      typeof record["scope"] === "object" &&
+      record["scope"] !== null &&
+      !Array.isArray(record["scope"])
+        ? (record["scope"] as InstrumentationAttemptScope)
+        : (value as InstrumentationAttemptScope);
+    actions[idempotencyKey] = {
+      scope,
+      toolCall: record.toolCall as InstrumentationActionState["toolCall"],
+    };
+  }
+  return actions;
 }

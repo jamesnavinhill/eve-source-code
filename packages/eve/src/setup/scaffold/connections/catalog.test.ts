@@ -1,15 +1,12 @@
 import { describe, expect, test } from "vitest";
 
 import {
-  canonicalConnectorNameForEntry,
   catalogSlugs,
   CONNECTION_CATALOG,
-  connectorServiceForEntry,
   effectiveProtocols,
   endpointForProtocol,
   getCatalogEntry,
   isValidConnectionSlug,
-  mcpServiceHost,
   SUPPORTED_PROTOCOLS,
 } from "./catalog.js";
 import { connectionEntries } from "@eve/catalog";
@@ -34,10 +31,13 @@ describe("catalog integrity", () => {
     expect(new Set(slugs).size).toBe(slugs.length);
   });
 
-  test("every curated entry authenticates via Connect", () => {
-    for (const entry of CONNECTION_CATALOG) {
-      expect(entry.auth.kind).toBe("connect");
-    }
+  test("includes Browser Use with static API-key authentication", () => {
+    expect(getCatalogEntry("browser-use")).toMatchObject({
+      auth: {
+        kind: "header",
+        headers: [{ header: "x-browser-use-api-key", envVar: "BROWSER_USE_API_KEY" }],
+      },
+    });
   });
 
   test("gallery-only connections stay out of the scaffolder catalog", () => {
@@ -48,68 +48,11 @@ describe("catalog integrity", () => {
     expect(connectionEntries().length).toBeGreaterThan(scaffoldable.length);
   });
 
-  test("every Connect entry resolves a `vercel connect create` service", () => {
+  test("every Connect entry names the connector its scaffold references", () => {
     for (const entry of CONNECTION_CATALOG) {
-      expect(connectorServiceForEntry(entry)).toBeTruthy();
-      expect(canonicalConnectorNameForEntry(entry)).toBeTruthy();
+      if (entry.auth.kind !== "connect") continue;
+      expect(entry.auth.connector.trim()).not.toBe("");
     }
-  });
-});
-
-describe("connectorServiceForEntry", () => {
-  test("prefers the explicit service over the MCP endpoint", () => {
-    expect(
-      connectorServiceForEntry({
-        mcp: { url: "https://mcp.example.com/sse" },
-        auth: { kind: "connect", connector: "x", service: "explicit.example" },
-      }),
-    ).toBe("explicit.example");
-  });
-
-  test("falls back to the MCP host when no service is set", () => {
-    expect(
-      connectorServiceForEntry({
-        mcp: { url: "https://mcp.example.com/sse" },
-        auth: { kind: "connect", connector: "x" },
-      }),
-    ).toBe("mcp.example.com");
-  });
-
-  test("returns undefined for non-connect auth", () => {
-    expect(
-      connectorServiceForEntry({ auth: { kind: "bearer-env", envVar: "TOKEN" } }),
-    ).toBeUndefined();
-  });
-});
-
-describe("canonicalConnectorNameForEntry", () => {
-  test("uses the configured connector name without inferring a UID namespace", () => {
-    expect(canonicalConnectorNameForEntry(getCatalogEntry("notion")!)).toBe("notion");
-    expect(
-      canonicalConnectorNameForEntry({
-        auth: { kind: "connect", connector: "custom", service: "mcp.example.com/mcp" },
-      }),
-    ).toBe("custom");
-  });
-});
-
-describe("curated Connect services", () => {
-  test("uses the provider's managed service identifier", () => {
-    expect(connectorServiceForEntry(getCatalogEntry("linear")!)).toBe("mcp.linear.app");
-    expect(connectorServiceForEntry(getCatalogEntry("notion")!)).toBe("mcp.notion.com");
-    expect(connectorServiceForEntry(getCatalogEntry("datadog")!)).toBe("mcp.datadoghq.com");
-    expect(connectorServiceForEntry(getCatalogEntry("honeycomb")!)).toBe("mcp.honeycomb.io");
-  });
-});
-
-describe("mcpServiceHost", () => {
-  test("extracts the host from a URL", () => {
-    expect(mcpServiceHost("https://mcp.linear.app/mcp")).toBe("mcp.linear.app");
-  });
-
-  test("returns undefined for missing or unparseable input", () => {
-    expect(mcpServiceHost(undefined)).toBeUndefined();
-    expect(mcpServiceHost("not a url")).toBeUndefined();
   });
 });
 

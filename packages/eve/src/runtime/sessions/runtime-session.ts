@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
+import type { DescribedAgent } from "#channel/agent-description.js";
 import type { BundledCompiledArtifacts } from "#runtime/loaders/bundled-artifacts.js";
 import type { CompiledRuntimeAgentBundle } from "#runtime/sessions/compiled-agent-cache.js";
 
@@ -33,6 +34,15 @@ export interface RuntimeSession {
    * changes.
    */
   readonly bundleCacheKeyBySourceKey: Map<string, string>;
+  /**
+   * Agents as channel routes describe them, keyed by the stable source key
+   * and tagged with the versioned cache key they were loaded under, so a
+   * recompile under the same app root replaces the entry.
+   */
+  readonly describedAgents: Map<
+    string,
+    { readonly agent: Promise<DescribedAgent>; readonly version: string }
+  >;
 }
 
 /**
@@ -43,8 +53,52 @@ export function createRuntimeSession(id: string = "test-session"): RuntimeSessio
     bundleCache: new Map(),
     bundleCacheKeyBySourceKey: new Map(),
     compiledArtifacts: null,
+    describedAgents: new Map(),
     id,
   };
+}
+
+export function setRuntimeSessionCompiledArtifacts(
+  session: RuntimeSession,
+  input: BundledCompiledArtifacts,
+): void {
+  const installed = session.compiledArtifacts;
+  const snapshotChanged = installed === null || !isSameCompiledArtifactSnapshot(installed, input);
+
+  // Resolved bundles and described agents retain references into the
+  // installed snapshot, so a replacement must not inherit caches populated
+  // by the prior deployment.
+  if (snapshotChanged) {
+    session.bundleCache.clear();
+    session.bundleCacheKeyBySourceKey.clear();
+    session.describedAgents.clear();
+  }
+
+  session.compiledArtifacts = input;
+}
+
+function isSameCompiledArtifactSnapshot(
+  installed: BundledCompiledArtifacts,
+  input: BundledCompiledArtifacts,
+): boolean {
+  const installedSourceGraphHash = installed.metadata?.discovery.sourceGraphHash;
+  const inputSourceGraphHash = input.metadata?.discovery.sourceGraphHash;
+
+  // Equivalent bootstrap modules do not share object identity, but the
+  // compiler fingerprint is stable across their copies.
+  if (installedSourceGraphHash && inputSourceGraphHash) {
+    return (
+      installedSourceGraphHash === inputSourceGraphHash &&
+      JSON.stringify(installed.sandboxPreparedArtifacts) ===
+        JSON.stringify(input.sandboxPreparedArtifacts)
+    );
+  }
+
+  return (
+    installed.manifest === input.manifest &&
+    installed.moduleMap === input.moduleMap &&
+    installed.metadata === input.metadata
+  );
 }
 
 /**

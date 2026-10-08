@@ -24,6 +24,18 @@ import {
 } from "#instrumentation/state.js";
 
 const { logDebug, logWarn } = vi.hoisted(() => ({ logDebug: vi.fn(), logWarn: vi.fn() }));
+
+const traceContext = (
+  agentName = "test-agent",
+  audience: "public" | "private" | "unknown" = "unknown",
+) => ({
+  agentName,
+  audience,
+  channel: { kind: "http" as const },
+  environment: "production" as const,
+  principalType: "anonymous",
+});
+
 vi.mock("#internal/logging.js", () => ({
   createLogger: () => ({ debug: logDebug, warn: logWarn }),
   formatError: (error: unknown) => error,
@@ -32,10 +44,7 @@ vi.mock("#internal/logging.js", () => ({
 function createInstrumentationHooks(
   ...args: Parameters<typeof createUnboundInstrumentationHooks>
 ): ReturnType<typeof createUnboundInstrumentationHooks> {
-  return createUnboundInstrumentationHooks(...args).forTrace!({
-    agentName: "test-agent",
-    audience: "unknown",
-  });
+  return createUnboundInstrumentationHooks(...args).forTrace!(traceContext());
 }
 
 const scope: InstrumentationAttemptScope = {
@@ -75,13 +84,16 @@ describe("instrumentation idempotency keys", () => {
   });
 
   it("derives model identity without an AI SDK call ID", () => {
-    expect(modelCallIdempotencyKey(scope, 2)).toBe("model:session-1:turn-1:0:0:2");
+    expect(modelCallIdempotencyKey(scope, 2, 0)).toBe("model:session-1:turn-1:0:0:2:0");
+    expect(modelCallIdempotencyKey(scope, 2, 0)).not.toBe(modelCallIdempotencyKey(scope, 2, 1));
   });
 
   it("separates model attempts and SDK tool calls", () => {
     const retry = { ...scope, attemptId: "session-1:turn-1:0:1", attemptIndex: 1 };
     expect(attemptIdempotencyKey(scope)).not.toBe(attemptIdempotencyKey(retry));
-    expect(modelCallIdempotencyKey(scope, 0)).not.toBe(toolCallIdempotencyKey(scope, "call-1", 0));
+    expect(modelCallIdempotencyKey(scope, 0, 0)).not.toBe(
+      toolCallIdempotencyKey(scope, "call-1", 0),
+    );
   });
 });
 
@@ -196,7 +208,7 @@ describe("provider state lifecycle", () => {
   });
 
   it("releases unterminated model state when its attempt ends", async () => {
-    const modelKey = modelCallIdempotencyKey(scope, 0);
+    const modelKey = modelCallIdempotencyKey(scope, 0, 0);
     const hooks = createInstrumentationHooks([
       {
         events: { "model.call.started": (_event, ctx) => ctx.state.set("open") },
@@ -221,7 +233,7 @@ describe("provider state lifecycle", () => {
   });
 
   it("releases attempt-owned state after its provider is removed", async () => {
-    const modelKey = modelCallIdempotencyKey(scope, 0);
+    const modelKey = modelCallIdempotencyKey(scope, 0, 0);
     const starts = createInstrumentationHooks([
       {
         events: { "model.call.started": (_event, ctx) => ctx.state.set("open") },
@@ -250,7 +262,7 @@ describe("provider state lifecycle", () => {
     const actionKey = actionIdempotencyKey(scope.sessionId, scope.turnId, "call-1");
     const hooks = createInstrumentationHooks([
       {
-        events: { "action.started": (_event, ctx) => ctx.state.set("open") },
+        events: { "tool.call.started": (_event, ctx) => ctx.state.set("open") },
         name: "sink",
       },
     ]);
@@ -260,9 +272,9 @@ describe("provider state lifecycle", () => {
         idempotencyKey: actionKey,
         input: {},
         kind: "tool-call",
-        name: "tool",
+        toolName: "tool",
         scope,
-        type: "action.started",
+        type: "tool.call.started",
       });
       await hooks.publish({
         idempotencyKey: attemptIdempotencyKey(scope),
@@ -279,8 +291,8 @@ describe("provider state lifecycle", () => {
     const hooks = createInstrumentationHooks([
       {
         events: {
-          "action.failed": failed,
-          "action.started": (_event, ctx) => ctx.state.set("open"),
+          "tool.call.failed": failed,
+          "tool.call.started": (_event, ctx) => ctx.state.set("open"),
         },
         name: "sink",
       },
@@ -292,9 +304,9 @@ describe("provider state lifecycle", () => {
         idempotencyKey: actionKey,
         input: {},
         kind: "tool-call",
-        name: "tool",
+        toolName: "tool",
         scope,
-        type: "action.started",
+        type: "tool.call.started",
       });
       await hooks.publish({
         idempotencyKey: turnIdempotencyKey(scope.sessionId, scope.turnId),
@@ -309,7 +321,7 @@ describe("provider state lifecycle", () => {
     expect(failed.mock.calls[0]?.[0]).toMatchObject({
       errorCode: "ACTION_CANCELLED",
       outcome: "cancelled",
-      type: "action.failed",
+      type: "tool.call.failed",
     });
   });
 });
@@ -522,7 +534,7 @@ describe("provider dispatch groups", () => {
     const observed: unknown[] = [];
     const mutableScope = { ...scope };
     const event: InstrumentationModelCallStartedEvent = {
-      idempotencyKey: modelCallIdempotencyKey(mutableScope, 0),
+      idempotencyKey: modelCallIdempotencyKey(mutableScope, 0, 0),
       input: { messages: [{ content: "private", role: "user" }] },
       model: { modelId: "model", provider: "test" },
       scope: mutableScope,
@@ -579,7 +591,7 @@ describe("provider dispatch groups", () => {
 
     await contextStorage.run(new ContextContainer(), async () => {
       await hooks.publish({
-        idempotencyKey: modelCallIdempotencyKey(sharedScope, 0),
+        idempotencyKey: modelCallIdempotencyKey(sharedScope, 0, 0),
         input: { messages: [] },
         model: { modelId: "model", provider: "test" },
         scope: sharedScope,
@@ -588,7 +600,7 @@ describe("provider dispatch groups", () => {
       await hooks.publish({
         content: [],
         finishReason: "stop",
-        idempotencyKey: modelCallIdempotencyKey(sharedScope, 0),
+        idempotencyKey: modelCallIdempotencyKey(sharedScope, 0, 0),
         scope: sharedScope,
         type: "model.call.completed",
         usage: {},
@@ -835,12 +847,8 @@ describe("trace policies", () => {
   it("defaults provider content to the audience-aware policy", () => {
     const hooks = createInstrumentationHooks([{ name: "provider" }]);
 
-    expect(hooks.forTrace?.({ agentName: "weather", audience: "public" }).capturesContent).toBe(
-      true,
-    );
-    expect(hooks.forTrace?.({ agentName: "weather", audience: "private" }).capturesContent).toBe(
-      false,
-    );
+    expect(hooks.forTrace?.(traceContext("weather", "public")).capturesContent).toBe(true);
+    expect(hooks.forTrace?.(traceContext("weather", "private")).capturesContent).toBe(false);
   });
 
   it("passes trace context to each provider policy", () => {
@@ -850,11 +858,7 @@ describe("trace policies", () => {
       recordOutputs: false,
     }));
     const hooks = createInstrumentationHooks([{ name: "provider", tracePolicy }]);
-    const trace = {
-      agentName: "weather",
-      audience: "private" as const,
-      channelType: "slack",
-    };
+    const trace = traceContext("weather", "private");
 
     tracePolicy.mockClear();
     expect(hooks.forTrace?.(trace).capturesContent).toBe(true);
@@ -888,20 +892,20 @@ describe("trace policies", () => {
     const observed = vi.fn();
     const hooks = createInstrumentationHooks([
       {
-        events: { "action.started": observed },
+        events: { "tool.call.started": observed },
         name: "private-audit",
         tracePolicy: () => ({ emit: true, recordInputs: true, recordOutputs: false }),
       },
-    ]).forTrace!({ agentName: "weather", audience: "private" });
+    ]).forTrace!(traceContext("weather", "private"));
 
     await hooks.publish({
       callId: "call-1",
       idempotencyKey: actionIdempotencyKey(scope.sessionId, scope.turnId, "call-1"),
       input: { secret: "private" },
       kind: "tool-call",
-      name: "weather",
+      toolName: "weather",
       scope,
-      type: "action.started",
+      type: "tool.call.started",
     });
 
     expect(observed.mock.calls[0]?.[0].input).toEqual({ secret: "private" });
@@ -925,7 +929,7 @@ describe("trace policies", () => {
         name: "outputs",
         tracePolicy: () => ({ emit: true, recordInputs: false, recordOutputs: true }),
       },
-    ]).forTrace!({ agentName: "weather", audience: "public" });
+    ]).forTrace!(traceContext("weather", "public"));
 
     await hooks.publish({
       idempotencyKey: "model-1",
@@ -967,7 +971,7 @@ describe("trace policies", () => {
         name: "inputs-only",
         tracePolicy: () => ({ emit: true, recordInputs: true, recordOutputs: false }),
       },
-    ]).forTrace!({ agentName: "weather", audience: "public" });
+    ]).forTrace!(traceContext("weather", "public"));
 
     await hooks.publish({
       error,
@@ -990,22 +994,8 @@ describe("trace policies", () => {
       ]).capturesContent,
     ).toBe(false);
     expect(
-      createUnboundInstrumentationHooks([{ capture: "content", name: "legacy" }]).capturesContent,
-    ).toBe(false);
-    expect(
-      createUnboundInstrumentationHooks([
-        {
-          capture: "content",
-          name: "explicit-policy",
-          tracePolicy: () => ({ emit: true, recordInputs: false, recordOutputs: false }),
-        },
-      ]).capturesContent,
-    ).toBe(false);
-    expect(
-      createInstrumentationHooks([{ name: "quiet" }]).forTrace!({
-        agentName: "weather",
-        audience: "private",
-      }).capturesContent,
+      createInstrumentationHooks([{ name: "quiet" }]).forTrace!(traceContext("weather", "private"))
+        .capturesContent,
     ).toBe(false);
     expect(
       createInstrumentationHooks([
@@ -1017,7 +1007,7 @@ describe("trace policies", () => {
           name: "also-quiet",
           tracePolicy: () => ({ emit: true, recordInputs: false, recordOutputs: false }),
         },
-      ]).forTrace!({ agentName: "weather", audience: "public" }).capturesContent,
+      ]).forTrace!(traceContext("weather", "public")).capturesContent,
     ).toBe(false);
     expect(
       createInstrumentationHooks([
@@ -1026,7 +1016,7 @@ describe("trace policies", () => {
           name: "loud",
           tracePolicy: () => ({ emit: true, recordInputs: true, recordOutputs: true }),
         },
-      ]).forTrace!({ agentName: "weather", audience: "public" }).capturesContent,
+      ]).forTrace!(traceContext("weather", "public")).capturesContent,
     ).toBe(true);
     expect(
       createInstrumentationHooks({
@@ -1036,7 +1026,7 @@ describe("trace policies", () => {
             tracePolicy: () => ({ emit: true, recordInputs: true, recordOutputs: true }),
           },
         ],
-      }).forTrace!({ agentName: "weather", audience: "public" }).capturesContent,
+      }).forTrace!(traceContext("weather", "public")).capturesContent,
     ).toBe(true);
   });
 
@@ -1048,7 +1038,7 @@ describe("trace policies", () => {
         name: "dropped",
         tracePolicy: () => false,
       },
-    ]).forTrace!({ agentName: "weather", audience: "public" });
+    ]).forTrace!(traceContext("weather", "public"));
 
     await hooks.publish({
       idempotencyKey: turnIdempotencyKey("session-1", "turn-1"),
@@ -1079,8 +1069,8 @@ describe("trace policies", () => {
         tracePolicy: () => ({ emit: true, recordInputs: false, recordOutputs: false }),
       },
     ]);
-    const hooks = unboundHooks.forTrace!({ agentName: "weather", audience: "public" });
-    unboundHooks.forTrace!({ agentName: "weather", audience: "private" });
+    const hooks = unboundHooks.forTrace!(traceContext("weather", "public"));
+    unboundHooks.forTrace!(traceContext("weather", "private"));
 
     await hooks.publish({
       idempotencyKey: turnIdempotencyKey("session-1", "turn-1"),
@@ -1114,7 +1104,7 @@ describe("trace policies", () => {
         events: { "step.attempt.metadata": wantsContent },
         name: "content",
       },
-    ]).forTrace!({ agentName: "weather", audience: "private" });
+    ]).forTrace!(traceContext("weather", "private"));
     const providerMetadata = {
       gateway: {
         cost: "0.01",
@@ -1147,13 +1137,13 @@ describe("trace policies", () => {
     const metadataOnly = vi.fn();
     const wantsContent = vi.fn();
     const hooks = createInstrumentationHooks([
-      { events: { "action.failed": metadataOnly }, name: "metadata" },
+      { events: { "tool.call.failed": metadataOnly }, name: "metadata" },
       {
-        events: { "action.failed": wantsContent },
+        events: { "tool.call.failed": wantsContent },
         name: "content",
         tracePolicy: () => ({ emit: true, recordInputs: true, recordOutputs: true }),
       },
-    ]).forTrace!({ agentName: "weather", audience: "private" });
+    ]).forTrace!(traceContext("weather", "private"));
     const error = { output: "private tool output", requestBody: "private request" };
     const actionScope = { ...scope };
 
@@ -1163,14 +1153,14 @@ describe("trace policies", () => {
       idempotencyKey: actionIdempotencyKey(scope.sessionId, scope.turnId, "call-1"),
       outcome: "failed",
       scope: actionScope,
-      type: "action.failed",
+      type: "tool.call.failed",
     });
 
     expect(metadataOnly.mock.calls[0]?.[0]).toMatchObject({
       error: undefined,
       errorCode: "SUBAGENT_EXECUTION_FAILED",
       outcome: "failed",
-      type: "action.failed",
+      type: "tool.call.failed",
     });
     expect(Object.isFrozen(metadataOnly.mock.calls[0]?.[0])).toBe(true);
     expect(wantsContent.mock.calls[0]?.[0].error).toEqual(error);
@@ -1181,7 +1171,7 @@ describe("trace policies", () => {
   it("keeps action outcome and usage when output content is withheld", async () => {
     const metadataOnly = vi.fn();
     const hooks = createInstrumentationHooks([
-      { events: { "action.completed": metadataOnly }, name: "metadata" },
+      { events: { "tool.call.completed": metadataOnly }, name: "metadata" },
     ]);
     await hooks.publish({
       acceptedAtMs: 1_234,
@@ -1189,7 +1179,7 @@ describe("trace policies", () => {
       outcome: "completed",
       output: { output: "private result", type: "result" },
       scope,
-      type: "action.completed",
+      type: "tool.call.completed",
       usage: { inputTokens: 10, outputTokens: 5 },
     });
 
@@ -1220,7 +1210,7 @@ describe("trace policies", () => {
         },
         name: "content",
       },
-    ]).forTrace!({ agentName: "weather", audience: "private" });
+    ]).forTrace!(traceContext("weather", "private"));
     const idempotencyKey = inputIdempotencyKey(scope.sessionId, scope.turnId, "request-1");
 
     await hooks.publish({
@@ -1272,7 +1262,7 @@ describe("trace policies", () => {
           name: "content",
         },
       ],
-    }).forTrace!({ agentName: "weather", audience: "private" });
+    }).forTrace!(traceContext("weather", "private"));
 
     const event = {
       idempotencyKey: toolCallIdempotencyKey(scope, "call-1", 0),

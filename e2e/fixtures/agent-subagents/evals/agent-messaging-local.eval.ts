@@ -5,7 +5,7 @@ const MEMORABLE_FACT = "The observatory locker code is ORBIT-CEDAR-7319.";
 /**
  * Cross-turn continuation of a local child: turn one delegates a fact to the
  * built-in agent subagent and lets it park; turn two re-messages the same
- * child via its agentId. The fact can only come back if the child's session
+ * child via its taskId. The fact can only come back if the child's session
  * survived the parent turn boundary.
  */
 export default defineEval({
@@ -13,39 +13,38 @@ export default defineEval({
     "A parked local child re-messaged in a later parent turn still recalls a fact from its first turn.",
   tags: ["real-model"],
   async test(t) {
-    await t.send(
+    const started = await t.send(
       [
-        "Call the built-in agent subagent exactly once with this message:",
+        "Call the built-in agent subagent with this message:",
         `"Remember this exact fact: ${MEMORABLE_FACT} Reply only with READY."`,
-        "When it returns, reply with the single word: delegated.",
+        "Do not state the fact yourself. When the agent replies, reply with the single word: delegated.",
       ].join(" "),
     );
+    started.expectOk();
+    started.messageIncludes("delegated");
 
-    await t.send(
+    const continued = await started.session.send(
       [
-        "Message that same agent again: call the agent subagent with the agentId shown in the latest <agents> block",
+        "Message that same agent again: call the agent subagent again with the taskId of the task you started earlier",
         'and the message: "What exact fact did I ask you to remember? Reply with only the fact."',
-        "Do not state the fact yourself.",
-        "When it returns, reply with the agent's exact output and no other text.",
+        "Do not state the fact yourself. When the agent replies, reply with its exact output and no other text.",
       ].join(" "),
     );
+    continued.expectOk();
+    continued.messageIncludes(MEMORABLE_FACT);
 
     t.succeeded();
-    t.calledSubagent("agent", { count: 2 });
-    t.calledSubagent("agent", { output: new RegExp(MEMORABLE_FACT), count: 1 });
     t.eventsSatisfy("both turns continue one child session", (events) => {
-      const childSessionIds = events.flatMap((event) =>
-        event.type === "subagent.called" && event.data.name === "agent"
-          ? [event.data.childSessionId]
-          : [],
+      const calls = events.flatMap((event) =>
+        event.type === "task.started" && event.data.name === "agent" ? [event.data] : [],
       );
       return (
-        childSessionIds.length === 2 &&
-        childSessionIds[0] !== undefined &&
-        childSessionIds[0] === childSessionIds[1]
+        calls.length >= 2 &&
+        new Set(calls.map((call) => call.taskId)).size === 1 &&
+        new Set(calls.map((call) => call.turnId)).size >= 2
       );
     });
-    t.messageIncludes(MEMORABLE_FACT);
+    t.event("agent.started", { data: { name: "agent" }, count: 1 });
     t.noFailedActions();
   },
 });

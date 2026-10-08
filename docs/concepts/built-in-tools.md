@@ -1,111 +1,77 @@
 ---
 title: "Built-in Tools"
-description: "The default and opt-in tools eve provides, including Workflow, glob, grep, and sleep."
+description: "The default and opt-in tools eve provides, including glob, grep, and sleep."
 ---
 
 eve provides a default tool set for every agent and additional tools you can add with one file. Each default occupies the same `agent/tools/<name>.ts` slot you would author yourself, so an authored definition replaces it and `disableTool()` removes it. Use this page to review what the model can call, opt into more capabilities, or override and disable defaults. For custom tools, see [Tools](../tools).
 
 ## Default tools
 
-Default tools require no imports. The exact set depends on the agent and session. `agent` is available only in the root session; `load_skill` and `connection_search` appear only when the agent declares the corresponding resources; `ask_question` requires a session that can request user input; and `web_search` requires a supported model provider. The harness advertises only the tools available to the current session.
+Default tools require no imports. The exact set depends on the agent and session, and the harness advertises only the tools available to the current session.
 
-The default shell and file tools (`bash`, `read_file`, and `write_file`) run in the app and proxy their work into the agent's [sandbox](../sandbox). The table shows where each tool's effect lands.
+### Disable optional default tools
 
-| Tool                | Does                                                                                                                                                                                                                | Where it runs |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
-| `bash`              | Run a shell command.                                                                                                                                                                                                | Sandbox       |
-| `read_file`         | Read a text file with line-numbered output (enables read-before-write).                                                                                                                                             | Sandbox FS    |
-| `write_file`        | Write a complete file; enforces read-before-write and stale-read detection.                                                                                                                                         | Sandbox FS    |
-| `web_fetch`         | Fetch a URL.                                                                                                                                                                                                        | App runtime   |
-| `web_search`        | Search the web (provider-managed; resolved from the model provider).                                                                                                                                                | Provider      |
-| `todo`              | Maintain a durable per-session todo list.                                                                                                                                                                           | App runtime   |
-| `ask_question`      | Ask the user a clarifying question or a choice mid-turn and park until they answer. No `execute`; the model calls it with `{ prompt, options?, allowFreeform? }`. See [Human-in-the-loop](/docs/human-in-the-loop). | App runtime   |
-| `agent`             | From the root session, delegate a subtask to a fresh copy of the root agent.                                                                                                                                        | App runtime   |
-| `load_skill`        | Pull an on-demand [skill](../skills)'s instructions into the current turn. Present only when the agent declares skills.                                                                                             | App runtime   |
-| `connection_search` | Discover tools across declared [connections](../connections); matched tools become directly callable. Present only when the agent declares connections.                                                             | App runtime   |
+Optional default tools are enabled unless you set `defaultTools: false` in `agent/agent.ts`:
 
-The model-facing file tools accept absolute paths and paths beginning with `$HOME/`. eve resolves `$HOME` against the sandbox before invoking non-shell file operations, so packaged skill references such as `$HOME/.agents/skills/<skill>/references/...` work consistently across `read_file`, `write_file`, and the opt-in `glob` and `grep` tools.
+```ts title="agent/agent.ts"
+import { defineAgent } from "eve";
 
-Notes:
-
-- **`agent`** is available only in the root session. Its child uses the root's instructions, tools, connections, and sandbox, but starts with fresh conversation history and fresh [state](./state). The child receives neither `agent` nor `Workflow`; declared subagents do not receive the built-in `agent` either. See [Subagents](../subagents).
-- **`load_skill`** only pulls instructions into context. It adds no new execution surface, because behavior still comes from the tools the agent already has.
-- **`connection_search`** surfaces a connection's tools by their qualified name (e.g. `linear__list_issues`), which the model can then call directly. The model sees it only when the agent has connections.
-- **`web_search`** has no local executor; the provider runs it. AI Gateway models use Exa by default. To use Parallel instead, export `webSearch({ provider: "parallel" })` from `agent/tools/web_search.ts`. Direct provider models continue to use their native search implementation. To supply your own implementation, override it with `defineTool()`.
-- **`web_fetch`** follows up to ten redirects, rechecking every destination for SSRF safety. Non-success HTTP responses return a plain-text failure result with the response body when available instead of failing the tool call.
-
-Review these default tools before production use. Disable, wrap, restrict, or require approval for any tool that can access the filesystem, network, shell, or sensitive data.
-
-## Add framework-provided tools
-
-Some framework-provided tools stay out of the default set. Add the corresponding file when your agent needs one:
-
-| Tool       | Definition to export                                | Purpose                                            |
-| ---------- | --------------------------------------------------- | -------------------------------------------------- |
-| `glob`     | `glob` from `eve/tools/glob`                        | Find sandbox files by glob pattern.                |
-| `grep`     | `grep` from `eve/tools/grep`                        | Search sandbox file contents by regex.             |
-| `Workflow` | `experimental_workflow()` from `eve/tools/workflow` | Orchestrate root-agent copies from generated code. |
-| `sleep`    | `sleep()` from `eve/tools/sleep`                    | Pause and durably resume the current turn.         |
-
-For example, add file discovery and content search with two files:
-
-```ts title="agent/tools/glob.ts"
-export { glob as default } from "eve/tools/glob";
+export default defineAgent({
+  defaultTools: false,
+  model: "openai/gpt-5.4",
+});
 ```
 
-```ts title="agent/tools/grep.ts"
-export { grep as default } from "eve/tools/grep";
+This turns off the optional defaults described below. Add back only the tools the agent needs with the command in each tool's section. Existing files under `agent/tools/` remain available, including same-name replacements such as `agent/tools/bash.ts`.
+
+`connection_search` and `connection_execute` stay available when the agent has connections because they provide access to connection tools.
+
+### `bash`
+
+`bash` runs shell commands in the agent's [sandbox](../sandbox).
+
+```sh
+eve add tool/bash
 ```
 
-The filename supplies the model-facing tool name. The tools run against the agent's sandbox and use the same schemas, results, and error behavior as eve's framework implementations. Wrap either definition with `defineTool({ ...glob, description: "..." })` or `defineTool({ ...grep, description: "..." })` when you need to change its description or approval policy.
+```ts title="agent/tools/bash.ts"
+export { default } from "eve/tools/bash";
+```
 
-The sections below cover `Workflow` and `sleep` in more detail.
+`bash` waits up to 30 seconds for a command. A command that finishes in time returns `status: "completed"` with `exitCode`, `stdout`, `stderr`, and `truncated`. A command that is still running keeps running in the sandbox as its own process group and returns `status: "running"` with:
 
-## Override a default
+- `pid`: the process group id
+- `outputDirectory`: a directory under `/tmp/.eve/jobs/`
+- `stdout`, `stderr`, and `truncated`: the output so far
+- `message`: instructions for the model
 
-Author a tool at the same slug and it takes over the built-in of that name. The file `agent/tools/write_file.ts` replaces the built-in `write_file` by existing:
+The command keeps writing to `stdout` and `stderr` files in `outputDirectory` and writes its exit code to an `exit` file when it finishes. The model checks on or stops it with ordinary shell commands in later `bash` calls, so the tool's approval policy applies to them:
 
-```ts title="agent/tools/write_file.ts"
+```sh
+tail /tmp/.eve/jobs/3f9a1c2e/stdout   # latest output
+cat /tmp/.eve/jobs/3f9a1c2e/exit      # exit code, once the command has finished
+kill -- -4312                         # stop the command's whole process group
+```
+
+The command keeps running across turns until it exits, the model stops it, or the sandbox stops. Its output files stay in the sandbox until the sandbox stops. Cancelling a turn stops a command that has not yet returned `running`. The `just-bash` provider has no background processes, so it runs every command to completion.
+
+Override its description, approval policy, or executor by wrapping the exported definition:
+
+```ts title="agent/tools/bash.ts"
 import { defineTool } from "eve/tools";
-import { writeFile } from "eve/tools/write_file";
+import { bash } from "eve/tools/bash";
 
 export default defineTool({
-  ...writeFile, // keep the default description, schema, and executor
+  ...bash,
+  description: "Run approved project maintenance commands.",
   async execute(input, ctx) {
-    console.log("[write_file]", input.path);
-    return writeFile.execute(input, ctx);
+    console.info("Running sandbox command", input.command);
+    return bash.execute(input, ctx);
   },
 });
 ```
 
-Import each reusable definition from its own subpath:
-
-| Definition  | Import                 | Registered by default |
-| ----------- | ---------------------- | --------------------- |
-| `bash`      | `eve/tools/bash`       | Yes                   |
-| `readFile`  | `eve/tools/read_file`  | Yes                   |
-| `writeFile` | `eve/tools/write_file` | Yes                   |
-| `todo`      | `eve/tools/todo`       | Yes                   |
-| `webFetch`  | `eve/tools/web_fetch`  | Yes                   |
-| `loadSkill` | `eve/tools/load_skill` | Yes                   |
-| `glob`      | `eve/tools/glob`       | No                    |
-| `grep`      | `eve/tools/grep`       | No                    |
-
-Importing a definition does not add it to an agent; export it from the corresponding `agent/tools/*.ts` file. Skip the spread and your replacement owns its own context. A fresh `defineTool` for `todo` does not inherit the default's durable state key.
-
-Provider-managed web search has a dedicated configuration helper instead of an executable default:
-
-```ts title="agent/tools/web_search.ts"
-import { webSearch } from "eve/tools/web_search";
-
-export default webSearch({ provider: "parallel" });
-```
-
-Set `provider` to `"exa"` or `"parallel"`. Without this file, AI Gateway models use Exa.
-
-## Disable a default
-
-Export a `disableTool()` sentinel from a file named after the tool's slug. The filename is what picks the default to remove:
+Disable only `bash`:
 
 ```ts title="agent/tools/bash.ts"
 import { disableTool } from "eve/tools";
@@ -113,113 +79,363 @@ import { disableTool } from "eve/tools";
 export default disableTool();
 ```
 
-Use `agent/tools/agent.ts` to remove the root-only `agent` delegation tool. The root session then receives no tool for delegating to a fresh copy of itself, and the model never sees that tool.
+### `read_file`
 
-If the filename matches no known framework tool, resolution fails instead of silently doing nothing, so a typo surfaces at build time rather than removing the wrong tool.
+`read_file` reads text files from the sandbox with line-numbered output, and shows PNG, JPEG, GIF, and WebP images up to 3 MiB to the model as images. Images are detected from their bytes, so a missing or mismatched filename extension does not matter, and text files are always read as text. It accepts absolute paths and paths beginning with `$HOME/`.
 
-## When to override, disable, or author a new tool
-
-Three moves shape the harness. The right one depends on whether the model should keep the built-in capability.
-
-- **Override** when you want the same capability with different behavior. Import its definition from the matching `eve/tools/<name>` subpath and wrap it (logging, an extra guard, or a different backend), and the model still sees a tool by that name. Spreading keeps the default's description, schema, and any framework state, such as the `todo` tool's durable state key. Drop the spread and your replacement owns its own context, losing that wiring.
-- **Disable** when the model should not have the capability at all. A `disableTool()` sentinel removes the built-in, and the model never sees it. Reach for this to lock down `bash` or `web_fetch` in an agent that should not run shell commands or fetch arbitrary URLs.
-- **Author a new tool** when you want a capability the harness does not ship. Give it a fresh slug under `agent/tools/` and it joins the built-ins instead of replacing one. See [Tools](../tools) for the authoring model.
-
-## Workflow tool
-
-The opt-in experimental `Workflow` tool lets the model write JavaScript that coordinates the agent's own subagents as a single durable step. The program can run them in sequence, feed one result into the next, fan out over a list, and combine the results. You enable the capability and the model decides and runs the orchestration.
-
-A single turn can already call several subagents, and parallel tool calls dispatch concurrently. What a workflow adds is _programmatic_ coordination. The program decides how many subagents to run based on an earlier result, which output feeds which call, and how to combine everything. That is logic the model cannot express as a few one-off calls.
-
-`Workflow` is a model-facing tool, not an API for authored tools, hooks, or application code. Authored code cannot submit a Workflow program or use `Workflow` to start an arbitrary user-authored Vercel Workflow. Use the [client SDK](../guides/client/overview) when application code needs to start or continue an eve session; use ordinary application APIs for other deterministic orchestration.
-
-### Enable Workflow
-
-Export the experimental Workflow definition from `agent/tools/workflow.ts`. The helper name carries the "experimental" warning, but the tool the model actually sees is named `Workflow`.
-
-```ts title="agent/tools/workflow.ts"
-import { experimental_workflow } from "eve/tools/workflow";
-
-export default experimental_workflow();
+```sh
+eve add tool/read_file
 ```
 
-Without that file, the `Workflow` tool stays off. It earns its keep only when the agent has subagents (or the built-in `agent`) worth coordinating:
+```ts title="agent/tools/read_file.ts"
+export { default } from "eve/tools/read_file";
+```
 
-```ts title="agent/subagents/analyst/agent.ts"
-import { defineAgent } from "eve";
+Override it:
 
-export default defineAgent({
-  description: "Analyzes one metric: queries, computes, writes a short finding.",
-  model: "anthropic/claude-opus-4.8",
+```ts title="agent/tools/read_file.ts"
+import { defineTool } from "eve/tools";
+import { readFile } from "eve/tools/read_file";
+
+export default defineTool({
+  ...readFile,
+  description: "Read project files from the sandbox.",
 });
 ```
 
-When asked for a weekly business review, the model picks the metrics, runs one `analyst` per metric in parallel, and combines the findings. The program below is the kind of JavaScript the model authors. It fans `analyst` out over a runtime-decided list of metrics and merges the results:
+Disable it:
 
-```js
-const metrics = ["revenue", "signups", "churn"];
-const findings = await Promise.all(
-  metrics.map((metric) => tools.analyst({ message: `Summarize last week's ${metric}.` })),
-);
-return findings.join("\n\n");
+```ts title="agent/tools/read_file.ts"
+import { disableTool } from "eve/tools";
+
+export default disableTool();
 ```
 
-Each `tools.analyst(...)` call dispatches a child subagent, so the parent stream records one `subagent.called` per metric and one `subagent.completed` as each finishes:
+### `write_file`
 
-```json
-{ "type": "subagent.called", "data": { "name": "analyst", "toolName": "analyst", "callId": "call_1", "childSessionId": "ses_a1", "sequence": 0 } }
-{ "type": "subagent.called", "data": { "name": "analyst", "toolName": "analyst", "callId": "call_2", "childSessionId": "ses_a2", "sequence": 1 } }
-{ "type": "subagent.called", "data": { "name": "analyst", "toolName": "analyst", "callId": "call_3", "childSessionId": "ses_a3", "sequence": 2 } }
-{ "type": "subagent.completed", "data": { "subagentName": "analyst", "callId": "call_1", "output": "..." } }
-{ "type": "subagent.completed", "data": { "subagentName": "analyst", "callId": "call_2", "output": "..." } }
-{ "type": "subagent.completed", "data": { "subagentName": "analyst", "callId": "call_3", "output": "..." } }
+`write_file` writes complete files in the sandbox. It enforces read-before-write and stale-read detection, and accepts absolute paths and paths beginning with `$HOME/`.
+
+```sh
+eve add tool/write_file
 ```
 
-### What a workflow can orchestrate
-
-A workflow reaches only this agent's own agents: the built-in `agent` (a copy of itself), declared [subagents](../subagents), and [remote agents](../guides/remote-agents). That is the whole list. No files, network, shell, skills, or connections. A workflow is a coordination layer over subagents, not a place to do other work. Each call can still request structured output via `outputSchema`, exactly like a direct subagent delegation.
-
-### Caps on workflow-spawned subagents
-
-Workflow orchestration is capped in two independent ways.
-
-**Per-program call budget.** One Workflow program may dispatch at most `maxSubagents` subagent calls in total, counted across the whole program — sequential and parallel calls alike. Configure it on `experimental_workflow`; the default is 100. Calls beyond the budget do not start a child session; they resolve inside the program with a `WORKFLOW_SUBAGENT_LIMIT_REACHED` error result, and the budget is stated in the tool's description so the model sizes its fan-out to fit.
-
-```ts title="agent/tools/workflow.ts"
-import { experimental_workflow } from "eve/tools/workflow";
-
-export default experimental_workflow({ maxSubagents: 4 });
+```ts title="agent/tools/write_file.ts"
+export { default } from "eve/tools/write_file";
 ```
 
-**Root-only orchestration.** Only the root session receives `Workflow`. Children started by a workflow receive neither `Workflow` nor the built-in `agent`, so Workflow programs cannot recurse. A declared child can still call subagents defined in its own directory (see [Subagents](../subagents)).
+Override it:
 
-### Where the JavaScript runs
+```ts title="agent/tools/write_file.ts"
+import { defineTool } from "eve/tools";
+import { writeFile } from "eve/tools/write_file";
 
-The orchestration code never touches the agent's process. The runtime hands the program text to a small isolated JavaScript engine (a QuickJS sandbox) and runs it there. Nothing from the host realm crosses in, so there is no `process`, no `globalThis` from the agent, and no `import`/`require`. The program can reach exactly two things, the agent functions bridged in as `tools.<name>` and the ordinary language built-ins.
+export default defineTool({
+  ...writeFile,
+  description: "Write approved project files in the sandbox.",
+  async execute(input, ctx) {
+    if (!input.filePath.startsWith("/workspace/")) {
+      throw new Error("write_file is limited to /workspace");
+    }
+    return writeFile.execute(input, ctx);
+  },
+});
+```
 
-That is an allowlist, not a denylist. The sandbox cannot read files, open a socket, or see an environment variable because those are not present, not because each one is blocked in turn. When the program calls an agent function, that call bridges back out to the runtime, which dispatches it exactly like a direct delegation. The orchestration glue stays inside the sandbox.
+Disable it:
 
-### Durability, approvals, and observability
+```ts title="agent/tools/write_file.ts"
+import { disableTool } from "eve/tools";
 
-- **Durable.** The whole orchestration counts as one step. Subagents dispatched together run concurrently, and if a run parks (suspends durably without holding compute; see [Execution model and durability](./execution-model-and-durability)) on a long-running or human-gated child, it resumes where it left off after a restart.
-- **Approval-safe.** A subagent that needs human approval (HITL, human-in-the-loop) mid-run surfaces its request to the user, and the workflow picks back up once that is answered, same as direct delegation.
-- **Observable.** Every orchestrated subagent emits the usual `subagent.called` / `subagent.completed` events on the parent stream and gets its own child session and stream. The telemetry matches direct delegation, so existing dashboards and cost attribution keep working.
+export default disableTool();
+```
 
-## The opt-in `sleep` tool
+### `web_fetch`
 
-The framework also ships a durable `sleep` tool, but does not add it to agents by default. Enable it with `agent/tools/sleep.ts`:
+`web_fetch` fetches URLs from the app runtime. It follows up to ten redirects and checks every destination for SSRF safety. Non-success responses return plain text with the response body when available.
 
-```ts
+```sh
+eve add tool/web_fetch
+```
+
+```ts title="agent/tools/web_fetch.ts"
+export { default } from "eve/tools/web_fetch";
+```
+
+Override it:
+
+```ts title="agent/tools/web_fetch.ts"
+import { defineTool } from "eve/tools";
+import { webFetch } from "eve/tools/web_fetch";
+
+export default defineTool({
+  ...webFetch,
+  description: "Fetch approved public documentation URLs.",
+  async execute(input, ctx) {
+    const hostname = new URL(input.url).hostname;
+    if (hostname !== "docs.example.com") {
+      throw new Error("web_fetch is limited to docs.example.com");
+    }
+    return webFetch.execute(input, ctx);
+  },
+});
+```
+
+Disable it:
+
+```ts title="agent/tools/web_fetch.ts"
+import { disableTool } from "eve/tools";
+
+export default disableTool();
+```
+
+### `web_search`
+
+`web_search` uses provider-managed web search and appears only for supported model providers. AI Gateway models use Exa by default; direct provider models use their native search implementation.
+
+```sh
+eve add tool/web_search
+```
+
+```ts title="agent/tools/web_search.ts"
+export { default } from "eve/tools/web_search";
+```
+
+Override the provider-managed configuration for AI Gateway:
+
+```ts title="agent/tools/web_search.ts"
+import { webSearch } from "eve/tools/web_search";
+
+export default webSearch({ provider: "parallel" });
+```
+
+Select Browserbase Search in the same slot:
+
+```ts title="agent/tools/web_search.ts"
+import { webSearch } from "eve/tools/web_search";
+
+export default webSearch({ provider: "browserbase" });
+```
+
+Use a [Gateway model ID](../agent-config#set-the-model) to route searches through Browserbase. AI Gateway executes the search using `AI_GATEWAY_API_KEY` or Vercel project OIDC credentials; no `BROWSERBASE_API_KEY` is needed. See [Browserbase Search on AI Gateway](https://vercel.com/docs/ai-gateway/models-and-providers/web-search#using-browserbase-search).
+
+The `provider` setting applies only to AI Gateway models. Unsupported direct providers omit `web_search`.
+
+Replace provider-managed search with an authored implementation:
+
+```ts title="agent/tools/web_search.ts"
+import { defineTool } from "eve/tools";
+
+export default defineTool({
+  description: "Search the internal documentation index.",
+  inputSchema: { type: "object" },
+  async execute(input) {
+    return { results: [], query: input };
+  },
+});
+```
+
+Disable it:
+
+```ts title="agent/tools/web_search.ts"
+import { disableTool } from "eve/tools";
+
+export default disableTool();
+```
+
+### `agent`
+
+`agent` delegates a subtask to a fresh copy of the root agent. It is root-only, and each call is a [task](/docs/tools/tasks): the call returns a receipt, and the child's reply arrives later as the task's result. The child receives the root's instructions, tools, connections, and sandbox, but starts with fresh conversation history and [state](./state). See [Subagents](../subagents).
+
+```sh
+eve add tool/agent
+```
+
+```ts title="agent/tools/agent.ts"
+export { default } from "eve/tools/agent";
+```
+
+An authored tool at `agent/tools/agent.ts` replaces the framework behavior. Re-export the definition above to restore direct root-copy delegation, export another tool such as `agentRouter()` to change the model-facing behavior, or disable the slot. `agentRouter()` runs each call as a [task](/docs/tools/workflows#run-calls-as-tasks-task), which adds `task_wait` and `task_cancel`:
+
+```ts title="agent/tools/agent.ts"
+import { disableTool } from "eve/tools";
+
+export default disableTool();
+```
+
+### `load_skill`
+
+`load_skill` pulls an on-demand [skill](../skills)'s instructions into the current turn. It appears only when the agent declares skills and adds no execution surface by itself.
+
+```sh
+eve add tool/load_skill
+```
+
+```ts title="agent/tools/load_skill.ts"
+export { default } from "eve/tools/load_skill";
+```
+
+Override it:
+
+```ts title="agent/tools/load_skill.ts"
+import { defineTool } from "eve/tools";
+import { loadSkill } from "eve/tools/load_skill";
+
+export default defineTool({
+  ...loadSkill,
+  description: "Load instructions for an available skill.",
+});
+```
+
+Disable it:
+
+```ts title="agent/tools/load_skill.ts"
+import { disableTool } from "eve/tools";
+
+export default disableTool();
+```
+
+### `connection_search`
+
+`connection_search` and `connection_execute` give the model every tool from the agent's [connections](../connections) without adding each tool to the model's tool list. eve adds both when the agent has a static connection or a dynamic connection resolver, even when `defaultTools` is `false`, so there is no add command.
+
+- `connection_search({ query?, connection?, signIn?, limit?, offset? })` returns matching tools with their connection, name, description, and a TypeScript signature rendered from the tool's schemas. Omit `query` to list every tool, or pair it with `connection` to list one connection's tools. A plain search never asks the user to sign in. For a connection whose server will not list its tools until the user signs in, the result tells the model that sign-in is needed: the connection appears under `unavailable` with `requiresSignIn: true` and an error that points to `signIn: true`. Tools from the other connections are still returned.
+- `connection_search({ connection, signIn: true, query? })` asks the user to sign in to that one connection when they have not yet, then returns its matching tools. Without `connection` it fails, so the user is asked about one service at a time.
+- `connection_execute({ connection, tool, input })` checks `input` against the tool's input schema, calls the tool, and returns its result. When the server asks for the user's authorization, it also asks the user to sign in and the call parks until sign-in completes. The stream reports the call as a nested action named `<connection>__<tool>`, such as `linear__list_issues`, whose `parentCallId` is the `connection_execute` call id.
+
+The definitions of both tools never change during a session. eve lists connection names and descriptions in append-only context messages rather than in the system prompt, so finding a tool, signing in, or resolving a dynamic connection keeps the cached prompt prefix.
+
+The tools cannot be replaced or disabled. The compiler rejects an authored `agent/tools/connection_search.ts`, `agent/tools/connection_execute.ts`, or `agent/tools/connection_tools.ts`. An agent without connections has neither tool.
+
+### `task_wait` and `task_cancel`
+
+eve adds `task_wait` and `task_cancel` when the agent has a tool that runs its calls as [tasks](/docs/tools/tasks): any agent tool, including the built-in `agent` tool, declared subagents, and remote agents, or a tool such as `agentRouter()`, the `workflow` tool, or an authored workflow tool that defines `task(input, ctx)` or `serve(receive, ctx)`. There is no add command, and the tools are not workflow tools. Both names are reserved: the compiler rejects an authored `agent/tools/task_wait.ts` or `agent/tools/task_cancel.ts`.
+
+- `task_wait({ timeoutSeconds? })` parks the turn until any task has a result, a new message arrives, or `timeoutSeconds` pass, and returns at once when a result is already waiting. While it waits, the stream reports `turn.waiting` for the open turn. Results arrive in a `<task_result>` message right after it returns. Waiting never stops a task.
+- `task_cancel({ taskId })` stops a task's current work and says so, or says the task had no work to stop when it already finished or is an idle [resumable task](/docs/tools/workflows#resumable-tasks-serve). An id that names no task fails with `UNKNOWN_TASK`. A resumable task stays available after a cancel.
+
+Review these tools before production use. Disable, wrap, restrict, or require approval for any tool that can access the filesystem, network, shell, or sensitive data.
+
+You can also add the opt-in framework tools described below.
+
+## Opt-in framework tools
+
+These framework-provided tools are not added by default. Add only the ones the agent needs.
+
+### `ask_question`
+
+`ask_question` lets the model ask the user one question, then waits for the answer. The model can offer two or three options, each with a label and a short description, and the user can always type their own answer instead. Channels render the options as native UI, such as Slack select menus. Without the tool, the model can still ask in its reply text and the user answers with their next message. See [Human-in-the-loop](/docs/human-in-the-loop). Add it:
+
+```sh
+eve add tool/ask_question
+```
+
+```ts title="agent/tools/ask_question.ts"
+import { askQuestion } from "eve/tools/ask_question";
+
+export default askQuestion();
+```
+
+`ask_question` is a [workflow tool](/docs/tools/workflows) that calls `ctx.ask()`. The model receives `{ status: "answered", answer }`, where `answer` is the chosen option's label or the user's own words. A plain follow-up message answers the question too when it is the only pending question. When other questions are also pending, a message does not answer any of them: `ask_question` withdraws its question, resolves as `{ interrupted: true }`, which the model reads as `Stopped early because a new message arrived.`, and the model reads the message next. In a session that cannot request input, such as a scheduled run, the result is `{ status: "unavailable" }` and the model continues on its own judgment. Remove the file to remove the tool.
+
+### `glob`
+
+`glob` finds sandbox files by glob pattern. Add it:
+
+```sh
+eve add tool/glob
+```
+
+```ts title="agent/tools/glob.ts"
+export { default } from "eve/tools/glob";
+```
+
+Customize it by wrapping the framework definition:
+
+```ts title="agent/tools/glob.ts"
+import { defineTool } from "eve/tools";
+import { glob } from "eve/tools/glob";
+
+export default defineTool({
+  ...glob,
+  description: "Find project files by glob pattern.",
+});
+```
+
+Remove the file to remove the tool. `disableTool()` is unnecessary because `glob` is not added by default.
+
+### `grep`
+
+`grep` searches sandbox file contents with a regular expression. Add it:
+
+```sh
+eve add tool/grep
+```
+
+```ts title="agent/tools/grep.ts"
+export { default } from "eve/tools/grep";
+```
+
+Customize it by wrapping the framework definition:
+
+```ts title="agent/tools/grep.ts"
+import { defineTool } from "eve/tools";
+import { grep } from "eve/tools/grep";
+
+export default defineTool({
+  ...grep,
+  description: "Search project files with a regular expression.",
+});
+```
+
+Remove the file to remove the tool. `disableTool()` is unnecessary because `grep` is not added by default.
+
+### `no_reply`
+
+`no_reply` ends the turn without a reply. Use it when a scheduled check finds nothing to report, or when an action the agent already took is the whole answer. The model calls it with an optional `{ reason }`, which stays in the session history and traces and is never sent. The turn completes without a final message, so channels and schedule sends post nothing, and later turns see that the agent chose to stay quiet. Add it:
+
+```sh
+eve add tool/no_reply
+```
+
+```ts title="agent/tools/no_reply.ts"
+import { noReply } from "eve/tools/no_reply";
+
+export default noReply();
+```
+
+`no_reply` is a `defineTool` tool with [`endsTurn: true`](/docs/tools#end-the-turn-after-a-tool-call), so the turn ends only when no other tool runs in the same step. Only root sessions receive it. Slack clears the thread status when the turn completes. Remove the file to remove the tool.
+
+### `sleep`
+
+`sleep` pauses and durably resumes the current turn. The model calls it with `{ seconds }`; the wait does not hold an application runtime open. Concurrent calls run in parallel, and the turn resumes after the longest wait. A steering message, the default for a new message, ends the wait early: `sleep` returns `{ interrupted: true }`, which the model reads as `Stopped early because a new message arrived.`, followed by the message. Add it:
+
+```sh
+eve add tool/sleep
+```
+
+```ts title="agent/tools/sleep.ts"
 import { sleep } from "eve/tools/sleep";
 
 export default sleep();
 ```
 
-The model calls it with `{ seconds }` when it is useful to wait before checking progress or status again. The pause sleeps the durable turn workflow, so it does not hold an application runtime open, and the same turn continues automatically when the duration elapses. If one model response makes concurrent `sleep` calls, eve waits for the longest requested duration.
+Customize it by wrapping the framework definition:
+
+```ts title="agent/tools/sleep.ts"
+import { defineWorkflowTool } from "eve/tools";
+import { sleep } from "eve/tools/sleep";
+
+export default defineWorkflowTool({
+  ...sleep(),
+  description: "Pause before checking an external operation again.",
+});
+```
+
+Remove the file to remove the tool. `disableTool()` is unnecessary because `sleep` is not added by default.
 
 ## What to read next
 
 - [Tools](../tools): define your own tools, gate them on approval, and shape their output with `toModelOutput`
 - [Dynamic capabilities](../guides/dynamic-capabilities): generate the tool set per session with `defineDynamic`
 - [Sandbox](../sandbox): configure the sandbox used by shell and file tools
-- [Subagents](../subagents): declare the agents that `agent` and `Workflow` can call
+- [Subagents](../subagents): declare specialists that the model can delegate to

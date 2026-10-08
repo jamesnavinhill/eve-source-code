@@ -29,6 +29,34 @@ export function resolveProviderHeaders(model: LanguageModel): Record<string, str
   return Object.fromEntries(appendPackageUserAgent(new Headers()));
 }
 
-function isGatewayModel(model: LanguageModel): boolean {
-  return typeof model === "string" || model.provider?.split(".")[0] === "gateway";
+/** Provider identity reported by the model, normalized for bare Gateway ids. */
+export function resolveModelProvider(model: LanguageModel): string | undefined {
+  return typeof model === "string" ? "gateway" : model.provider;
+}
+
+export function isGatewayModel(model: LanguageModel): boolean {
+  return resolveModelProvider(model)?.split(".")[0] === "gateway";
+}
+
+/** Groups Gateway generations under the same identity used by eve's agent spans. */
+export function mergeGatewaySessionId(
+  model: LanguageModel,
+  providerOptions: Readonly<Record<string, unknown>> | undefined,
+  conversationId: string,
+): Record<string, unknown> | undefined {
+  if (!isGatewayModel(model)) return providerOptions;
+
+  const gateway = providerOptions?.gateway;
+  const gatewayOptions =
+    gateway !== null && typeof gateway === "object" && !Array.isArray(gateway)
+      ? (gateway as Record<string, unknown>)
+      : undefined;
+  if (typeof gatewayOptions?.sessionId === "string" && gatewayOptions.sessionId.trim()) {
+    return providerOptions;
+  }
+
+  return {
+    ...providerOptions,
+    gateway: { ...gatewayOptions, sessionId: conversationId },
+  };
 }

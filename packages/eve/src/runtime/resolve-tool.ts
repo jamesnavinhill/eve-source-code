@@ -1,16 +1,15 @@
 import type { CompiledToolDefinition } from "#compiler/manifest.js";
+import { isFrameworkTool, frameworkTool } from "#tools/provided/framework-tool.js";
 import type { CompiledModuleMap } from "#compiler/module-map.js";
 import { expectFunction, expectObjectRecord } from "#internal/authored-module.js";
 import { normalizeApproval } from "#internal/authored-definition/approval.js";
-import {
-  registerDefinitionSource,
-  stampDefinitionKey,
-} from "#internal/authored-definition/source-identity.js";
+import { registerDefinitionSource } from "#internal/authored-definition/source-identity.js";
 import { isToolSchema, toInputSchema, toOutputSchema } from "#tools/schema.js";
 import { toErrorMessage } from "#shared/errors.js";
 import { loadResolvedModuleExport, ResolveAgentError } from "#runtime/resolve-helpers.js";
 import type { ResolvedToolDefinition } from "#runtime/types.js";
 import type { AgentSourceOwner } from "#compiler/source-graph.js";
+import { createWorkflowProgramExecuteInput } from "#tools/workflow-program-input.js";
 
 /**
  * Resolves one compiled authored tool into a runtime-owned definition
@@ -28,7 +27,9 @@ export async function resolveToolDefinition(
   owner: AgentSourceOwner,
 ): Promise<ResolvedToolDefinition> {
   if (!definition.hasExecute) {
-    return {
+    const resolved: ResolvedToolDefinition = {
+      availableInSubagents: definition.availableInSubagents,
+      behavior: definition.behavior,
       description: definition.description,
       inputSchema: toInputSchema(definition.inputSchema),
       logicalPath: definition.logicalPath,
@@ -38,6 +39,9 @@ export async function resolveToolDefinition(
       sourceId: definition.sourceId,
       sourceKind: "module",
     };
+    return definition.behavior?.handling?.kind === "provider-tool"
+      ? frameworkTool(resolved)
+      : resolved;
   }
   try {
     const resolvedExportValue = await loadResolvedModuleExport({
@@ -51,33 +55,38 @@ export async function resolveToolDefinition(
       describe(definition, "to return an object"),
     );
 
-    const sourceEntry = {
-      kind: "tool",
-      logicalPath: definition.logicalPath,
-      name: definition.name,
-      owner,
-    } as const;
+    registerDefinitionSource(
+      resolvedRecord,
+      { kind: "tool", logicalPath: definition.logicalPath, name: definition.name },
+      `tool:${resolvedRecord.description}`,
+    );
 
-    const sourceKey = `tool-source:${definition.sourceId}`;
-    stampDefinitionKey(resolvedRecord, sourceKey);
-    registerDefinitionSource(sourceKey, sourceEntry);
-    registerDefinitionSource(`tool:${resolvedRecord.description}`, sourceEntry);
-
-    const execute = expectFunction(
-      resolvedRecord.execute,
-      describe(definition, "to provide an execute function"),
-    ) as NonNullable<ResolvedToolDefinition["execute"]>;
+    // A workflow tool's entry point runs from the workflow registry, never in process.
+    const execute =
+      definition.behavior?.handling?.kind === "workflow-tool"
+        ? undefined
+        : (expectFunction(
+            resolvedRecord.execute,
+            describe(definition, "to provide an execute function"),
+          ) as NonNullable<ResolvedToolDefinition["execute"]>);
     const inputSchema = isToolSchema(resolvedRecord.inputSchema)
       ? resolvedRecord.inputSchema
       : toInputSchema(definition.inputSchema);
     const outputSchema = isToolSchema(resolvedRecord.outputSchema)
       ? resolvedRecord.outputSchema
       : toOutputSchema(definition.outputSchema);
+    const workflowProgram = definition.workflowProgram;
+    const executeInput =
+      workflowProgram === undefined
+        ? undefined
+        : (input: unknown) => createWorkflowProgramExecuteInput(workflowProgram, input);
 
-    return {
+    const resolved: ResolvedToolDefinition = {
+      availableInSubagents: definition.availableInSubagents,
+      behavior: definition.behavior,
       description: definition.description,
       execute,
-      execution: definition.execution,
+      executeInput,
       exportName: definition.exportName,
       inputSchema,
       logicalPath: definition.logicalPath,
@@ -88,6 +97,7 @@ export async function resolveToolDefinition(
       sourceKind: "module",
       ...extractOptionalHooks(resolvedRecord, definition),
     };
+    return isFrameworkTool(resolvedRecord) ? frameworkTool(resolved) : resolved;
   } catch (error) {
     if (error instanceof ResolveAgentError) {
       throw error;
@@ -109,7 +119,9 @@ export async function resolveToolDefinition(
  * result without clobbering required fields with `undefined`.
  */
 type OptionalResolvedFields = {
-  -readonly [K in "approval" | "toModelOutput"]?: ResolvedToolDefinition[K];
+  -readonly [
+    K in "label" | "approval" | "approvalKey" | "endsTurn" | "toModelOutput"
+  ]?: ResolvedToolDefinition[K];
 };
 
 /**
@@ -123,11 +135,55 @@ function extractOptionalHooks(
 ): OptionalResolvedFields {
   const optional: OptionalResolvedFields = {};
 
+  if (record.label !== undefined) {
+    const label = expectObjectRecord(
+      record.label,
+      describe(definition, "to provide a valid label definition"),
+    );
+    optional.label = {
+      complete:
+        label.complete === undefined
+          ? undefined
+          : (expectFunction(
+              label.complete,
+              describe(definition, "to provide an label complete function"),
+            ) as NonNullable<ResolvedToolDefinition["label"]>["complete"]),
+      delta:
+        label.delta === undefined
+          ? undefined
+          : (expectFunction(
+              label.delta,
+              describe(definition, "to provide an label delta function"),
+            ) as NonNullable<ResolvedToolDefinition["label"]>["delta"]),
+      start: expectFunction(
+        label.start,
+        describe(definition, "to provide a label start callback function"),
+      ) as NonNullable<ResolvedToolDefinition["label"]>["start"],
+    };
+  }
+
   if (record.approval !== undefined) {
     optional.approval = normalizeApproval(
       record.approval,
       describe(definition, "to provide a valid approval definition"),
     );
+  }
+
+  if (record.approvalKey !== undefined) {
+    optional.approvalKey = expectFunction(
+      record.approvalKey,
+      describe(definition, "to provide an approvalKey function"),
+    ) as ResolvedToolDefinition["approvalKey"];
+  }
+
+  if (record.endsTurn !== undefined) {
+    optional.endsTurn =
+      typeof record.endsTurn === "boolean"
+        ? record.endsTurn
+        : (expectFunction(
+            record.endsTurn,
+            describe(definition, "to provide endsTurn as a boolean or a function"),
+          ) as ResolvedToolDefinition["endsTurn"]);
   }
 
   if (record.toModelOutput !== undefined) {

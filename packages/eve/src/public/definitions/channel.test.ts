@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { buildAdapterContext } from "#channel/adapter-context.js";
 import { callAdapterEventHandler, type ChannelAdapter } from "#channel/adapter.js";
@@ -157,6 +157,59 @@ describe("defineChannel", () => {
     const adapter = getAdapter(channel);
     expect(adapter.kind).toBe("defineChannel");
     expect(adapter.instrumentation?.metadata?.(adapter.state)).toEqual({ threadTs: null });
+  });
+
+  it("keeps the HTTP fast path when only an audience classifier is declared", () => {
+    const channel = defineChannel({
+      audience: () => "public",
+      routes: [POST("/x", async () => new Response("ok"))],
+    });
+
+    const adapter = getAdapter(channel);
+    expect(adapter.kind).toBe("http");
+    expect(adapter.instrumentation?.metadata).toBeUndefined();
+    expect(
+      adapter.instrumentation?.audience?.({
+        auth: null,
+        caller: { type: "anonymous" },
+        channel: { kind: "http" },
+        environment: "production",
+        state: undefined,
+      }),
+    ).toBe("public");
+  });
+
+  it("drops the former audience key from custom metadata", () => {
+    const channel = defineChannel({
+      metadata: () => ({ audience: "public", custom: "value" }),
+      routes: [POST("/x", async () => new Response("ok"))],
+    });
+
+    const adapter = getAdapter(channel);
+    expect(adapter.instrumentation?.metadata?.(adapter.state)).toEqual({ custom: "value" });
+  });
+
+  it("classifies legacy metadata audience after defineChannel strips it", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const channel = defineChannel({
+      metadata: () => ({ audience: "public", custom: "value" }),
+      routes: [POST("/x", async () => new Response("ok"))],
+    });
+    const adapter = getAdapter(channel);
+
+    expect(
+      adapter.instrumentation?.audience?.({
+        auth: null,
+        caller: { type: "anonymous" },
+        channel: { kind: "channel:legacy" },
+        environment: "production",
+        state: adapter.state,
+      }),
+    ).toBe("public");
+    expect(adapter.instrumentation?.metadata?.(adapter.state)).toEqual({ custom: "value" });
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      "channel defineChannel uses deprecated metadata audience; move it to the audience() hook",
+    );
   });
 
   it("infers channel metadata from metadata() return values", () => {
@@ -329,7 +382,7 @@ describe("defineChannel", () => {
     }
 
     const captured: {
-      sessions: Array<{ continuation?: { rekey(token: string): void } }>;
+      sessions: Array<{ continuation?: { alias(token: string): void } }>;
     } = {
       sessions: [],
     };
@@ -346,7 +399,7 @@ describe("defineChannel", () => {
     const adapter = getAdapter(channel);
 
     // Stand up a minimal accessor whose `set` calls are captured so the
-    // session handle's continuation rekey is observable.
+    // session handle's additive continuation claim is observable.
     const writes: Array<[string, unknown]> = [];
     let continuationToken = "slack:C123:";
     const accessor: ContextAccessor = {
@@ -378,8 +431,11 @@ describe("defineChannel", () => {
     // The session is the one ctx.session exposes (same reference).
     expect(adapterCtx.session).toBe(captured.sessions[0]);
 
-    captured.sessions[0]!.continuation?.rekey("C123:T456");
-    expect(writes).toEqual([["eve.continuationToken", "slack:C123:T456"]]);
+    captured.sessions[0]!.continuation?.alias("C123:T456");
+    expect(writes).toEqual([
+      ["eve.continuationHookTokens", ["slack:C123:", "slack:C123:T456"]],
+      ["eve.continuationToken", "slack:C123:T456"],
+    ]);
   });
 
   it("passes SessionContext as third arg to event handlers inside the ALS scope", async () => {
@@ -422,7 +478,7 @@ describe("defineChannel", () => {
 
     expect(capturedCtx).toBeDefined();
     expect(typeof capturedCtx.getSandbox).toBe("function");
-    expect(typeof capturedCtx.getSkill).toBe("function");
+    expect(capturedCtx).not.toHaveProperty("getSkill");
     expect(capturedCtx.session.id).toBe("sess-channel-test");
     expect(capturedCtx.session.turn).toEqual({ id: "turn-1", sequence: 0 });
     expect(capturedChannel.session).toBeUndefined();
@@ -474,7 +530,6 @@ describe("defineChannel", () => {
           type: "reasoning.appended",
           data: {
             reasoningDelta: "Need",
-            reasoningSoFar: "Need",
             sequence: 0,
             stepIndex: 0,
             turnId: "turn-1",
@@ -499,7 +554,6 @@ describe("defineChannel", () => {
 
     expect(appendedData).toMatchObject({
       reasoningDelta: "Need",
-      reasoningSoFar: "Need",
       turnId: "turn-1",
     });
     expect(completedData).toMatchObject({

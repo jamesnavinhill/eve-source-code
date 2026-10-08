@@ -29,11 +29,27 @@ export interface McpClientConnectionDefinition {
    */
   readonly url: string;
   /**
+   * Whether to discover the server's protocol before initialization.
+   * Defaults to enabled. Set to false for servers that require the older
+   * initialize handshake; that handshake still negotiates a supported version.
+   */
+  readonly protocolVersionDiscovery?: boolean;
+  /**
+   * Whether to forward the calling turn's user and initiator to the server in
+   * the `eve-forwarded-principal` header, so an eve agent's `mcpChannel` can
+   * run its published tools as that user. The server must set
+   * `trustedForwarders` and trust this connection's route-authenticated
+   * identity; otherwise it refuses the request with 403. Anonymous callers
+   * are not forwarded. Requests carrying the header fail rather than follow
+   * a redirect.
+   * @default false
+   */
+  readonly forwardPrincipal?: boolean;
+  /**
    * Human-readable summary of the connection and its tools.
    *
-   * The system prompt layer uses it to describe the connection to
-   * the model, and `connection_search` results use it so the model
-   * can choose which connection to query.
+   * The model sees it in the connection listing eve announces, so it
+   * can choose which connection to search with `connection_search`.
    */
   readonly description: string;
   /**
@@ -42,7 +58,7 @@ export interface McpClientConnectionDefinition {
    *
    * - `getToken`-only: covers static API keys, pre-provisioned
    *   JWTs, and out-of-band OAuth. Defaults to
-   *   `principalType: "app"` when omitted.
+   *   `credentialOwner: "app"` when omitted.
    * - Three-method form: provide `startAuthorization` and
    *   `completeAuthorization` together to opt into
    *   interactive OAuth authorization.
@@ -67,6 +83,7 @@ export interface McpClientConnectionDefinition {
    * - `never()`: allow all tool calls without approval
    * - `once()`: require approval only the first time per session
    * - `always()`: require approval for every tool call
+   * - `auto()`: use a decision model to ask about dangerous or unclear effects
    *
    * When omitted, tool calls execute without approval, consistent
    * with authored tools.
@@ -90,9 +107,8 @@ export interface McpClientConnectionDefinition {
    */
   toolCall?: ConnectionToolCallDefinition;
   /**
-   * Client-side tool filter. When set, the model sees only tools
-   * whose names pass the filter; `connection_search` drops all
-   * others.
+   * Client-side tool filter. When set, `connection_search` returns and
+   * `connection_execute` calls only tools whose names pass the filter.
    *
    * Specify exactly one of `allow` or `block`.
    */

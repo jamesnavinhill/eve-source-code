@@ -1,0 +1,15 @@
+packages:
+  - "."
+
+minimumReleaseAgeExclude:
+  - eve
+  - "@vercel/connect"
+  - ai
+  - eve
+
+allowBuilds:
+  "@parcel/watcher": false
+  better-sqlite3: true
+  esbuild: true
+  sharp: false
+  vue-demi: false

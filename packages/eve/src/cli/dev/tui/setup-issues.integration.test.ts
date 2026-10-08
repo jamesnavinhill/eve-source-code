@@ -51,12 +51,9 @@ describe("BOOT_DETECTIONS against a real directory", () => {
     expect(issues).toEqual([]);
   });
 
-  it("diagnoses missing credentials (not the link) when the directory is linked", async () => {
+  it("defers model diagnosis when runtime info is unavailable", async () => {
     const appRoot = await linkedAppRoot();
-    const issues = await detectSetupIssues({ appRoot, env: {} });
-    expect(issues).toEqual([
-      { kind: "attention", label: "AI Gateway credentials missing", command: "/model" },
-    ]);
+    expect(await detectSetupIssues({ appRoot, env: {} })).toEqual([]);
   });
 
   it("diagnoses a linked project with disconnected model access", async () => {
@@ -71,12 +68,12 @@ describe("BOOT_DETECTIONS against a real directory", () => {
       {
         kind: "attention",
         label: "AI Gateway credentials missing",
-        command: "/model",
+        command: "/login",
       },
     ]);
   });
 
-  it("opens model setup from the prefilled onboarding prompt when inspection is unavailable", async () => {
+  it("opens only login during onboarding when inspection is unavailable", async () => {
     const appRoot = await linkedAppRoot();
     const client = new Client({ host: "http://localhost:3000" });
     vi.spyOn(client, "info").mockRejectedValue(new Error("inspection unavailable"));
@@ -89,13 +86,12 @@ describe("BOOT_DETECTIONS against a real directory", () => {
       order.push(command.name);
       return { message: `/${command.name} dismissed.` };
     });
-    const readPrompt = vi.fn(async () => {
+    const readInput = vi.fn(async () => {
       order.push("prompt");
       return undefined;
     });
     const renderer: AgentTUIRenderer = {
-      readPrompt,
-      renderStream: vi.fn(async () => {}),
+      readInput,
       setupFlow: createFakeSetupFlowRenderer(),
     };
     const runner = new EveTUIRunner({
@@ -106,23 +102,16 @@ describe("BOOT_DETECTIONS against a real directory", () => {
       promptCommandHandler: { handle },
       renderer,
       serverUrl: "http://localhost:3000",
-      session: client.sessions.attach("session_test"),
-      initialInput: "/model",
+      onboard: true,
     });
 
     await runner.run();
 
-    expect(handle).toHaveBeenNthCalledWith(
-      1,
-      { type: "extension", name: "model", argument: "" },
-      { renderer, title: "eve", initialModelStep: "provider" },
+    expect(handle).toHaveBeenCalledExactlyOnceWith(
+      { type: "extension", name: "login", argument: "" },
+      expect.objectContaining({ renderer, title: "eve", initialModelStep: "provider" }),
     );
-    expect(handle).toHaveBeenNthCalledWith(
-      2,
-      { type: "extension", name: "add", argument: "" },
-      { renderer, title: "eve" },
-    );
-    expect(readPrompt).toHaveBeenCalledOnce();
-    expect(order).toEqual(["model", "add", "prompt"]);
+    expect(readInput).toHaveBeenCalledOnce();
+    expect(order).toEqual(["login", "prompt"]);
   });
 });

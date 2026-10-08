@@ -1,6 +1,8 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 
+import { shellQuote } from "#shared/shell-quote.js";
+
 import {
   EVE_INTERNAL_BUILD_OUTPUT_DIRECTORY_ENV,
   EVE_INTERNAL_HOST_BUILD_OUTPUT_DIRECTORY_ENV,
@@ -58,7 +60,7 @@ interface VercelJsonConfig {
  * The top-level Vercel Build Output route that sends eve transport requests to
  * the generated eve service.
  */
-export type EveVercelServiceRoute = {
+type EveVercelServiceRoute = {
   readonly destination: {
     readonly service: string;
     readonly type: "service";
@@ -70,7 +72,7 @@ export type EveVercelServiceRoute = {
  * A service-scoped route carrying the `request.path` transform that pins the
  * path the eve runtime observes to the eve transport namespace.
  */
-export type EveVercelServiceRequestPathRoute = {
+type EveVercelServiceRequestPathRoute = {
   readonly src: string;
   readonly transforms: readonly [VercelRequestPathTransform];
 };
@@ -82,6 +84,7 @@ export type EveVercelServiceRequestPathRoute = {
 export type EveVercelGeneratedService = {
   readonly buildCommand: string;
   readonly framework: "eve";
+  readonly outputDirectory: ".vercel/output";
   readonly routes: readonly VercelRouteConfig[];
   readonly root: string;
 };
@@ -117,10 +120,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function toPosixRelative(from: string, to: string): string {
   const relativePath = relative(from, to);
   return relativePath.length === 0 ? "." : relativePath.replaceAll("\\", "/");
-}
-
-function quoteShellArgument(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function isNamedServiceConfigArray(
@@ -294,10 +293,10 @@ function createGeneratedServiceBuild(input: {
   const configuredHostOutputDirectory = toPosixRelative(input.appRoot, hostOutputDirectory);
   const buildCommand =
     input.eveBuildCommand ??
-    `node ${quoteShellArgument(toPosixRelative(input.appRoot, resolveEveBinaryPath(input.hostRoot)))} build`;
+    `node ${shellQuote(toPosixRelative(input.appRoot, resolveEveBinaryPath(input.hostRoot)))} build`;
 
   return {
-    buildCommand: `cd ${quoteShellArgument(workingDirectory)} && export ${EVE_INTERNAL_BUILD_OUTPUT_DIRECTORY_ENV}=${quoteShellArgument(configuredOutputDirectory)} && export ${EVE_INTERNAL_HOST_BUILD_OUTPUT_DIRECTORY_ENV}=${quoteShellArgument(configuredHostOutputDirectory)} && ${buildCommand}`,
+    buildCommand: `cd ${shellQuote(workingDirectory)} && export ${EVE_INTERNAL_BUILD_OUTPUT_DIRECTORY_ENV}=${shellQuote(configuredOutputDirectory)} && export ${EVE_INTERNAL_HOST_BUILD_OUTPUT_DIRECTORY_ENV}=${shellQuote(configuredHostOutputDirectory)} && ${buildCommand}`,
     root: toPosixRelative(input.hostRoot, rootDirectory),
     rootDirectory,
   };
@@ -358,6 +357,7 @@ export async function ensureEveVercelServicesConfig(input: {
       [EVE_SERVICE_NAME]: {
         buildCommand: generatedServiceBuild.buildCommand,
         framework: "eve",
+        outputDirectory: ".vercel/output",
         routes: [createEveServiceRequestPathRoute()],
         root: generatedServiceBuild.root,
       },

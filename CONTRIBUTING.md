@@ -57,6 +57,7 @@ pnpm test               # unit + integration
 pnpm test:unit          # unit tests
 pnpm test:integration   # integration tests
 pnpm test:scenario      # scenario tests (requires pnpm build first)
+pnpm test:framework-fixtures # apps/frameworks smoke builds (requires pnpm build first)
 pnpm test:e2e           # fixture-owned eve eval suites
 pnpm test:tui           # TUI smoke scripts (not e2e)
 ```
@@ -210,7 +211,8 @@ on when one exists. Do not create an issue solely to accompany a pull request.
    ```
 
 5. Make sure `pnpm lint`, `pnpm typecheck`, and `pnpm test` pass.
-6. Open the PR with a clear description of the problem and solution.
+6. Open the PR with a short description that explains the problem, user need,
+   or decision behind the change before describing the solution.
 
 Releases are managed with [Changesets](https://github.com/changesets/changesets) by the maintainers.
 

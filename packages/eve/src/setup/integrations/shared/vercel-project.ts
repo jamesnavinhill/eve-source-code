@@ -2,7 +2,7 @@ import { readProjectLink, type VercelProjectReference } from "#setup/project-res
 
 import { SetupPrerequisiteRequired } from "./prerequisite.js";
 
-export interface IntegrationVercelProjectDeps {
+interface IntegrationVercelProjectDeps {
   readProjectLink: typeof readProjectLink;
 }
 
@@ -22,7 +22,7 @@ export async function resolveIntegrationVercelProject(input: {
   throw new SetupPrerequisiteRequired({
     kind: "command",
     code: "vercel-project-link",
-    message: `Vercel Connect setup requires a linked Vercel project. Run \`eve link\`, then retry ${input.integration} setup.`,
+    message: `${input.integration} setup requires a linked Vercel project. Run \`eve link\`, then retry.`,
     command: "eve link",
   });
 }

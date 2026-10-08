@@ -1,20 +1,29 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { effectScope } from "vue";
 
-import { EveAgentStore, type EveAgentStoreSnapshot } from "#client/eve-agent-store.js";
+import {
+  detachEveAgentStore,
+  EveAgentStore,
+  type EveAgentStoreSnapshot,
+} from "#client/eve-agent-store.js";
+import { defaultMessageReducer } from "#client/message-reducer.js";
+import type { ClientSessionState } from "#client/types.js";
 import { useEveAgent } from "#vue/use-eve-agent.js";
 import type { EveMessageData } from "#client/message-reducer.js";
-import { EVE_SESSION_ID_HEADER } from "#protocol/message.js";
+import type { ConversationState } from "#client/conversation-state.js";
+import {
+  EVE_MESSAGE_STREAM_VERSION,
+  EVE_SESSION_ID_HEADER,
+  EVE_STREAM_VERSION_HEADER,
+} from "#protocol/message.js";
 import {
   createMessageCompletedEvent,
   createMessageReceivedEvent,
-  createSessionFailedEvent,
   createSessionWaitingEvent,
+  createSessionFailedEvent,
   type UnstampedMessageStreamEvent,
 } from "#protocol/message.js";
-import { stampTestEvents } from "#internal/testing/events.js";
-import { defaultMessageReducer } from "#client/message-reducer.js";
-import type { ClientSessionState } from "#client/types.js";
+import { TEST_USAGE, stampTestEvents } from "#internal/testing/events.js";
 
 function createStartedMessageResponse(sessionId: string, continuationToken: string): Response {
   return new Response(JSON.stringify({ continuationToken, ok: true, sessionId }), {
@@ -37,12 +46,18 @@ function createEagerStreamResponse(events: readonly UnstampedMessageStreamEvent[
         controller.close();
       },
     }),
+    {
+      headers: { [EVE_STREAM_VERSION_HEADER]: EVE_MESSAGE_STREAM_VERSION },
+    },
   );
 }
 
-function createBoundedStreamResponse(events: readonly UnstampedMessageStreamEvent[]): Response {
+function createBoundedStreamResponse(
+  events: readonly UnstampedMessageStreamEvent[],
+  tailIndex = events.length - 1,
+): Response {
   const response = createEagerStreamResponse(events);
-  response.headers.set("x-eve-stream-tail-index", String(events.length - 1));
+  response.headers.set("x-eve-stream-tail-index", String(tailIndex));
   return response;
 }
 
@@ -60,11 +75,15 @@ function completedTurnData(input: {
   readonly assistantMessage?: string;
   readonly turnId: string;
   readonly userMessage: string;
-}): EveMessageData {
+}): ConversationState {
   return {
+    tasks: {},
+    agents: {},
+    inputs: {},
+    turns: {},
     messages: [
       {
-        id: `${input.turnId}:user`,
+        id: expect.stringMatching(/^evt_.+:user$/),
         metadata: {
           status: "complete",
           turnId: input.turnId,
@@ -84,6 +103,7 @@ function completedTurnData(input: {
               parts: [
                 { type: "step-start" as const },
                 {
+                  id: expect.stringMatching(/^evt_/),
                   state: "done" as const,
                   stepIndex: 0,
                   text: input.assistantMessage,
@@ -97,14 +117,24 @@ function completedTurnData(input: {
   };
 }
 
+const cleanupStores: Array<() => void> = [];
+function createStore<TData>(
+  init: ConstructorParameters<typeof EveAgentStore<TData>>[0],
+): EveAgentStore<TData> {
+  const store = new EveAgentStore<TData>(init);
+  cleanupStores.push(() => detachEveAgentStore(store));
+  return store;
+}
+
 afterEach(() => {
+  for (const cleanup of cleanupStores.splice(0)) cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 describe("EveAgentStore (Vue composable backing store)", () => {
   it("starts in ready status with empty data", () => {
-    const store = new EveAgentStore({
+    const store = createStore({
       reducer: defaultMessageReducer(),
     });
 
@@ -115,7 +145,7 @@ describe("EveAgentStore (Vue composable backing store)", () => {
   });
 
   it("notifies subscribers on state changes", async () => {
-    const store = new EveAgentStore({
+    const store = createStore({
       reducer: defaultMessageReducer(),
     });
 
@@ -145,7 +175,7 @@ describe("EveAgentStore (Vue composable backing store)", () => {
         stepIndex: 0,
         turnId: "turn_1",
       }),
-      createSessionWaitingEvent(),
+      createSessionWaitingEvent(TEST_USAGE),
     ];
 
     const startResponse = createDeferred<Response>();
@@ -153,7 +183,7 @@ describe("EveAgentStore (Vue composable backing store)", () => {
       .mockReturnValueOnce(startResponse.promise)
       .mockResolvedValueOnce(createEagerStreamResponse(events));
 
-    const store = new EveAgentStore({
+    const store = createStore({
       reducer: defaultMessageReducer(),
     });
 
@@ -188,29 +218,20 @@ describe("EveAgentStore (Vue composable backing store)", () => {
 
     expect(seenEvents).toEqual(stampTestEvents(events));
     expect(store.snapshot.status).toBe("ready");
-    expect(store.snapshot.data).toEqual(
-      completedTurnData({
+    expect(store.snapshot.data).toEqual({
+      messages: completedTurnData({
         assistantMessage: "Hi there.",
         turnId: "turn_1",
         userMessage: "Hello",
-      }),
-    );
-    expect(seenSessions).toEqual([
-      {
-        sessionId: "session_1",
-        streamIndex: 0,
-      },
-      {
-        sessionId: "session_1",
-        streamIndex: 3,
-      },
-    ]);
+      }).messages,
+    });
+    expect(seenSessions.map((session) => session?.streamIndex)).toEqual([0, 1, 2, 3, 3]);
   });
 
   it("surfaces transport errors", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("Network failed"));
 
-    const store = new EveAgentStore({
+    const store = createStore({
       reducer: defaultMessageReducer(),
     });
 
@@ -236,6 +257,7 @@ describe("EveAgentStore (Vue composable backing store)", () => {
         turnId: "turn_1",
       }),
       createSessionFailedEvent({
+        usage: TEST_USAGE,
         code: "MODEL_CALL_FAILED",
         message: "Bad Request",
         sessionId: "session_1",
@@ -247,7 +269,7 @@ describe("EveAgentStore (Vue composable backing store)", () => {
       .mockReturnValueOnce(startResponse.promise)
       .mockResolvedValueOnce(createEagerStreamResponse(events));
 
-    const store = new EveAgentStore({
+    const store = createStore({
       reducer: defaultMessageReducer(),
     });
 
@@ -270,7 +292,7 @@ describe("EveAgentStore (Vue composable backing store)", () => {
   it("resets state and creates a new session", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValueOnce(new Error("fail"));
 
-    const store = new EveAgentStore({
+    const store = createStore({
       reducer: defaultMessageReducer(),
     });
 
@@ -285,7 +307,7 @@ describe("EveAgentStore (Vue composable backing store)", () => {
   });
 
   it("unsubscribe removes the listener", () => {
-    const store = new EveAgentStore({
+    const store = createStore({
       reducer: defaultMessageReducer(),
     });
 
@@ -304,11 +326,13 @@ describe("EveAgentStore (Vue composable backing store)", () => {
 
   it("projects input responses before the resumed stream returns", async () => {
     const startResponse = createDeferred<Response>();
-    vi.spyOn(globalThis, "fetch")
-      .mockReturnValueOnce(startResponse.promise)
-      .mockResolvedValueOnce(createEagerStreamResponse([createSessionWaitingEvent()]));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_request, init) =>
+      init?.method === "POST"
+        ? await startResponse.promise
+        : createEagerStreamResponse([createSessionWaitingEvent(TEST_USAGE)]),
+    );
 
-    const store = new EveAgentStore<readonly string[]>({
+    const store = createStore<readonly string[]>({
       initialSession: {
         sessionId: "session_1",
         streamIndex: 0,
@@ -350,11 +374,11 @@ describe("useEveAgent (Vue composable wiring)", () => {
         stepIndex: 0,
         turnId: "turn_1",
       }),
-      createSessionWaitingEvent(),
+      createSessionWaitingEvent(TEST_USAGE),
     ];
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(createBoundedStreamResponse(events))
-      .mockResolvedValueOnce(createEagerStreamResponse([]));
+      .mockResolvedValueOnce(createBoundedStreamResponse([], events.length - 1));
     const scope = effectScope();
     const agent = scope.run(() =>
       useEveAgent({
@@ -388,7 +412,7 @@ describe("useEveAgent (Vue composable wiring)", () => {
         stepIndex: 0,
         turnId: "turn_1",
       }),
-      createSessionWaitingEvent(),
+      createSessionWaitingEvent(TEST_USAGE),
     ];
 
     const startResponse = createDeferred<Response>();
@@ -397,7 +421,7 @@ describe("useEveAgent (Vue composable wiring)", () => {
       .mockResolvedValueOnce(createEagerStreamResponse(events));
 
     const scope = effectScope();
-    const agent = scope.run(() => useEveAgent());
+    const agent = scope.run(() => useEveAgent({ prewarm: false }));
     if (agent === undefined) throw new Error("effect scope did not run");
 
     expect(agent.status.value).toBe("ready");
@@ -429,12 +453,12 @@ describe("useEveAgent (Vue composable wiring)", () => {
       .mockResolvedValueOnce(
         createEagerStreamResponse([
           createMessageReceivedEvent({ message: "After", sequence: 0, turnId: "turn_1" }),
-          createSessionWaitingEvent(),
+          createSessionWaitingEvent(TEST_USAGE),
         ]),
       );
 
     const scope = effectScope();
-    const agent = scope.run(() => useEveAgent());
+    const agent = scope.run(() => useEveAgent({ prewarm: false }));
     if (agent === undefined) throw new Error("effect scope did not run");
 
     const dataBeforeDispose = agent.data.value;

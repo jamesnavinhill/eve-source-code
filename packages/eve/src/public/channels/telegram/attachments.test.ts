@@ -5,9 +5,11 @@ import {
   createTelegramFetchFile,
   createTelegramFileUrl,
 } from "#public/channels/telegram/attachments.js";
+import { captureLogRecords } from "#internal/testing/log-records.js";
 
 describe("collectTelegramFileParts", () => {
   it("emits URL-backed file parts and applies the upload policy", () => {
+    const logs = captureLogRecords();
     const parts = collectTelegramFileParts(
       [
         {
@@ -35,6 +37,13 @@ describe("collectTelegramFileParts", () => {
       type: "file",
     });
     expect(String(parts[0]!.data)).toContain("telegram-file:");
+    expect(logs.records).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        message:
+          'dropped attachment — report.pdf has media type "application/pdf" which is not allowed by this route. Allowed: image/*.',
+      }),
+    );
   });
 });
 
@@ -48,7 +57,8 @@ describe("createTelegramFetchFile", () => {
         }),
       )
       .mockResolvedValueOnce(
-        new Response("PDF", { headers: { "content-type": "application/pdf" } }),
+        // Telegram serves every file as octet-stream; the declared type must win (#1217).
+        new Response("PDF", { headers: { "content-type": "application/octet-stream" } }),
       );
 
     const fetchFile = createTelegramFetchFile({
@@ -85,5 +95,29 @@ describe("createTelegramFetchFile", () => {
     });
 
     await expect(fetchFile("https://example.com/file.png")).resolves.toBeNull();
+  });
+
+  it("reports download status without exposing the Telegram file reference", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ok: true, result: { file_path: "private/path.pdf" } }), {
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response("forbidden", { status: 403 }));
+    const fetchFile = createTelegramFetchFile({
+      api: { apiBaseUrl: "https://telegram.example", fetch: fetchMock },
+      credentials: { botToken: "123456:PRIVATE" },
+      policy: { allowedMediaTypes: "*", maxBytes: 1024 },
+    });
+    const reference = String(
+      createTelegramFileUrl({ fileId: "PRIVATE_FILE_ID", filename: "report.pdf" }),
+    );
+
+    const result = fetchFile(reference);
+    await expect(result).rejects.toThrow("HTTP 403");
+    await expect(result).rejects.not.toThrow("PRIVATE_FILE_ID");
+    await expect(result).rejects.not.toThrow("123456:PRIVATE");
   });
 });

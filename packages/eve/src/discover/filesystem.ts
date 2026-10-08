@@ -17,7 +17,7 @@ export const SUPPORTED_AUTHORED_MODULE_FILE_EXTENSIONS = [
  * Files that mark a surrounding directory as an application root when paired
  * with a top-level `agent/` directory.
  */
-export const PROJECT_MARKER_FILE_NAMES = ["package.json", "vercel.json"] as const;
+const PROJECT_MARKER_FILE_NAMES = ["package.json", "vercel.json"] as const;
 
 const PROJECT_MARKER_FILE_NAME_SET = new Set<string>(PROJECT_MARKER_FILE_NAMES);
 const GENERATED_AGENT_DIRECTORY_NAMES = new Set<string>([
@@ -37,7 +37,7 @@ export type DirectoryEntryType = "directory" | "file" | "other";
 /**
  * Classified root-level agent entry.
  */
-export type AgentRootEntryKind =
+type AgentRootEntryKind =
   | "agent-config-module"
   | "channels-directory"
   | "connections-directory"
@@ -63,7 +63,7 @@ export type AgentRootEntryKind =
 /**
  * Classified local-subagent root entry.
  */
-export type LocalSubagentEntryKind =
+type LocalSubagentEntryKind =
   | "agent-config-module"
   | "connections-directory"
   | "extensions-directory"
@@ -87,7 +87,7 @@ export type LocalSubagentEntryKind =
 /**
  * Classified Agent Skills package entry.
  */
-export type SkillPackageEntryKind =
+type SkillPackageEntryKind =
   | "skill-assets-directory"
   | "skill-markdown"
   | "skill-references-directory"
@@ -97,10 +97,11 @@ export type SkillPackageEntryKind =
 /**
  * Classified top-level entry inside `skills/`.
  */
-export type SkillsDirectoryEntryKind =
+type SkillsDirectoryEntryKind =
   | "flat-skill-markdown"
   | "flat-skill-module"
   | "ignored-declaration"
+  | "ignored-source-map"
   | "skill-package-directory"
   | "unknown";
 
@@ -131,6 +132,16 @@ export function isProjectMarkerEntry(name: string, entryType: DirectoryEntryType
 /**
  * Classifies a top-level agent-root entry according to the spec-legal grammar.
  */
+export function isDiscoverableAgentRootEntry(name: string, entryType: DirectoryEntryType): boolean {
+  const kind = classifyAgentRootEntry(name, entryType);
+  return (
+    kind !== "unknown" &&
+    kind !== "ignored-directory" &&
+    kind !== "lib-directory" &&
+    kind !== "memory-directory"
+  );
+}
+
 export function classifyAgentRootEntry(
   name: string,
   entryType: DirectoryEntryType,
@@ -352,6 +363,10 @@ export function classifySkillsDirectoryEntry(
       return "ignored-declaration";
     }
 
+    if (isGeneratedSourceMapFileName(name)) {
+      return "ignored-source-map";
+    }
+
     if (name.toLowerCase().endsWith(".md")) {
       return "flat-skill-markdown";
     }
@@ -392,6 +407,21 @@ export function getSupportedModuleBaseName(name: string): string | null {
 /** Returns whether a filename is a TypeScript declaration module. */
 export function isTypeScriptDeclarationFileName(name: string): boolean {
   return /\.d\.(?:cts|mts|ts)$/.test(name);
+}
+
+/** Identifies colocated tests to omit from automatic agent source discovery. */
+export function isAuthoredTestPath(path: string): boolean {
+  return /(?:^|[/\\])__tests__(?:[/\\]|$)/.test(path) || /\.(?:test|spec)\.[cm]?[jt]s$/.test(path);
+}
+
+/** Returns whether a filename is a source map for a generated module or declaration. */
+export function isGeneratedSourceMapFileName(name: string): boolean {
+  if (!name.endsWith(".map")) return false;
+  const sourceFileName = name.slice(0, -".map".length);
+  return (
+    isTypeScriptDeclarationFileName(sourceFileName) ||
+    getSupportedModuleBaseName(sourceFileName) !== null
+  );
 }
 
 /**

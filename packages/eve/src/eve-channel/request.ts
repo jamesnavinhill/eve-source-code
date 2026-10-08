@@ -1,7 +1,6 @@
 import type { FilePart, TextPart, UserContent } from "ai";
 
 import type {
-  ActivityObserverConfig,
   SessionAuthContext,
   SessionCallback,
   SessionCapabilities,
@@ -9,20 +8,29 @@ import type {
 } from "#channel/types.js";
 import type { Session } from "#channel/session.js";
 import { parseSessionCallback } from "#channel/session-callback.js";
-import {
-  parseActivityObserverField,
-  validateActivityObserverBinding,
-} from "#eve-channel/activity-observer-request.js";
 import { hasInternalRefScheme } from "#internal/attachments/url-refs.js";
+import { isMissingWorkflowRunError } from "#internal/workflow/is-inactive-workflow-run-error.js";
 import {
   EVE_MESSAGE_STREAM_CONTENT_TYPE,
   EVE_MESSAGE_STREAM_FORMAT,
   EVE_MESSAGE_STREAM_VERSION,
   EVE_SESSION_ID_HEADER,
+  EVE_STREAM_CONTROL_VERSION,
+  EVE_STREAM_CONTROL_VERSION_QUERY,
   EVE_STREAM_FORMAT_HEADER,
+  EVE_STREAM_LEASE_ENDED_CONTROL,
   EVE_STREAM_TAIL_INDEX_HEADER,
   EVE_STREAM_VERSION_HEADER,
 } from "#protocol/message.js";
+import {
+  REMOTE_AGENT_PROTOCOL_MISMATCH,
+  REMOTE_AGENT_PROTOCOL_VERSION,
+  readRemoteAgentProtocolVersion,
+} from "#protocol/remote-agent-protocol.js";
+import {
+  LEGACY_REMOTE_AGENT_PROTOCOL_VERSION,
+  splitLegacyTaskFields,
+} from "#execution/legacy-remote-agent/protocol.js";
 import {
   collectUploadPolicyViolations,
   formatUploadPolicyViolation,
@@ -30,18 +38,11 @@ import {
 } from "#public/channels/upload-policy.js";
 import { isInputResponse, type ValidatedInputResponse } from "#shared/input.js";
 import { parseJsonObject, type JsonObject } from "#shared/json.js";
-import type { RunMode } from "#shared/run-mode.js";
+import { parseTurnPolicyField } from "#eve-channel/turn-policy-request.js";
+import { type ParsedCreateBody, validateMessageFreeCreate } from "#eve-channel/create-request.js";
 
-interface ParsedCreateBody {
-  activityObserver?: ActivityObserverConfig;
-  callback?: SessionCallback;
-  capabilities?: SessionCapabilities;
-  message: string | UserContent;
-  mode?: RunMode;
-  context?: readonly string[];
-  operationId?: string;
-  outputSchema?: JsonObject;
-}
+const SESSION_STREAM_HEARTBEAT_MS = 10_000;
+const SESSION_STREAM_LEASE_MS = 60_000;
 
 /** Replay-stable identity for one authenticated create operation. */
 export async function deriveOperationContinuationToken(input: {
@@ -63,7 +64,9 @@ export async function deriveOperationContinuationToken(input: {
   return `eve:op:${hex.slice(0, 32)}`;
 }
 
-export function parseCreateBody(payload: Record<string, unknown>): ParsedCreateBody | Response {
+export function parseCreateBody(input: Record<string, unknown>): ParsedCreateBody | Response {
+  const legacy = splitLegacyTaskFields(input);
+  const { payload } = legacy;
   if (payload.inputResponses !== undefined) {
     return Response.json(
       { error: "'inputResponses' is only accepted for an existing session.", ok: false },
@@ -78,29 +81,24 @@ export function parseCreateBody(payload: Record<string, unknown>): ParsedCreateB
 
   const callback = parseCallbackField(payload.callback);
   if (callback instanceof Response) return callback;
+  const protocolVersion =
+    callback === undefined ? undefined : parseProtocolVersionField(payload.protocolVersion);
+  if (protocolVersion instanceof Response) return protocolVersion;
 
   const capabilities = parseCapabilitiesField(payload.capabilities);
   if (capabilities instanceof Response) return capabilities;
 
-  const activityObserver = parseActivityObserverField(payload.activityObserver);
-  if (activityObserver instanceof Response) return activityObserver;
-  if (activityObserver !== undefined) {
-    const observerRejection = validateActivityObserverBinding(activityObserver, callback);
-    if (observerRejection !== undefined) return observerRejection;
-  }
-
-  const mode = parseModeField(payload.mode);
-  if (mode instanceof Response) return mode;
-
   const outputSchema = parseOutputSchemaField(payload.outputSchema);
   if (outputSchema instanceof Response) return outputSchema;
 
-  if (message === undefined) {
-    return Response.json(
-      { error: "Missing or empty 'message' field.", ok: false },
-      { status: 400 },
-    );
-  }
+  const messageFreeRejection = validateMessageFreeCreate({
+    callback,
+    hasClientContext: payload.clientContext !== undefined,
+    hasMessageField: "message" in payload,
+    message,
+    outputSchema,
+  });
+  if (messageFreeRejection !== undefined) return messageFreeRejection;
 
   const rawOperationId = payload.operationId;
   if (rawOperationId !== undefined && (typeof rawOperationId !== "string" || !rawOperationId)) {
@@ -111,20 +109,21 @@ export function parseCreateBody(payload: Record<string, unknown>): ParsedCreateB
   }
 
   const result: ParsedCreateBody = {
-    activityObserver,
     callback,
     capabilities,
-    message,
-    mode,
     context,
     outputSchema,
   };
+  if (message !== undefined) result.message = message;
   if (typeof rawOperationId === "string") result.operationId = rawOperationId;
+  if (protocolVersion !== undefined) result.protocolVersion = protocolVersion;
+  if (protocolVersion === LEGACY_REMOTE_AGENT_PROTOCOL_VERSION) {
+    result.legacyRemoteAgentCaller = legacy.taskId === undefined ? {} : { taskId: legacy.taskId };
+  }
   return result;
 }
 
 interface ParsedSessionMessageBody {
-  activityObserver?: ActivityObserverConfig;
   callback?: SessionCallback;
   message?: string | UserContent;
   inputResponses?: readonly ValidatedInputResponse[];
@@ -134,8 +133,9 @@ interface ParsedSessionMessageBody {
 }
 
 export function parseSessionMessageBody(
-  payload: Record<string, unknown>,
+  input: Record<string, unknown>,
 ): ParsedSessionMessageBody | Response {
+  const { payload } = splitLegacyTaskFields(input);
   const tokenRejection = rejectSessionContinuationToken(payload);
   if (tokenRejection !== null) return tokenRejection;
 
@@ -143,12 +143,6 @@ export function parseSessionMessageBody(
   if (message instanceof Response) return message;
   const callback = parseCallbackField(payload.callback);
   if (callback instanceof Response) return callback;
-  const activityObserver = parseActivityObserverField(payload.activityObserver);
-  if (activityObserver instanceof Response) return activityObserver;
-  if (activityObserver !== undefined) {
-    const observerRejection = validateActivityObserverBinding(activityObserver, callback);
-    if (observerRejection !== undefined) return observerRejection;
-  }
   const inputResponses = parseInputResponses(payload.inputResponses);
   if (inputResponses instanceof Response) return inputResponses;
   const context = parseClientContextField(payload.clientContext);
@@ -176,7 +170,6 @@ export function parseSessionMessageBody(
   }
 
   return {
-    activityObserver,
     callback,
     message,
     inputResponses,
@@ -187,7 +180,6 @@ export function parseSessionMessageBody(
 }
 
 interface ParsedCancelTurnBody {
-  taskId?: string;
   turnId?: string;
 }
 
@@ -198,23 +190,13 @@ export async function parseCancelTurnBody(req: Request): Promise<ParsedCancelTur
   if (tokenRejection !== null) return tokenRejection;
 
   const turnId = payload.turnId;
-  const taskId = payload.taskId;
   if (turnId !== undefined && (typeof turnId !== "string" || turnId.length === 0)) {
     return Response.json(
       { error: "Expected 'turnId' to be a non-empty string.", ok: false },
       { status: 400 },
     );
   }
-  if (taskId !== undefined && (typeof taskId !== "string" || taskId.length === 0)) {
-    return Response.json(
-      { error: "Expected 'taskId' to be a non-empty string.", ok: false },
-      { status: 400 },
-    );
-  }
-  const result: ParsedCancelTurnBody = {};
-  if (typeof taskId === "string") result.taskId = taskId;
-  if (typeof turnId === "string") result.turnId = turnId;
-  return result;
+  return typeof turnId === "string" ? { turnId } : {};
 }
 
 export async function parseJsonRequest(req: Request): Promise<Record<string, unknown> | Response> {
@@ -255,7 +237,9 @@ export async function parseSessionControlBody(
   return rejectSessionContinuationToken(payload) ?? payload;
 }
 
-async function parseOptionalJsonRequest(req: Request): Promise<Record<string, unknown> | Response> {
+export async function parseOptionalJsonRequest(
+  req: Request,
+): Promise<Record<string, unknown> | Response> {
   let text: string;
   try {
     text = await req.text();
@@ -299,8 +283,16 @@ export async function createSessionStreamResponse(
   const includeTailIndex = parseIncludeTailIndex(request);
 
   try {
-    const tailIndex = includeTailIndex ? await session.getStreamTailIndex() : undefined;
+    // The event stream opens its durable source lazily, so an unknown or
+    // unreachable session would otherwise answer 200 and then fail mid-body.
+    // Resolving the tail first surfaces that before any bytes are committed.
+    const tailIndex = await session.getStreamTailIndex();
     const events = await session.getEventStream({ startIndex });
+    const controlVersion =
+      new URL(request.url).searchParams.get(EVE_STREAM_CONTROL_VERSION_QUERY) ===
+      EVE_STREAM_CONTROL_VERSION
+        ? EVE_STREAM_CONTROL_VERSION
+        : undefined;
     const headers = new Headers({
       "cache-control": "no-store, no-transform",
       "content-type": EVE_MESSAGE_STREAM_CONTENT_TYPE,
@@ -309,15 +301,24 @@ export async function createSessionStreamResponse(
       [EVE_STREAM_FORMAT_HEADER]: EVE_MESSAGE_STREAM_FORMAT,
       [EVE_STREAM_VERSION_HEADER]: EVE_MESSAGE_STREAM_VERSION,
     });
-    if (tailIndex !== undefined) {
+    if (includeTailIndex) {
       headers.set(EVE_STREAM_TAIL_INDEX_HEADER, String(tailIndex));
     }
     return new Response(
-      serializeAsNdjson(events, request.signal, streamEventLimit(startIndex, tailIndex)),
+      serializeAsNdjson(
+        events,
+        request.signal,
+        includeTailIndex ? streamEventLimit(startIndex, tailIndex) : undefined,
+        controlVersion !== undefined,
+      ),
       { headers },
     );
-  } catch {
-    return Response.json({ error: "Session not found.", ok: false }, { status: 404 });
+  } catch (error) {
+    const notFound = isMissingWorkflowRunError(error);
+    return Response.json(
+      { error: notFound ? "Session not found." : "Session stream unavailable.", ok: false },
+      { status: notFound ? 404 : 503 },
+    );
   }
 }
 
@@ -342,6 +343,33 @@ function parseCallbackField(value: unknown): SessionCallback | Response | undefi
   return Response.json({ error: parsed.message, ok: false }, { status: 400 });
 }
 
+/** Delegating callers must speak a remote agent protocol this deployment serves. */
+function parseProtocolVersionField(value: unknown): number | Response {
+  // Only an absent version means protocol 1; 0.66–0.68 callers omit the field.
+  if (value !== undefined && typeof value !== "number") {
+    return Response.json(
+      { error: "Expected 'protocolVersion' to be a number.", ok: false },
+      { status: 400 },
+    );
+  }
+  const callerVersion = readRemoteAgentProtocolVersion(value);
+  if (
+    callerVersion === REMOTE_AGENT_PROTOCOL_VERSION ||
+    callerVersion === LEGACY_REMOTE_AGENT_PROTOCOL_VERSION
+  ) {
+    return callerVersion;
+  }
+  return Response.json(
+    {
+      code: REMOTE_AGENT_PROTOCOL_MISMATCH,
+      error: `This deployment speaks eve remote agent protocol ${String(REMOTE_AGENT_PROTOCOL_VERSION)}, but the caller speaks protocol ${String(callerVersion)}. Upgrade both deployments to the same eve release.`,
+      ok: false,
+      protocolVersion: REMOTE_AGENT_PROTOCOL_VERSION,
+    },
+    { status: 409 },
+  );
+}
+
 function parseCapabilitiesField(value: unknown): SessionCapabilities | Response | undefined {
   if (value === undefined) return undefined;
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -364,24 +392,6 @@ function parseCapabilitiesField(value: unknown): SessionCapabilities | Response 
   }
 
   return requestInput === undefined ? {} : { requestInput };
-}
-
-function parseModeField(value: unknown): RunMode | Response | undefined {
-  if (value === undefined) return undefined;
-  if (value === "conversation" || value === "task") return value;
-  return Response.json(
-    { error: "Expected 'mode' to be either 'conversation' or 'task'.", ok: false },
-    { status: 400 },
-  );
-}
-
-function parseTurnPolicyField(value: unknown): TurnPolicy | Response | undefined {
-  if (value === undefined) return undefined;
-  if (value === "queue" || value === "steer") return value;
-  return Response.json(
-    { error: "Expected 'turnPolicy' to be either 'queue' or 'steer'.", ok: false },
-    { status: 400 },
-  );
 }
 
 function parseMessageField(value: unknown): string | UserContent | undefined | Response {
@@ -606,20 +616,69 @@ function serializeAsNdjson(
   events: ReadableStream<unknown>,
   signal: AbortSignal,
   eventLimit?: number,
+  leased = false,
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   let eventCount = 0;
+  let heartbeat: ReturnType<typeof setTimeout> | undefined;
+  let lease: ReturnType<typeof setTimeout> | undefined;
+
+  const clearTimers = () => {
+    clearTimeout(heartbeat);
+    clearTimeout(lease);
+    heartbeat = undefined;
+    lease = undefined;
+  };
+  const scheduleHeartbeat = (controller: TransformStreamDefaultController<Uint8Array>) => {
+    clearTimeout(heartbeat);
+    heartbeat = setTimeout(() => {
+      try {
+        controller.enqueue(encoder.encode("\n"));
+        scheduleHeartbeat(controller);
+      } catch {
+        clearTimers();
+      }
+    }, SESSION_STREAM_HEARTBEAT_MS);
+  };
+  const startLease = (controller: TransformStreamDefaultController<Uint8Array>) => {
+    scheduleHeartbeat(controller);
+    lease = setTimeout(() => {
+      clearTimers();
+      try {
+        controller.enqueue(encoder.encode(`${JSON.stringify(EVE_STREAM_LEASE_ENDED_CONTROL)}\n`));
+        controller.terminate();
+      } catch {
+        // The response was cancelled while the lease callback was already queued.
+      }
+    }, SESSION_STREAM_LEASE_MS);
+  };
+
   const transform = new TransformStream<unknown, Uint8Array>({
     start(controller) {
       controller.enqueue(encoder.encode("\n"));
-      if (eventLimit === 0) controller.terminate();
+      if (eventLimit === 0) {
+        controller.terminate();
+      } else if (leased) {
+        startLease(controller);
+      }
     },
     transform(event, controller) {
       controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
       eventCount += 1;
-      if (eventCount === eventLimit) controller.terminate();
+      if (eventCount === eventLimit) {
+        clearTimers();
+        controller.terminate();
+      } else if (leased) {
+        scheduleHeartbeat(controller);
+      }
+    },
+    flush() {
+      clearTimers();
     },
   });
-  void events.pipeTo(transform.writable, { signal }).catch(() => {});
+  void events
+    .pipeTo(transform.writable, { signal })
+    .catch(() => {})
+    .finally(clearTimers);
   return transform.readable;
 }

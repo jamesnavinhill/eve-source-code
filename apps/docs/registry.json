@@ -4,51 +4,79 @@
   "homepage": "https://eve.dev",
   "items": [
     {
-      "name": "linear",
+      "name": "eve/self-modification",
       "type": "registry:item",
-      "title": "Linear",
-      "description": "Receive delegated Linear work and give your agent tools for issues, projects, and comments.",
+      "title": "Self-modification",
+      "description": "Add a source editing subagent with local edits and official registry installation.",
+      "dependencies": ["just-bash"],
       "meta": {
         "eve": {
-          "requires": ">=0.30.6",
-          "components": [
+          "requires": ">=0.62.0",
+          "install": {
+            "pnpm": {
+              "buildScripts": [
+                {
+                  "packages": ["node-liblzma", "@mongodb-js/zstd"],
+                  "optional": true,
+                  "recommendedAction": "ignore-optional",
+                  "reason": "These optional just-bash compression accelerators are not required by the self-modification agent."
+                }
+              ]
+            }
+          },
+          "setup": [
             {
-              "item": "channel/linear-agent",
-              "label": "Linear Channel",
-              "description": "Interact with your eve agent natively in Linear",
-              "default": true
-            },
-            {
-              "item": "connection/linear",
-              "label": "Linear MCP",
-              "description": "Use the Linear MCP",
-              "default": true
+              "package": "eve",
+              "bin": "eve",
+              "args": ["integration", "setup", "self-modification"]
             }
           ]
         }
-      }
+      },
+      "files": [
+        {
+          "path": "registry/eve/self-modification/extension.ts",
+          "type": "registry:file",
+          "target": "agent/extensions/self-modification/extension.ts"
+        }
+      ]
     },
     {
       "name": "experimental/self-modification",
       "type": "registry:item",
       "title": "Self-modification (Experimental)",
-      "description": "Add an experimental, development-only source editing subagent to an eve project.",
-      "dependencies": ["@eve/self-modification"],
+      "description": "Add an experimental source editing subagent with local edits and official registry installation.",
+      "dependencies": ["just-bash"],
+      "meta": {
+        "eve": {
+          "hidden": true,
+          "install": {
+            "pnpm": {
+              "buildScripts": [
+                {
+                  "packages": ["node-liblzma", "@mongodb-js/zstd"],
+                  "optional": true,
+                  "recommendedAction": "ignore-optional",
+                  "reason": "These optional just-bash compression accelerators are not required by the self-modification agent."
+                }
+              ]
+            }
+          },
+          "setup": [
+            {
+              "package": "eve",
+              "bin": "eve",
+              "args": ["integration", "setup", "self-modification"]
+            }
+          ],
+          "requires": ">=0.62.0"
+        }
+      },
       "files": [
         {
-          "path": "registry/experimental/self-modification/agent.ts",
+          "path": "registry/eve/self-modification/extension.ts",
           "type": "registry:file",
-          "target": "agent/subagents/self-modification/agent.ts"
-        },
-        {
-          "path": "registry/experimental/self-modification/sandbox.ts",
-          "type": "registry:file",
-          "target": "agent/subagents/self-modification/sandbox.ts"
-        },
-        {
-          "path": "registry/experimental/self-modification/extension.ts",
-          "type": "registry:file",
-          "target": "agent/subagents/self-modification/extensions/selfmod.ts"
+          "target": "agent/extensions/self-modification/extension.ts"
         }
       ]
     },
@@ -136,6 +164,30 @@
       ]
     },
     {
+      "name": "extension/link",
+      "type": "registry:item",
+      "title": "Link",
+      "description": "Give an eve agent guarded access to a Link wallet for payment methods, purchase requests, and checkout credentials.",
+      "dependencies": [
+        "@stripe/link-integrations-eve"
+      ],
+      "envVars": {
+        "LINK_ACCESS_TOKEN": ""
+      },
+      "meta": {
+        "eve": {
+          "requires": ">=0.54.4"
+        }
+      },
+      "files": [
+        {
+          "path": "registry/extensions/link.ts",
+          "type": "registry:file",
+          "target": "agent/extensions/link.ts"
+        }
+      ]
+    },
+    {
       "name": "extension/kernel",
       "type": "registry:item",
       "title": "KERNEL",
@@ -153,20 +205,26 @@
       ]
     },
     {
-      "name": "extension/upstash-agentkit",
+      "name": "memory/file",
       "type": "registry:item",
-      "title": "Upstash AgentKit",
-      "description": "Add long-term memory, Redis Search, and durable chat history with Upstash Redis.",
-      "dependencies": ["@upstash/agentkit-eve-extension"],
-      "envVars": {
-        "UPSTASH_REDIS_REST_URL": "",
-        "UPSTASH_REDIS_REST_TOKEN": ""
+      "title": "File memory",
+      "description": "Store durable per-principal memory in a private Vercel Blob store. Setup connects production, preview, and development in the project's primary function region; Blob usage may incur charges.",
+      "meta": {
+        "eve": {
+          "setup": {
+            "package": "eve",
+            "bin": "eve",
+            "args": ["integration", "setup", "file-memory"]
+          },
+          "requires": ">=0.49.1",
+          "docs": "/docs/memory/file"
+        }
       },
       "files": [
         {
-          "path": "registry/extensions/upstash-agentkit.ts",
+          "path": "registry/memory/file.ts",
           "type": "registry:file",
-          "target": "agent/extensions/agentkit.ts"
+          "target": "agent/memory/file.ts"
         }
       ]
     },
@@ -193,20 +251,48 @@
       ]
     },
     {
-      "name": "extension/arcana",
+      "name": "memory/upstash-agentkit",
+      "type": "registry:item",
+      "title": "Upstash AgentKit",
+      "description": "Give your agents ranked recall and automatic capture on Upstash Redis, or a Redis backend for file memory.",
+      "dependencies": ["@upstash/agentkit-eve", "@upstash/redis"],
+      "envVars": {
+        "UPSTASH_REDIS_REST_URL": "",
+        "UPSTASH_REDIS_REST_TOKEN": ""
+      },
+      "meta": {
+        "eve": {
+          "requires": ">=0.45.2"
+        }
+      },
+      "files": [
+        {
+          "path": "registry/memory/upstash-agentkit.ts",
+          "type": "registry:file",
+          "target": "agent/memory/upstash-agentkit.ts"
+        }
+      ]
+    },
+    {
+      "name": "memory/arcana",
       "type": "registry:item",
       "title": "Kybernesis Arcana",
-      "description": "Give an eve agent a workspace-scoped long-term memory with recall, storage, and brain notes.",
+      "description": "Give your agents workspace-scoped long-term memory with automatic recall and deliberate storage.",
       "dependencies": ["@kybernesis/arcana"],
       "envVars": {
         "ARCANA_API_KEY": "",
         "ARCANA_WORKSPACE": ""
       },
+      "meta": {
+        "eve": {
+          "requires": ">=0.49.0"
+        }
+      },
       "files": [
         {
-          "path": "registry/extensions/arcana.ts",
+          "path": "registry/memory/arcana.ts",
           "type": "registry:file",
-          "target": "agent/extensions/arcana.ts"
+          "target": "agent/memory/arcana.ts"
         }
       ]
     },
@@ -235,6 +321,162 @@
       ]
     },
     {
+      "name": "tool/agent",
+      "type": "registry:item",
+      "title": "Agent",
+      "description": "Add root-agent delegation to other agents.",
+      "files": [
+        {
+          "path": "registry/tools/agent.ts",
+          "type": "registry:file",
+          "target": "agent/tools/agent.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/ask_question",
+      "type": "registry:item",
+      "title": "Ask Question",
+      "description": "Let the agent ask the user one question and wait for the answer.",
+      "files": [
+        {
+          "path": "registry/tools/ask_question.ts",
+          "type": "registry:file",
+          "target": "agent/tools/ask_question.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/bash",
+      "type": "registry:item",
+      "title": "Bash",
+      "description": "Run shell commands in the agent sandbox.",
+      "files": [
+        {
+          "path": "registry/tools/bash.ts",
+          "type": "registry:file",
+          "target": "agent/tools/bash.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/load_skill",
+      "type": "registry:item",
+      "title": "Load Skill",
+      "description": "Load instructions from an agent skill.",
+      "files": [
+        {
+          "path": "registry/tools/load_skill.ts",
+          "type": "registry:file",
+          "target": "agent/tools/load_skill.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/read_file",
+      "type": "registry:item",
+      "title": "Read File",
+      "description": "Read text files from the agent sandbox.",
+      "files": [
+        {
+          "path": "registry/tools/read_file.ts",
+          "type": "registry:file",
+          "target": "agent/tools/read_file.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/web_fetch",
+      "type": "registry:item",
+      "title": "Web Fetch",
+      "description": "Fetch a URL from the app runtime.",
+      "files": [
+        {
+          "path": "registry/tools/web_fetch.ts",
+          "type": "registry:file",
+          "target": "agent/tools/web_fetch.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/web_search",
+      "type": "registry:item",
+      "title": "Web Search",
+      "description": "Search the web through the model provider.",
+      "files": [
+        {
+          "path": "registry/tools/web_search.ts",
+          "type": "registry:file",
+          "target": "agent/tools/web_search.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/write_file",
+      "type": "registry:item",
+      "title": "Write File",
+      "description": "Write complete files in the agent sandbox.",
+      "files": [
+        {
+          "path": "registry/tools/write_file.ts",
+          "type": "registry:file",
+          "target": "agent/tools/write_file.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/glob",
+      "type": "registry:item",
+      "title": "Glob",
+      "description": "Find sandbox files by glob pattern.",
+      "files": [
+        {
+          "path": "registry/tools/glob.ts",
+          "type": "registry:file",
+          "target": "agent/tools/glob.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/grep",
+      "type": "registry:item",
+      "title": "Grep",
+      "description": "Search sandbox file contents with a regular expression.",
+      "files": [
+        {
+          "path": "registry/tools/grep.ts",
+          "type": "registry:file",
+          "target": "agent/tools/grep.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/sleep",
+      "type": "registry:item",
+      "title": "Sleep",
+      "description": "Pause and durably resume the current turn.",
+      "files": [
+        {
+          "path": "registry/tools/sleep.ts",
+          "type": "registry:file",
+          "target": "agent/tools/sleep.ts"
+        }
+      ]
+    },
+    {
+      "name": "tool/no_reply",
+      "type": "registry:item",
+      "title": "No Reply",
+      "description": "End the turn without sending a reply.",
+      "files": [
+        {
+          "path": "registry/tools/no_reply.ts",
+          "type": "registry:file",
+          "target": "agent/tools/no_reply.ts"
+        }
+      ]
+    },
+    {
       "name": "connection/browser-use",
       "type": "registry:item",
       "title": "Browser Use",
@@ -251,6 +493,23 @@
       ]
     },
     {
+      "name": "connection/dataforseo",
+      "type": "registry:item",
+      "title": "DataForSEO",
+      "description": "Run SEO, keyword, and SERP data lookups through DataForSEO's MCP server.",
+      "envVars": {
+        "DATAFORSEO_USERNAME": "",
+        "DATAFORSEO_PASSWORD": ""
+      },
+      "files": [
+        {
+          "path": "registry/connections/dataforseo.ts",
+          "type": "registry:file",
+          "target": "agent/connections/dataforseo.ts"
+        }
+      ]
+    },
+    {
       "name": "connection/vercel",
       "type": "registry:item",
       "title": "Vercel",
@@ -261,7 +520,15 @@
             "command": "eve",
             "package": "eve",
             "bin": "eve",
-            "args": ["integration", "connect", "vercel", "vercel", "vercel"]
+            "args": [
+              "integration",
+              "connect",
+              "vercel",
+              "vercel",
+              "vercel",
+              "--connection-method",
+              "mcp"
+            ]
           },
           "requires": ">=0.29.0"
         }
@@ -862,6 +1129,31 @@
       ]
     },
     {
+      "name": "connection/neon",
+      "type": "registry:item",
+      "title": "Neon",
+      "description": "Manage Neon projects, run queries, and make schema changes.",
+      "meta": {
+        "eve": {
+          "setup": {
+            "command": "eve",
+            "package": "eve",
+            "bin": "eve",
+            "args": ["integration", "connect", "neon", "neon", "neon", "--principal-type", "app"]
+          },
+          "requires": ">=0.48.0"
+        }
+      },
+      "dependencies": ["@vercel/connect"],
+      "files": [
+        {
+          "path": "registry/connections/neon.ts",
+          "type": "registry:file",
+          "target": "agent/connections/neon.ts"
+        }
+      ]
+    },
+    {
       "name": "connection/netlify",
       "type": "registry:item",
       "title": "Netlify",
@@ -1008,6 +1300,41 @@
           "path": "registry/connections/razorpay.ts",
           "type": "registry:file",
           "target": "agent/connections/razorpay.ts"
+        }
+      ]
+    },
+    {
+      "name": "connection/sanity",
+      "type": "registry:item",
+      "title": "Sanity",
+      "description": "Query and edit Sanity content, inspect schemas, and manage releases.",
+      "meta": {
+        "eve": {
+          "setup": {
+            "command": "eve",
+            "package": "eve",
+            "bin": "eve",
+            "args": [
+              "integration",
+              "connect",
+              "sanity",
+              "sanity",
+              "sanity",
+              "--connection-method",
+              "mcp"
+            ]
+          },
+          "requires": ">=0.55.0"
+        }
+      },
+      "dependencies": [
+        "@vercel/connect"
+      ],
+      "files": [
+        {
+          "path": "registry/connections/sanity.ts",
+          "type": "registry:file",
+          "target": "agent/connections/sanity.ts"
         }
       ]
     },
@@ -1196,9 +1523,17 @@
             "command": "eve",
             "package": "eve",
             "bin": "eve",
-            "args": ["integration", "connect", "tinybird", "tinybird", "tinybird"]
+            "args": [
+              "integration",
+              "connect",
+              "tinybird",
+              "tinybird",
+              "tinybird",
+              "--principal-type",
+              "app"
+            ]
           },
-          "requires": ">=0.29.0"
+          "requires": ">=0.48.0"
         }
       },
       "dependencies": ["@vercel/connect"],
@@ -1379,24 +1714,22 @@
       "name": "channel/teams",
       "type": "registry:item",
       "title": "Microsoft Teams",
-      "description": "Bring your agent into Teams chats and channels.",
-      "envVars": {
-        "TEAMS_APP_ID": "",
-        "TEAMS_APP_PASSWORD": ""
-      },
-      "files": [
-        {
-          "path": "registry/channels/teams.ts",
-          "type": "registry:file",
-          "target": "agent/channels/teams.ts"
-        }
-      ],
+      "description": "Run an eve agent as a managed Microsoft Teams bot, with guided Vercel Connect setup.",
       "meta": {
         "eve": {
+          "setup": {
+            "command": "eve",
+            "package": "eve",
+            "bin": "eve",
+            "args": ["integration", "setup", "teams"]
+          },
+          "requires": ">=0.53.0",
           "docs": "/docs/channels/teams",
           "implementation": "native"
         }
-      }
+      },
+      "dependencies": ["@vercel/connect@>=2.1.0"],
+      "devDependencies": ["vercel@>=58.5.1"]
     },
     {
       "name": "channel/telegram",
@@ -1489,7 +1822,7 @@
       "devDependencies": ["vercel@>=58.5.1"]
     },
     {
-      "name": "channel/linear-agent",
+      "name": "channel/linear",
       "type": "registry:item",
       "title": "Linear Agent",
       "description": "Delegate Linear issues and comments through Agent Sessions, with guided Vercel Connect setup.",
@@ -1522,7 +1855,7 @@
             "bin": "eve",
             "args": ["integration", "setup", "web"]
           },
-          "requires": ">=0.33.0",
+          "requires": ">=0.66.1",
           "docs": "/docs/channels/eve",
           "implementation": "native"
         }
@@ -1543,7 +1876,7 @@
         "lucide-react@1.16.0",
         "motion@12.40.0",
         "nanoid@5.1.11",
-        "next@16.3.0-preview.6",
+        "next@16.3.6",
         "radix-ui@1.4.3",
         "react@19.2.6",
         "react-dom@19.2.6",
@@ -1562,204 +1895,209 @@
       ],
       "files": [
         {
-          "path": "registry/channel/web/agent/channels/eve.ts",
-          "type": "registry:file",
-          "target": "agent/channels/eve.ts"
-        },
-        {
           "path": "registry/channel/web/app/_components/agent-chat.tsx",
           "type": "registry:file",
-          "target": "app/_components/agent-chat.tsx"
+          "target": "apps/web/app/_components/agent-chat.tsx"
         },
         {
           "path": "registry/channel/web/app/_components/agent-message.tsx",
           "type": "registry:file",
-          "target": "app/_components/agent-message.tsx"
+          "target": "apps/web/app/_components/agent-message.tsx"
         },
         {
           "path": "registry/channel/web/app/globals.css",
           "type": "registry:file",
-          "target": "app/globals.css"
+          "target": "apps/web/app/globals.css"
         },
         {
           "path": "registry/channel/web/app/icon.svg",
           "type": "registry:file",
-          "target": "app/icon.svg"
+          "target": "apps/web/app/icon.svg"
         },
         {
           "path": "registry/channel/web/app/apple-icon.tsx",
           "type": "registry:file",
-          "target": "app/apple-icon.tsx"
+          "target": "apps/web/app/apple-icon.tsx"
         },
         {
           "path": "registry/channel/web/app/layout.tsx",
           "type": "registry:file",
-          "target": "app/layout.tsx"
+          "target": "apps/web/app/layout.tsx"
         },
         {
           "path": "registry/channel/web/app/page.tsx",
           "type": "registry:file",
-          "target": "app/page.tsx"
+          "target": "apps/web/app/page.tsx"
         },
         {
           "path": "registry/channel/web/app/s/[sessionId]/page.tsx",
           "type": "registry:file",
-          "target": "app/s/[sessionId]/page.tsx"
+          "target": "apps/web/app/s/[sessionId]/page.tsx"
         },
         {
           "path": "registry/channel/web/app/s/page.tsx",
           "type": "registry:file",
-          "target": "app/s/page.tsx"
+          "target": "apps/web/app/s/page.tsx"
         },
         {
           "path": "registry/channel/web/components.json",
           "type": "registry:file",
-          "target": "components.json"
+          "target": "apps/web/components.json"
         },
         {
           "path": "registry/channel/web/components/ai-elements/chain-of-thought.tsx",
           "type": "registry:file",
-          "target": "components/ai-elements/chain-of-thought.tsx"
+          "target": "apps/web/components/ai-elements/chain-of-thought.tsx"
         },
         {
           "path": "registry/channel/web/components/ai-elements/code-block.tsx",
           "type": "registry:file",
-          "target": "components/ai-elements/code-block.tsx"
+          "target": "apps/web/components/ai-elements/code-block.tsx"
         },
         {
           "path": "registry/channel/web/components/ai-elements/conversation.tsx",
           "type": "registry:file",
-          "target": "components/ai-elements/conversation.tsx"
+          "target": "apps/web/components/ai-elements/conversation.tsx"
         },
         {
           "path": "registry/channel/web/components/ai-elements/message.tsx",
           "type": "registry:file",
-          "target": "components/ai-elements/message.tsx"
+          "target": "apps/web/components/ai-elements/message.tsx"
         },
         {
           "path": "registry/channel/web/components/ai-elements/prompt-input.tsx",
           "type": "registry:file",
-          "target": "components/ai-elements/prompt-input.tsx"
+          "target": "apps/web/components/ai-elements/prompt-input.tsx"
         },
         {
           "path": "registry/channel/web/components/ai-elements/question.tsx",
           "type": "registry:file",
-          "target": "components/ai-elements/question.tsx"
+          "target": "apps/web/components/ai-elements/question.tsx"
         },
         {
           "path": "registry/channel/web/components/ai-elements/reasoning.tsx",
           "type": "registry:file",
-          "target": "components/ai-elements/reasoning.tsx"
+          "target": "apps/web/components/ai-elements/reasoning.tsx"
         },
         {
           "path": "registry/channel/web/components/ai-elements/shimmer.tsx",
           "type": "registry:file",
-          "target": "components/ai-elements/shimmer.tsx"
+          "target": "apps/web/components/ai-elements/shimmer.tsx"
         },
         {
           "path": "registry/channel/web/components/ai-elements/tool.tsx",
           "type": "registry:file",
-          "target": "components/ai-elements/tool.tsx"
+          "target": "apps/web/components/ai-elements/tool.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/badge.tsx",
           "type": "registry:file",
-          "target": "components/ui/badge.tsx"
+          "target": "apps/web/components/ui/badge.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/button-group.tsx",
           "type": "registry:file",
-          "target": "components/ui/button-group.tsx"
+          "target": "apps/web/components/ui/button-group.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/button.tsx",
           "type": "registry:file",
-          "target": "components/ui/button.tsx"
+          "target": "apps/web/components/ui/button.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/collapsible.tsx",
           "type": "registry:file",
-          "target": "components/ui/collapsible.tsx"
+          "target": "apps/web/components/ui/collapsible.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/command.tsx",
           "type": "registry:file",
-          "target": "components/ui/command.tsx"
+          "target": "apps/web/components/ui/command.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/dialog.tsx",
           "type": "registry:file",
-          "target": "components/ui/dialog.tsx"
+          "target": "apps/web/components/ui/dialog.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/dropdown-menu.tsx",
           "type": "registry:file",
-          "target": "components/ui/dropdown-menu.tsx"
+          "target": "apps/web/components/ui/dropdown-menu.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/hover-card.tsx",
           "type": "registry:file",
-          "target": "components/ui/hover-card.tsx"
+          "target": "apps/web/components/ui/hover-card.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/input-group.tsx",
           "type": "registry:file",
-          "target": "components/ui/input-group.tsx"
+          "target": "apps/web/components/ui/input-group.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/input.tsx",
           "type": "registry:file",
-          "target": "components/ui/input.tsx"
+          "target": "apps/web/components/ui/input.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/select.tsx",
           "type": "registry:file",
-          "target": "components/ui/select.tsx"
+          "target": "apps/web/components/ui/select.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/separator.tsx",
           "type": "registry:file",
-          "target": "components/ui/separator.tsx"
+          "target": "apps/web/components/ui/separator.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/spinner.tsx",
           "type": "registry:file",
-          "target": "components/ui/spinner.tsx"
+          "target": "apps/web/components/ui/spinner.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/textarea.tsx",
           "type": "registry:file",
-          "target": "components/ui/textarea.tsx"
+          "target": "apps/web/components/ui/textarea.tsx"
         },
         {
           "path": "registry/channel/web/components/ui/tooltip.tsx",
           "type": "registry:file",
-          "target": "components/ui/tooltip.tsx"
+          "target": "apps/web/components/ui/tooltip.tsx"
         },
         {
           "path": "registry/channel/web/css.d.ts",
           "type": "registry:file",
-          "target": "css.d.ts"
+          "target": "apps/web/css.d.ts"
         },
         {
           "path": "registry/channel/web/lib/utils.ts",
           "type": "registry:file",
-          "target": "lib/utils.ts"
+          "target": "apps/web/lib/utils.ts"
         },
         {
           "path": "registry/channel/web/next-env.d.ts",
           "type": "registry:file",
-          "target": "next-env.d.ts"
+          "target": "apps/web/next-env.d.ts"
         },
         {
           "path": "registry/channel/web/next.config.ts",
           "type": "registry:file",
-          "target": "next.config.ts"
+          "target": "apps/web/next.config.ts"
         },
         {
           "path": "registry/channel/web/postcss.config.mjs",
           "type": "registry:file",
-          "target": "postcss.config.mjs"
+          "target": "apps/web/postcss.config.mjs"
+        },
+        {
+          "path": "registry/channel/web/proxy.ts",
+          "type": "registry:file",
+          "target": "apps/web/proxy.ts"
+        },
+        {
+          "path": "registry/channel/web/tsconfig.json",
+          "type": "registry:file",
+          "target": "apps/web/tsconfig.json"
         }
       ]
     },
@@ -2172,11 +2510,48 @@
       }
     },
     {
+      "name": "channel/chat-sdk-gmail",
+      "type": "registry:item",
+      "title": "Gmail",
+      "description": "Turn labelled Gmail threads into agent conversations via the Chat SDK.",
+      "dependencies": ["chat", "@chat-adapter/gmail", "@chat-adapter/state-redis"],
+      "envVars": {
+        "REDIS_URL": "",
+        "GMAIL_MAILBOX": "",
+        "GMAIL_LABEL_ID": "",
+        "GMAIL_CLIENT_ID": "",
+        "GMAIL_CLIENT_SECRET": "",
+        "GMAIL_REFRESH_TOKEN": "",
+        "GMAIL_PUBSUB_AUDIENCE": "",
+        "GMAIL_PUBSUB_SERVICE_ACCOUNT_EMAIL": "",
+        "GMAIL_SUBSCRIPTION": "",
+        "GMAIL_TOPIC_NAME": ""
+      },
+      "files": [
+        {
+          "path": "registry/channels/gmail.ts",
+          "type": "registry:file",
+          "target": "agent/channels/gmail.ts"
+        },
+        {
+          "path": "registry/schedules/gmail-maintenance.ts",
+          "type": "registry:file",
+          "target": "agent/schedules/gmail-maintenance.ts"
+        }
+      ],
+      "meta": {
+        "eve": {
+          "docs": "/integrations/chat-sdk-gmail#configure",
+          "implementation": "chat-sdk"
+        }
+      }
+    },
+    {
       "name": "instrumentation/braintrust",
       "type": "registry:item",
       "title": "Braintrust",
       "description": "Trace eve agent sessions in Braintrust, including turns, steps, tool calls, and subagent interactions.",
-      "dependencies": ["braintrust"],
+      "dependencies": ["braintrust@^3.29.0"],
       "envVars": {
         "BRAINTRUST_API_KEY": ""
       },
@@ -2184,12 +2559,7 @@
         {
           "path": "registry/instrumentation/braintrust.ts",
           "type": "registry:file",
-          "target": "agent/instrumentation.ts"
-        },
-        {
-          "path": "registry/instrumentation/braintrust-hook.ts",
-          "type": "registry:file",
-          "target": "agent/hooks/braintrust.ts"
+          "target": "agent/instrumentation/braintrust.ts"
         }
       ]
     },
@@ -2213,7 +2583,7 @@
         {
           "path": "registry/instrumentation/posthog.ts",
           "type": "registry:file",
-          "target": "agent/instrumentation.ts"
+          "target": "agent/instrumentation/posthog.ts"
         }
       ]
     },
@@ -2231,7 +2601,7 @@
         {
           "path": "registry/instrumentation/sentry.ts",
           "type": "registry:file",
-          "target": "agent/instrumentation.ts"
+          "target": "agent/instrumentation/sentry.ts"
         }
       ]
     },
@@ -2249,7 +2619,7 @@
         {
           "path": "registry/instrumentation/datadog.ts",
           "type": "registry:file",
-          "target": "agent/instrumentation.ts"
+          "target": "agent/instrumentation/datadog.ts"
         }
       ]
     },
@@ -2266,7 +2636,7 @@
         {
           "path": "registry/instrumentation/honeycomb.ts",
           "type": "registry:file",
-          "target": "agent/instrumentation.ts"
+          "target": "agent/instrumentation/honeycomb.ts"
         }
       ]
     },
@@ -2284,7 +2654,7 @@
         {
           "path": "registry/instrumentation/arize.ts",
           "type": "registry:file",
-          "target": "agent/instrumentation.ts"
+          "target": "agent/instrumentation/arize.ts"
         }
       ]
     },
@@ -2301,7 +2671,7 @@
         {
           "path": "registry/instrumentation/raindrop.ts",
           "type": "registry:file",
-          "target": "agent/instrumentation.ts"
+          "target": "agent/instrumentation/raindrop.ts"
         }
       ]
     },
@@ -2315,7 +2685,7 @@
         {
           "path": "registry/instrumentation/jaeger.ts",
           "type": "registry:file",
-          "target": "agent/instrumentation.ts"
+          "target": "agent/instrumentation/jaeger.ts"
         }
       ]
     }

@@ -23,6 +23,14 @@ import {
 const REGISTRY_GLOBAL_KEY = Symbol.for("eve.harness-instrumentation-providers");
 const RUNTIME_GLOBAL_KEY = Symbol.for("eve.instrumentation-runtime");
 
+const traceContext = (audience: "public" | "private" | "unknown") => ({
+  agentName: "weather",
+  audience,
+  channel: { kind: "http" as const },
+  environment: "production" as const,
+  principalType: "anonymous",
+});
+
 function register(slot: string, value: unknown): Promise<void> {
   return registerInstrumentationProvider({ agentName: "weather-agent", slot, value });
 }
@@ -122,6 +130,15 @@ describe("registerInstrumentationProvider", () => {
       /The default export of "instrumentation\/otel" is not an instrumentation provider/,
     );
   });
+
+  it("rejects the removed capture option", async () => {
+    const provider = defineInstrumentation({ capture: "metadata" } as never);
+
+    await expect(register("audit", provider)).rejects.toThrow(
+      /instrumentation\/audit.*no longer supports `capture`.*Use `tracePolicy`/u,
+    );
+    expect(getInstrumentationProviders()).toEqual([]);
+  });
 });
 
 describe("seedInstrumentationProviders", () => {
@@ -141,18 +158,27 @@ describe("seedInstrumentationProviders", () => {
     expect(getInstrumentationProviders().map(({ slot }) => slot)).toEqual(["backend", "local"]);
   });
 
-  it("seeds Agent Runs only in Vercel production", () => {
+  it.each(["preview", "production"])("seeds Agent Runs in Vercel %s", (environment) => {
     vi.stubEnv(DEVELOPMENT_WORKER_APP_ROOT_ENV, undefined);
-    vi.stubEnv("VERCEL_ENV", "production");
+    vi.stubEnv("VERCEL_ENV", environment);
 
     seedInstrumentationProviders();
 
     expect(getInstrumentationProviders().map(({ slot }) => slot)).toEqual(["agent-runs"]);
   });
 
+  it("does not seed Agent Runs in Vercel development", () => {
+    vi.stubEnv(DEVELOPMENT_WORKER_APP_ROOT_ENV, undefined);
+    vi.stubEnv("VERCEL_ENV", "development");
+
+    seedInstrumentationProviders();
+
+    expect(getInstrumentationProviders()).toEqual([]);
+  });
+
   it("lets an authored reserved slot reconfigure or disable its default", async () => {
     seedInstrumentationProviders();
-    const authored = localTraces({ exportPolicy: { span: () => false } });
+    const authored = localTraces({ exportPolicy: { span: () => ({ emit: false }) } });
     await register("local", authored);
     expect(getInstrumentationProviders()).toEqual([{ provider: authored, slot: "local" }]);
 
@@ -160,11 +186,11 @@ describe("seedInstrumentationProviders", () => {
     expect(getInstrumentationProviders()).toEqual([]);
   });
 
-  it("lets an authored Agent Runs slot reconfigure the production default", async () => {
+  it("lets an authored Agent Runs slot reconfigure the hosted default", async () => {
     vi.stubEnv(DEVELOPMENT_WORKER_APP_ROOT_ENV, undefined);
     vi.stubEnv("VERCEL_ENV", "production");
     seedInstrumentationProviders();
-    const authored = agentRuns({ exportPolicy: { span: () => false } });
+    const authored = agentRuns({ exportPolicy: { span: () => ({ emit: false }) } });
 
     await register("agent-runs", authored);
 
@@ -176,7 +202,7 @@ describe("seedInstrumentationProviders", () => {
     seedInstrumentationProviders();
     await register("zeta", defineInstrumentation({}));
     await register("audit", defineInstrumentation({}));
-    await register("local", localTraces({ exportPolicy: { span: () => false } }));
+    await register("local", localTraces({ exportPolicy: { span: () => ({ emit: false }) } }));
 
     expect(getInstrumentationProviders().map(({ slot }) => slot)).toEqual([
       "agent-runs",
@@ -208,45 +234,68 @@ describe("finalizeInstrumentationProviders", () => {
     await register("rows", defineInstrumentation({ events: { "turn.started": started } }));
 
     const runtime = finalizeInstrumentationProviders({ serviceName: "weather-agent" });
-    await runtime.hooks.forTrace!({ agentName: "weather-agent", audience: "unknown" }).publish(
-      turnStarted,
-    );
+    await runtime.hooks.forTrace!(traceContext("unknown")).publish(turnStarted);
 
-    expect(runtime.instrumentationProviders).toBe(true);
     expect(started).toHaveBeenCalledOnce();
     expect(started.mock.calls[0]?.[0]).toMatchObject({ turnId: "turn-1" });
   });
 
-  it.each([
-    ["content", true],
-    ["metadata", false],
-  ] as const)(
-    "maps the deprecated %s capture setting to provider policy",
-    async (capture, expected) => {
-      await register("legacy", defineInstrumentation({ capture }));
-
-      const runtime = finalizeInstrumentationProviders({ serviceName: "weather-agent" });
-
-      expect(
-        runtime.hooks.forTrace?.({ agentName: "weather", audience: "private" }).capturesContent,
-      ).toBe(expected);
-    },
-  );
-
-  it("prefers provider tracePolicy over deprecated capture", async () => {
+  it("publishes one durable tool lifecycle without duplicate SDK callbacks", async () => {
+    const started = vi.fn((_event, ctx) => ctx.state.set({ started: true }));
+    const completed = vi.fn((_event, ctx) => expect(ctx.state.get()).toEqual({ started: true }));
     await register(
-      "provider",
+      "audit",
       defineInstrumentation({
-        capture: "metadata",
-        tracePolicy: () => ({ emit: true, recordInputs: true, recordOutputs: true }),
+        events: {
+          "tool.call.started": started,
+          "tool.call.completed": completed,
+        },
       }),
     );
-
     const runtime = finalizeInstrumentationProviders({ serviceName: "weather-agent" });
-
-    expect(
-      runtime.hooks.forTrace?.({ agentName: "weather", audience: "private" }).capturesContent,
-    ).toBe(true);
+    const hooks = runtime.hooks.forTrace!(traceContext("unknown"));
+    const scope = {
+      attemptId: "attempt",
+      attemptIndex: 0,
+      sessionId: "session-1",
+      turnId: "turn-1",
+      stepIndex: 0,
+    };
+    await hooks.publish({
+      type: "tool.call.started",
+      idempotencyKey: "call",
+      callId: "call-1",
+      toolName: "weather",
+      kind: "tool-call",
+      input: undefined,
+      scope,
+    });
+    await runtime.runInContext(
+      {
+        type: "tool.call",
+        idempotencyKey: "execution",
+        callId: "call-1",
+        toolName: "weather",
+        input: undefined,
+        scope,
+      },
+      () => Promise.resolve(),
+    );
+    await hooks.publish({ type: "step.attempt.completed", idempotencyKey: "attempt", scope });
+    await hooks.publish({
+      type: "tool.call.completed",
+      idempotencyKey: "call",
+      outcome: "completed",
+      usage: { inputTokens: 10 },
+      output: { type: "result" },
+      scope,
+    });
+    expect(started).toHaveBeenCalledOnce();
+    expect(completed).toHaveBeenCalledOnce();
+    expect(completed.mock.calls[0]?.[0]).toMatchObject({
+      outcome: "completed",
+      usage: { inputTokens: 10 },
+    });
   });
 
   it("still runs execution when no destination was declared", async () => {

@@ -41,6 +41,18 @@ describe("integration catalog", () => {
     }
   });
 
+  it("catalogs Neon with its official MCP endpoint", () => {
+    expect(getIntegrationEntry("neon")).toMatchObject({
+      name: "Neon",
+      kind: "connection",
+      surfaces: { scaffoldable: false, registry: true, gallery: true },
+      connection: {
+        description: "Neon: manage projects, run queries, and make schema changes.",
+        mcp: { url: "https://mcp.neon.tech/mcp" },
+      },
+    });
+  });
+
   it("keeps channels free of connection identity", () => {
     for (const entry of channelEntries()) {
       expect(entry.connection).toBeUndefined();
@@ -48,6 +60,7 @@ describe("integration catalog", () => {
   });
 
   it("keeps extensions free of connection identity", () => {
+    expect(extensionEntries().length).toBeGreaterThan(0);
     for (const entry of extensionEntries()) {
       expect(entry.connection).toBeUndefined();
     }
@@ -95,41 +108,6 @@ describe("integration catalog", () => {
     expect(getIntegrationEntry("linear")!.connection!.mcp!.url).toBe("https://mcp.linear.app/mcp");
   });
 
-  it("exposes Kernel as an extension", () => {
-    expect(getIntegrationEntry("kernel")?.kind).toBe("extension");
-    expect(getIntegrationEntry("kernel")?.connection).toBeUndefined();
-  });
-
-  it("exposes Browserbase as an extension", () => {
-    expect(getIntegrationEntry("browserbase")?.kind).toBe("extension");
-    expect(getIntegrationEntry("browserbase")?.connection).toBeUndefined();
-  });
-
-  it("exposes Jetty as an extension", () => {
-    expect(getIntegrationEntry("jetty")?.kind).toBe("extension");
-    expect(getIntegrationEntry("jetty")?.connection).toBeUndefined();
-  });
-
-  it("exposes Upstash AgentKit as an extension", () => {
-    expect(getIntegrationEntry("upstash-agentkit")?.kind).toBe("extension");
-    expect(getIntegrationEntry("upstash-agentkit")?.connection).toBeUndefined();
-  });
-
-  it("exposes Kybernesis Arcana as an extension", () => {
-    expect(getIntegrationEntry("arcana")?.kind).toBe("extension");
-    expect(getIntegrationEntry("arcana")?.connection).toBeUndefined();
-  });
-
-  it("exposes Hindsight as an extension", () => {
-    expect(getIntegrationEntry("hindsight")?.kind).toBe("extension");
-    expect(getIntegrationEntry("hindsight")?.connection).toBeUndefined();
-  });
-
-  it("exposes Supermemory as a memory provider", () => {
-    expect(getIntegrationEntry("supermemory")?.kind).toBe("memory");
-    expect(getIntegrationEntry("supermemory")?.connection).toBeUndefined();
-  });
-
   it("exposes Buzz as a gallery-only channel", () => {
     expect(getIntegrationEntry("buzz")).toMatchObject({
       kind: "channel",
@@ -137,10 +115,11 @@ describe("integration catalog", () => {
     });
   });
 
-  it("exposes GitHub Tools as an extension distinct from the GitHub channel", () => {
-    expect(getIntegrationEntry("github")?.kind).toBe("channel");
-    expect(getIntegrationEntry("github-tools")?.kind).toBe("extension");
-    expect(getIntegrationEntry("github-tools")?.connection).toBeUndefined();
+  it("exposes Mux Video as a gallery-only extension", () => {
+    expect(getIntegrationEntry("mux-video")).toMatchObject({
+      kind: "extension",
+      surfaces: { scaffoldable: false, registry: false, gallery: true },
+    });
   });
 
   it("uses Browser Use's streamable HTTP MCP endpoint", () => {

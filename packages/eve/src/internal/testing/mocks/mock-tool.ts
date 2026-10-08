@@ -12,7 +12,9 @@ import { toInputSchema } from "#tools/schema.js";
  * source id, permissive input schema) so most tests can supply just a name
  * and an `execute` function. Everything else is overrideable.
  */
-export interface MockToolInput {
+interface MockToolInput {
+  /** Presentation callbacks derived from tool lifecycle values. */
+  readonly label?: ResolvedToolDefinition["label"];
   /** Tool name exposed to the model. */
   readonly name: string;
   /** Human-readable description surfaced in the prompt. */
@@ -48,6 +50,7 @@ export interface MockToolInput {
 export function mockTool(input: MockToolInput): ResolvedToolDefinition {
   const logicalPath = input.logicalPath ?? `tools/${sanitizeLogicalPathSegment(input.name)}.ts`;
   const definition: ResolvedToolDefinition = {
+    label: input.label,
     description: input.description ?? `${input.name} mock tool.`,
     inputSchema: toInputSchema(input.inputSchema ?? null),
     logicalPath,

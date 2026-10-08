@@ -1,12 +1,8 @@
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
-import { z } from "zod";
 
-import {
-  readVercelProjectLink,
-  type VercelProjectLink,
-  VercelProjectLinkSchema,
-} from "#internal/vercel/project-link.js";
+import { readVercelProjectLink, type VercelProjectLink } from "#internal/vercel/project-link.js";
+import { readVercelResourceName } from "#internal/vercel/api-resource.js";
 import { captureVercel } from "./primitives/run-vercel.js";
 
 /** Link and production-deployment status for a Vercel project directory. */
@@ -20,25 +16,8 @@ export interface DeploymentInfo {
   productionUrl?: string;
 }
 
-const VercelProjectEnvironmentSchema = z.object({
-  VERCEL_ORG_ID: VercelProjectLinkSchema.shape.orgId,
-  VERCEL_PROJECT_ID: VercelProjectLinkSchema.shape.projectId,
-});
-
 /** Validated Vercel owner and project identifiers. */
 export type VercelProjectReference = VercelProjectLink;
-
-/** Parses the complete Vercel owner and project environment pair. */
-export function projectReferenceFromEnvironment(
-  environment: Readonly<Record<string, string | undefined>>,
-): VercelProjectReference | undefined {
-  const parsed = VercelProjectEnvironmentSchema.safeParse(environment);
-  if (!parsed.success) return undefined;
-  return {
-    orgId: parsed.data.VERCEL_ORG_ID,
-    projectId: parsed.data.VERCEL_PROJECT_ID,
-  };
-}
 
 /** Rejects Vercel's unsupported legacy link directory before link mutation. */
 export async function assertNoLegacyProjectLinkDirectory(projectRoot: string): Promise<void> {
@@ -137,11 +116,6 @@ export interface ProjectIdentity {
   teamName?: string;
 }
 
-interface VercelApiNamed {
-  name?: unknown;
-  slug?: unknown;
-}
-
 /** Reads a `name` (or `slug` fallback) off a Vercel API resource, or undefined. */
 async function fetchVercelName(
   apiPath: string,
@@ -155,10 +129,7 @@ async function fetchVercelName(
   });
   if (!result.ok) return undefined;
   try {
-    const parsed = JSON.parse(result.stdout) as VercelApiNamed;
-    if (typeof parsed.name === "string" && parsed.name.length > 0) return parsed.name;
-    if (typeof parsed.slug === "string" && parsed.slug.length > 0) return parsed.slug;
-    return undefined;
+    return readVercelResourceName(JSON.parse(result.stdout));
   } catch {
     return undefined;
   }

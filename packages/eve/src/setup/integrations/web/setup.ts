@@ -1,50 +1,172 @@
-import { detectPackageManager } from "#setup/package-manager.js";
-import { formatNodeEngineOverrideWarning } from "#setup/node-engine.js";
-import { ensureChannel, type EnsureChannelOptions } from "#setup/scaffold/index.js";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
-import { installScaffoldDependencies, reportOverwrittenFiles } from "../shared/scaffold.js";
+import { resolveEveProjectContext } from "#internal/project-context.js";
+import { select } from "#setup/ask.js";
+import type { RegistrySetupCompletion } from "#setup/registry-setup-protocol.js";
+import type { VercelProjectReference } from "#setup/project-resolution.js";
+import { installScaffoldDependencies } from "../shared/scaffold.js";
+import { prepareWebAuthScaffold } from "./auth-scaffold.js";
+import { WEB_AUTHENTICATION_QUESTION } from "./auth-options.js";
+import { provisionWebChatAuth } from "./provision-auth.js";
+import { detectPackageManager, type PackageManagerKind } from "#setup/package-manager.js";
+import { pathExists, writeTextFile } from "#setup/scaffold/files.js";
+import { WEB_CHANNEL_TEMPLATES } from "#setup/scaffold/create/web-template.js";
 import {
   defineSetupIntegration,
   type SetupApplyContext,
   type SetupPrepareContext,
 } from "../types.js";
 
-function reportCompetingNextConfigFiles(
-  log: Parameters<typeof reportOverwrittenFiles>[0],
-  files: readonly string[] | undefined,
-): void {
-  for (const filePath of files ?? []) {
-    log.warning(
-      `Found competing Next.js config at ${filePath}; merge any needed settings into next.config.ts and remove it before starting the preview, or Next.js may ignore the generated eve rewrite.`,
-    );
-  }
-}
+const NEXT_HOSTED_CONFIG = `import type { NextConfig } from "next";
+import { withEve } from "eve/next";
+import { fileURLToPath } from "node:url";
+
+const nextConfig: NextConfig = {};
+const eveRoot = fileURLToPath(new URL("../..", import.meta.url));
+
+export default withEve(nextConfig, { eveRoot });
+`;
+const PEER_SERVICE_NEXT_CONFIG = `import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {};
+
+export default nextConfig;
+`;
+const PEER_SERVICE_WEB_BUILD_COMMAND = "node ../../node_modules/next/dist/bin/next build";
+const PEER_SERVICE_VERCEL_CONFIG = `import { withEve } from "eve/vercel";
+
+export default await withEve({
+  services: {
+    web: {
+      framework: "nextjs",
+      root: "apps/web",
+      buildCommand: "${PEER_SERVICE_WEB_BUILD_COMMAND}",
+    },
+  },
+  routes: [
+    { src: "^(.*)$", destination: { type: "service", service: "web" } },
+  ],
+});
+`;
 
 export interface WebSetupDeps {
   detectPackageManager: typeof detectPackageManager;
-  ensureChannel: typeof ensureChannel;
+  pathExists: typeof pathExists;
+  readTextFile(path: string): Promise<string>;
+  resolveEveProjectContext: typeof resolveEveProjectContext;
+  writeTextFile: typeof writeTextFile;
+  prepareWebAuthScaffold: typeof prepareWebAuthScaffold;
+  provisionWebChatAuth: typeof provisionWebChatAuth;
   installScaffoldDependencies: typeof installScaffoldDependencies;
 }
 
 const defaultDeps: WebSetupDeps = {
   detectPackageManager,
-  ensureChannel,
+  pathExists,
+  readTextFile: (path) => readFile(path, "utf8"),
+  resolveEveProjectContext,
+  writeTextFile,
+  prepareWebAuthScaffold,
+  provisionWebChatAuth,
   installScaffoldDependencies,
 };
 
-export interface WebSetupPlan {
-  configureVercelServices: boolean;
-  packageManager: Awaited<ReturnType<typeof detectPackageManager>>["kind"];
+interface WebSetupPlan {
+  hosting: "next" | "vercel";
+  packageManager: PackageManagerKind;
+  authProject?: VercelProjectReference;
+  rootWebChat?: boolean;
 }
 
 export async function prepareWebSetup(
   context: SetupPrepareContext,
   deps: WebSetupDeps = defaultDeps,
 ): Promise<WebSetupPlan> {
-  return {
-    packageManager: (await deps.detectPackageManager(context.appRoot)).kind,
-    configureVercelServices: context.environment.vercel.kind === "available",
+  const project = await deps.resolveEveProjectContext(context.appRoot);
+  if (project.kind === "workspace") {
+    throw new Error("Web Chat setup requires a selected workspace agent.");
+  }
+  const rootWebChat =
+    (await deps.pathExists(join(project.environmentRoot, "app", "eve-agent.ts"))) &&
+    !(await deps.pathExists(join(project.environmentRoot, "apps", "web", "app", "eve-agent.ts")));
+  const hosting = rootWebChat
+    ? "next"
+    : await context.asker.ask(
+        select({
+          key: "web-hosting",
+          message: "How should Web Chat and your agents be deployed?",
+          options: [
+            {
+              id: "vercel",
+              label: "Vercel services",
+              hint: "(Recommended) Web Chat and agents deploy as separate services.",
+              value: "vercel" as const,
+            },
+            {
+              id: "next",
+              label: "Next.js",
+              hint: "One Next.js app serves Web Chat and routes agent requests.",
+              value: "next" as const,
+            },
+          ],
+          recommended: "vercel" as const,
+          required: true,
+        }),
+      );
+  const authentication = await context.asker.ask(WEB_AUTHENTICATION_QUESTION);
+  const authProject =
+    authentication === "vercel"
+      ? await context.resolveVercelProject("Web Chat sign-in")
+      : undefined;
+  const plan: WebSetupPlan = {
+    hosting,
+    packageManager: (await deps.detectPackageManager(project.environmentRoot)).kind,
   };
+  if (authProject !== undefined) plan.authProject = authProject;
+  if (rootWebChat) plan.rootWebChat = true;
+  return plan;
+}
+
+function runScriptCommand(packageManager: PackageManagerKind, script: string): string {
+  switch (packageManager) {
+    case "npm":
+      return `npm run ${script}`;
+    case "pnpm":
+      return `pnpm ${script}`;
+    case "yarn":
+      return `yarn ${script}`;
+    case "bun":
+      return `bun run ${script}`;
+  }
+}
+
+async function configurePeerServiceScripts(root: string, deps: WebSetupDeps): Promise<void> {
+  const path = join(root, "package.json");
+  const document = JSON.parse(await deps.readTextFile(path)) as {
+    scripts?: Record<string, string>;
+    [key: string]: unknown;
+  };
+  const scripts = { ...document.scripts };
+  scripts.dev ??= "eve dev";
+  scripts["dev:eve"] ??= "eve dev";
+  scripts["dev:all"] ??= "vercel dev --local";
+  await deps.writeTextFile(path, `${JSON.stringify({ ...document, scripts }, null, 2)}\n`, {
+    force: true,
+  });
+}
+
+async function assertInstallerOwned(path: string, allowed: readonly string[]): Promise<void> {
+  try {
+    const source = await readFile(path, "utf8");
+    if (allowed.includes(source)) return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(
+    `Could not configure Web Chat because ${path} contains authored configuration. Preserve it and compose the eve integration manually.`,
+  );
 }
 
 export async function applyWebSetup(
@@ -52,40 +174,104 @@ export async function applyWebSetup(
   context: SetupApplyContext,
   deps: WebSetupDeps = defaultDeps,
 ) {
-  context.presenter.log.message("Scaffolding Web Chat channel files...");
-  const options: EnsureChannelOptions = {
-    projectRoot: context.appRoot,
-    kind: "web",
-    packageManager: plan.packageManager,
-    configureVercelServices: plan.configureVercelServices,
-    force: context.force,
-    skipDependencyMutation: true,
-  };
-  const result = await deps.ensureChannel(options);
-  reportOverwrittenFiles(context.presenter.log, result.filesOverwritten);
-  if (
-    result.kind === "web" &&
-    result.action !== "skipped" &&
-    result.nodeEngineOverride !== undefined
-  ) {
-    context.presenter.log.warning(formatNodeEngineOverrideWarning(result.nodeEngineOverride));
+  const project = await deps.resolveEveProjectContext(context.appRoot);
+  if (project.kind === "workspace") {
+    throw new Error("Web Chat setup requires a selected workspace agent.");
   }
-  reportCompetingNextConfigFiles(
-    context.presenter.log,
-    "competingNextConfigFiles" in result ? result.competingNextConfigFiles : undefined,
+  const agentAppRoot =
+    project.kind === "workspace-member" ? project.member.appRoot : project.appRoot;
+  const channelPath = join(agentAppRoot, "agent", "channels", "eve.ts");
+  const webRoot = plan.rootWebChat
+    ? project.environmentRoot
+    : join(project.environmentRoot, "apps", "web");
+  const writeAuth =
+    plan.authProject === undefined
+      ? undefined
+      : await deps.prepareWebAuthScaffold({
+          environmentRoot: project.environmentRoot,
+          agentAppRoot,
+          webRoot,
+          force: context.force,
+        });
+  if (writeAuth === undefined && (context.force || !(await deps.pathExists(channelPath)))) {
+    await deps.writeTextFile(channelPath, WEB_CHANNEL_TEMPLATES.default, {
+      force: context.force,
+    });
+  }
+  const agentName = project.kind === "workspace-member" ? project.member.name : undefined;
+  await deps.writeTextFile(
+    join(webRoot, "app", "eve-agent.ts"),
+    `/** Named workspace agent selected by the Web Chat installer. */\nexport const WEB_CHAT_AGENT: string | undefined = ${agentName === undefined ? "undefined" : JSON.stringify(agentName)};\n`,
+    { force: true },
   );
-  if (result.action === "skipped") {
-    context.presenter.log.info("Next.js project detected. Skipping Web Chat scaffolding.");
-    return { facts: [] };
+  const nextConfigPath = join(webRoot, "next.config.ts");
+  const registryNextConfig = `import type { NextConfig } from "next";
+import { withEve } from "eve/next";
+
+const nextConfig: NextConfig = {};
+
+export default withEve(nextConfig);
+`;
+  await assertInstallerOwned(nextConfigPath, [
+    registryNextConfig,
+    NEXT_HOSTED_CONFIG,
+    PEER_SERVICE_NEXT_CONFIG,
+  ]);
+  let startScript: string;
+  if (plan.hosting === "vercel") {
+    const vercelTsPath = join(project.environmentRoot, "vercel.ts");
+    const vercelJsonPath = join(project.environmentRoot, "vercel.json");
+    await assertInstallerOwned(vercelTsPath, [
+      PEER_SERVICE_VERCEL_CONFIG,
+      PEER_SERVICE_VERCEL_CONFIG.replace(
+        /    web: \{[^}]+\},/,
+        '    web: { framework: "nextjs", root: "apps/web" },',
+      ),
+    ]);
+    if (await deps.pathExists(vercelJsonPath)) {
+      throw new Error(
+        `Could not configure Vercel services because ${vercelJsonPath} already exists. Preserve it and compose eve/vercel manually.`,
+      );
+    }
+    await deps.writeTextFile(nextConfigPath, PEER_SERVICE_NEXT_CONFIG, { force: true });
+    await deps.writeTextFile(vercelTsPath, PEER_SERVICE_VERCEL_CONFIG, { force: true });
+    await configurePeerServiceScripts(project.environmentRoot, deps);
+    startScript = "dev:all";
+  } else {
+    await deps.writeTextFile(
+      nextConfigPath,
+      plan.rootWebChat ? registryNextConfig : NEXT_HOSTED_CONFIG,
+      { force: true },
+    );
+    startScript = plan.rootWebChat ? "dev" : "dev:web";
   }
-  context.presenter.log.success("Scaffolded channel: web");
-  await deps.installScaffoldDependencies({
-    changed: result.packageJsonUpdated.length > 0,
-    log: context.presenter.log,
-    projectPath: context.appRoot,
-    signal: context.signal,
-  });
-  return { facts: [], deploymentRequired: true as const };
+  if (plan.authProject !== undefined && writeAuth !== undefined) {
+    await deps.provisionWebChatAuth(plan.authProject, context.signal);
+    context.signal?.throwIfAborted();
+    await writeAuth();
+    await deps.installScaffoldDependencies({
+      changed: true,
+      log: context.presenter.log,
+      projectPath: project.environmentRoot,
+      signal: context.signal,
+    });
+    context.presenter.log.success("Configured Sign in with Vercel for this project's team");
+    context.presenter.nextSteps([
+      "Local setup is complete. Run `eve deploy` to publish these changes. Production and preview credentials are configured.",
+      "Local development continues to use localDev() without signing in.",
+    ]);
+  }
+  context.presenter.log.success("Configured channel: web");
+  const completion: RegistrySetupCompletion = {
+    facts: [
+      {
+        label: "",
+        value: `Start locally with \`${runScriptCommand(plan.packageManager, startScript)}\`.`,
+      },
+    ],
+  };
+  if (plan.authProject !== undefined) completion.deploymentRequired = true;
+  return completion;
 }
 
 export const WEB_SETUP = defineSetupIntegration({

@@ -3,12 +3,7 @@ import { existsSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import {
-  eveDevArguments,
-  runPackageManagerInstall,
-  runPnpmInstall,
-  spawnPnpm,
-} from "./run-pnpm.js";
+import { eveDevArguments, runPackageManagerInstall, runPnpmInstall, spawnPnpm } from "./pm/run.js";
 import { packageManagerInstallSucceeded } from "./pm/run.js";
 import { resultSucceeded } from "./pm/process-result.js";
 import { pnpmPackageManager } from "./pm/pnpm.js";
@@ -74,6 +69,96 @@ describe("runPnpmInstall", () => {
       ["--dir", "/tmp/eve-agent", "install", "--no-frozen-lockfile"],
       expect.objectContaining({ cwd: "/tmp/eve-agent", stdio: "inherit" }),
     );
+  });
+
+  test("supports prompt-free installs with a scoped release-age override", async () => {
+    expect(
+      packageManagerInstallSucceeded(
+        await runPnpmInstall("/tmp/eve-agent", {
+          autoApprove: true,
+          bypassMinimumReleaseAge: true,
+        }),
+      ),
+    ).toBe(true);
+
+    expect(mockedSpawn).toHaveBeenCalledWith(
+      "pnpm",
+      [
+        "--dir",
+        "/tmp/eve-agent",
+        "install",
+        "--no-frozen-lockfile",
+        "--yes",
+        "--config.minimum-release-age=0",
+      ],
+      expect.objectContaining({ cwd: "/tmp/eve-agent", stdio: ["inherit", "pipe", "pipe"] }),
+    );
+  });
+
+  test("retries without auto-approval when pnpm rejects the option", async () => {
+    mockedSpawn.mockImplementationOnce(() => {
+      const child = createMockChildProcess();
+      queueMicrotask(() => {
+        child.stderr.emit("data", Buffer.from("ERROR Unknown option: 'yes'\n"));
+        child.stderr.emit("data", Buffer.from("For help, run: pnpm help install\n"));
+        child.emit("close", 1);
+      });
+      return child;
+    });
+    const onOutput = vi.fn();
+
+    expect(
+      packageManagerInstallSucceeded(
+        await runPnpmInstall("/tmp/eve-agent", {
+          autoApprove: true,
+          bypassMinimumReleaseAge: true,
+          onOutput,
+        }),
+      ),
+    ).toBe(true);
+
+    expect(mockedSpawn.mock.calls.map(([, args]) => args)).toEqual([
+      [
+        "--dir",
+        "/tmp/eve-agent",
+        "install",
+        "--no-frozen-lockfile",
+        "--yes",
+        "--config.minimum-release-age=0",
+      ],
+      [
+        "--dir",
+        "/tmp/eve-agent",
+        "install",
+        "--no-frozen-lockfile",
+        "--config.minimum-release-age=0",
+      ],
+    ]);
+    expect(onOutput).not.toHaveBeenCalled();
+  });
+
+  test("does not retry other pnpm install failures", async () => {
+    mockedSpawn.mockImplementationOnce(() => {
+      const child = createMockChildProcess();
+      queueMicrotask(() => {
+        child.stderr.emit("data", Buffer.from("ERR_PNPM_FETCH_500 Registry unavailable\n"));
+        child.emit("close", 1);
+      });
+      return child;
+    });
+    const onOutput = vi.fn();
+
+    expect(
+      packageManagerInstallSucceeded(
+        await runPnpmInstall("/tmp/eve-agent", { autoApprove: true, onOutput }),
+      ),
+    ).toBe(false);
+
+    expect(mockedSpawn).toHaveBeenCalledTimes(1);
+    expect(onOutput).toHaveBeenCalledWith({
+      stream: "stderr",
+      text: "ERR_PNPM_FETCH_500 Registry unavailable",
+    });
   });
 
   test("installs a claimed workspace member with native workspace semantics", async () => {
@@ -146,6 +231,40 @@ describe("runPnpmInstall", () => {
 });
 
 describe("runPackageManagerInstall", () => {
+  test("automatically approves npm prompts and bypasses inherited release-age policies", async () => {
+    expect(
+      packageManagerInstallSucceeded(
+        await runPackageManagerInstall("npm", "/tmp/app", {
+          autoApprove: true,
+          bypassMinimumReleaseAge: true,
+        }),
+      ),
+    ).toBe(true);
+
+    expect(mockedSpawn).toHaveBeenCalledWith(
+      "npm",
+      ["install", "--yes", "--min-release-age=0"],
+      expect.objectContaining({ cwd: "/tmp/app" }),
+    );
+  });
+
+  test("bypasses inherited Bun release-age policies without passing an unsupported yes flag", async () => {
+    expect(
+      packageManagerInstallSucceeded(
+        await runPackageManagerInstall("bun", "/tmp/app", {
+          autoApprove: true,
+          bypassMinimumReleaseAge: true,
+        }),
+      ),
+    ).toBe(true);
+
+    expect(mockedSpawn).toHaveBeenCalledWith(
+      "bun",
+      ["install", "--minimum-release-age=0"],
+      expect.objectContaining({ cwd: "/tmp/app" }),
+    );
+  });
+
   test("requests npm output before registry operations complete", async () => {
     expect(
       packageManagerInstallSucceeded(

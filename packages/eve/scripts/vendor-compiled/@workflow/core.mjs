@@ -87,6 +87,10 @@ const copyDeclarations = createDeclarationCopier({
       kind: "vendored",
       compiledPath: "@workflow/world",
     },
+    "@workflow/world/attributes-validation": {
+      kind: "vendored",
+      compiledPath: "@workflow/world",
+    },
     devalue: {
       kind: "stub",
       stubBaseName: "_devalue",
@@ -96,6 +100,10 @@ const copyDeclarations = createDeclarationCopier({
       kind: "stub",
       stubBaseName: "_ms",
       build: buildMsStub,
+    },
+    zod: {
+      kind: "vendored",
+      compiledPath: "zod",
     },
     "quickjs-wasi": {
       kind: "stub",
@@ -169,6 +177,8 @@ export default {
   chunkGroup: "workflow",
   plugins: [stubCoreWorldFactories(), stubCoreQuickJSEntrypoint()],
   entries: [
+    { entry: "dist/serialization.js", outputPath: "serialization" },
+    { entry: "dist/runtime/helpers.js", outputPath: "runtime/helpers" },
     {
       outputPath: "index",
     },

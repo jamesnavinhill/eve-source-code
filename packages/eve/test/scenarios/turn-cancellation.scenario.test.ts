@@ -18,8 +18,16 @@ const REMOTE_DESCRIPTOR: ScenarioAppDescriptor = {
   dependencies: { zod: "^4.3.6" },
   files: {
     "agent/agent.ts": `import { defineAgent } from "eve";
+import { mockModel } from "eve/evals";
 
-export default defineAgent({ model: "openai/gpt-5.4-mini" });
+export default defineAgent({
+  model: mockModel(({ lastUserMessage }) =>
+    lastUserMessage?.includes("wait-for-cancel") === true
+      ? { toolCalls: [{ name: "wait-for-cancel", input: {} }] }
+      : "cancelled",
+  ),
+  modelContextWindowTokens: 32_000,
+});
 `,
     "agent/channels/eve.ts": `import { eveChannel } from "eve/channels/eve";
 
@@ -56,20 +64,62 @@ export default defineTool({
   name: "remote-cancellation-child",
 };
 
-function createParentDescriptor(remoteUrl: string): ScenarioAppDescriptor {
+function createParentDescriptor(
+  remoteUrl: string,
+  options: { readonly sessionInputLimit?: number } = {},
+): ScenarioAppDescriptor {
   return {
     dependencies: { zod: "^4.3.6" },
     files: {
       "agent/agent.ts": `import { defineAgent } from "eve";
+import { mockModel } from "eve/evals";
 
-export default defineAgent({ model: "openai/gpt-5.4-mini" });
+const model = mockModel((request) => {
+  const message = request.lastUserMessage ?? "";
+  if (message.includes("Use workflow exactly once")) {
+    // The workflow tool runs as a task: after its receipt, wait on it.
+    if (request.toolResults.some((entry) => entry.name === "workflow")) {
+      return { toolCalls: [{ name: "task_wait", input: {} }] };
+    }
+    const localOnly = message.includes("local-sleeper only");
+    return {
+      toolCalls: [
+        {
+          name: "workflow",
+          input: {
+            js: localOnly
+              ? 'return await ctx.agent("local-sleeper", { message: "Use wait-for-cancel." });'
+              : 'return await Promise.all([ctx.agent("local-sleeper", { message: "Use wait-for-cancel." }), ctx.agent("remote-sleeper", { message: "Use wait-for-cancel." })]);',
+          },
+        },
+      ],
+    };
+  }
+  return "still-alive";
+});
+
+export default defineAgent({
+  ${options.sessionInputLimit === undefined ? "" : `limits: { maxInputTokensPerSession: ${String(options.sessionInputLimit)} },`}
+  model,
+  modelContextWindowTokens: 32_000,
+});
 `,
       "agent/instructions.md": "Delegate cancellation waits as requested.\n",
+      "agent/tools/workflow.ts": `import { workflow } from "eve/tools/workflow";
+
+export default workflow();
+`,
       "agent/subagents/local-sleeper/agent.ts": `import { defineAgent } from "eve";
+import { mockModel } from "eve/evals";
 
 export default defineAgent({
   description: "Runs the wait-for-cancel tool and waits for cancellation.",
-  model: "openai/gpt-5.4-mini",
+  model: mockModel(({ lastUserMessage }) =>
+    lastUserMessage?.includes("wait-for-cancel") === true
+      ? { toolCalls: [{ name: "wait-for-cancel", input: {} }] }
+      : "cancelled",
+  ),
+  modelContextWindowTokens: 32_000,
 });
 `,
       "agent/subagents/local-sleeper/instructions.md":
@@ -109,35 +159,39 @@ describe("turn cancellation descendant cascade", () => {
     "cancels racing local and authenticated remote children then continues the parent",
     async () => {
       const remoteApp = await scenarioApp(REMOTE_DESCRIPTOR);
-      const remoteServer = await startEveDev(remoteApp.appRoot);
+      const remoteServer = await startEveDev(remoteApp.appRoot, {
+        env: { EVE_MOCK_AUTHORED_MODELS: "", NODE_ENV: "production" },
+      });
 
       try {
         const parentApp = await scenarioApp(createParentDescriptor(remoteServer.url));
-        const parentServer = await startEveDev(parentApp.appRoot);
+        const parentServer = await startEveDev(parentApp.appRoot, {
+          env: { EVE_MOCK_AUTHORED_MODELS: "", NODE_ENV: "production" },
+        });
 
         try {
           const parentClient = new Client({ host: parentServer.url });
           const { session: parentSession, response } = await parentClient.sessions.create({
             message: [
-              "Call tools in parallel: local-sleeper, remote-sleeper",
-              'message: "Use wait-for-cancel."',
+              "Use workflow exactly once to call local-sleeper and remote-sleeper in parallel.",
+              'Pass both the message "Use wait-for-cancel." and return Promise.all of their results.',
             ].join("\n"),
           });
           const parentIterator = response[Symbol.asyncIterator]();
-          const called = await readSubagentCalls({
+          const started = await readAgentStarts({
             count: 2,
             iterator: parentIterator,
-            label: "local and remote subagent dispatch",
+            label: "local and remote agent sessions",
           });
-          const localCalled = called.find((event) => event.data.remote === undefined);
-          const remoteCalled = called.find((event) => event.data.remote !== undefined);
-          if (localCalled === undefined || remoteCalled === undefined) {
-            throw new Error("Expected one local and one remote subagent.called event.");
+          const localStarted = started.find((event) => event.data.remote === undefined);
+          const remoteStarted = started.find((event) => event.data.remote !== undefined);
+          if (localStarted === undefined || remoteStarted === undefined) {
+            throw new Error("Expected one local and one remote agent.started event.");
           }
-          expect(remoteCalled.data.remote?.url).toBe(remoteServer.url);
+          expect(remoteStarted.data.remote?.url).toBe(remoteServer.url);
 
           const localIterator = parentClient.sessions
-            .attach(localCalled.data.childSessionId)
+            .attach(localStarted.data.sessionId)
             .stream()
             [Symbol.asyncIterator]();
 
@@ -146,7 +200,7 @@ describe("turn cancellation descendant cascade", () => {
             host: remoteServer.url,
           });
           const remoteIterator = remoteClient.sessions
-            .attach(remoteCalled.data.childSessionId)
+            .attach(remoteStarted.data.sessionId)
             .stream()
             [Symbol.asyncIterator]();
           await Promise.all([
@@ -191,14 +245,13 @@ describe("turn cancellation descendant cascade", () => {
           expectCancellationBoundary(localEvents);
           expectCancellationBoundary(remoteEvents);
           expectCancellationBoundary(parentEvents);
-          expect(parentEvents.some((event) => event.type === "subagent.completed")).toBe(false);
 
           const followUp = await (
             await parentSession.send("Reply with the exact string `still-alive` and nothing else.")
           ).result();
           expect(followUp.sessionId).toBe(response.sessionId);
           expect(followUp.status).toBe("waiting");
-          expect(followUp.message).toBe("still-alive");
+          expect(followUp.message, JSON.stringify(followUp.events)).toBe("still-alive");
           expect(followUp.events.some((event) => event.type === "turn.cancelled")).toBe(false);
         } catch (error) {
           throw new Error(
@@ -219,22 +272,81 @@ describe("turn cancellation descendant cascade", () => {
     },
     SCENARIO_TIMEOUT_MS,
   );
+
+  it(
+    "declines the root continuation after a generated child inherits zero input quota",
+    async () => {
+      const parentApp = await scenarioApp(
+        createParentDescriptor("http://127.0.0.1:1", { sessionInputLimit: 1 }),
+      );
+      const parentServer = await startEveDev(parentApp.appRoot, {
+        env: { EVE_MOCK_AUTHORED_MODELS: "", NODE_ENV: "production" },
+      });
+
+      try {
+        const parentClient = new Client({ host: parentServer.url });
+        const { session, response } = await parentClient.sessions.create({
+          message:
+            "Use workflow exactly once to call local-sleeper only with message Use wait-for-cancel.",
+        });
+        const events = await readThroughBoundary({
+          iterator: response[Symbol.asyncIterator](),
+          label: "root session-limit prompt",
+        });
+        // The workflow program runs as a task, so the root reaches its limit
+        // prompt while the task keeps working.
+        const tasks = events.filter((event) => event.type === "task.started");
+        const requests = events.flatMap((event) =>
+          event.type === "input.requested" ? event.data.requests : [],
+        );
+        expect(tasks).toHaveLength(1);
+        expect(requests).toHaveLength(1);
+        expect(requests[0]?.requestId).toMatch(
+          new RegExp(`^${response.sessionId}:\\d+:limit:`, "u"),
+        );
+
+        const requestId = requests[0]?.requestId;
+        if (requestId === undefined) throw new Error("Root limit prompt has no request id.");
+        const declined = await (await session.respond([{ optionId: "stop", requestId }])).result();
+        expect(declined.status).toBe("waiting");
+        expectCancellationBoundary(declined.events);
+        expect(declined.events).toContainEqual(
+          expect.objectContaining({
+            data: expect.objectContaining({ status: "cancelled" }),
+            type: "task.settled",
+          }),
+        );
+        expect(declined.events.some((event) => event.type === "step.started")).toBe(false);
+      } catch (error) {
+        throw new Error(
+          [
+            `parent stdout:\n${parentServer.stdout()}`,
+            `parent stderr:\n${parentServer.stderr()}`,
+          ].join("\n\n"),
+          { cause: error },
+        );
+      } finally {
+        await parentServer.stop();
+      }
+    },
+    SCENARIO_TIMEOUT_MS,
+  );
 });
 
-type SubagentCalledEvent = Extract<MessageStreamEvent, { type: "subagent.called" }>;
+type AgentStartedEvent = Extract<MessageStreamEvent, { type: "agent.started" }>;
 
-async function readSubagentCalls(input: {
+async function readAgentStarts(input: {
   readonly count: number;
   readonly iterator: AsyncIterator<MessageStreamEvent>;
   readonly label: string;
-}): Promise<readonly SubagentCalledEvent[]> {
+}): Promise<readonly AgentStartedEvent[]> {
   return await withinEventDeadline(
     (async () => {
-      const events: SubagentCalledEvent[] = [];
+      const events: AgentStartedEvent[] = [];
       while (events.length < input.count) {
         const next = await input.iterator.next();
         if (next.done) throw new Error(`Stream ended before ${input.label}.`);
-        if (next.value.type === "subagent.called") events.push(next.value);
+        if (next.value.type === "agent.started") events.push(next.value);
       }
       return events;
     })(),

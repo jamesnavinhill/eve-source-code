@@ -1,8 +1,14 @@
 import type { FilePart, TextPart, UserContent } from "ai";
 
 import type { FetchFileResult } from "#channel/adapter.js";
+import { EveAttachmentError } from "#internal/attachments/errors.js";
+import { maxBytesOf, readLimitedBytes } from "#internal/attachments/limited-read.js";
 import { createLogger } from "#internal/logging.js";
-import type { TeamsAttachment } from "#public/channels/teams/api.js";
+import {
+  resolveTeamsAccessToken,
+  type TeamsApiOptions,
+  type TeamsAttachment,
+} from "#public/channels/teams/api.js";
 import {
   evaluateFilePart,
   formatUploadPolicyViolation,
@@ -15,14 +21,38 @@ import { isObject } from "#shared/guards.js";
 
 const log = createLogger("teams.attachments");
 
+const BOT_CONNECTOR_HOSTS = new Set([
+  "smba.trafficmanager.net",
+  "smba.infra.gcc.teams.microsoft.com",
+  "smba.infra.gov.teams.microsoft.us",
+  "smba.infra.dod.teams.microsoft.us",
+]);
+// Files a person uploads to a bot download from a pre-authenticated SharePoint URL.
+const SHAREPOINT_HOST_SUFFIXES = [".sharepoint.com", ".sharepoint.us"];
+// `fileType` on a Teams file upload is the file's extension.
+const FILE_TYPE_MEDIA_TYPES: Readonly<Record<string, string>> = {
+  csv: "text/csv",
+  gif: "image/gif",
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  json: "application/json",
+  md: "text/markdown",
+  pdf: "application/pdf",
+  png: "image/png",
+  txt: "text/plain",
+  webp: "image/webp",
+};
+const MAX_FILE_REDIRECTS = 5;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 /** File handling options for the native Teams channel. */
 export interface TeamsFilesConfig {
   /**
-   * Hosts whose file URLs may be fetched, or `"*"` for any host. Defaults to
-   * `[]` (no hosts), so attachments are dropped until you allowlist their host.
+   * Hosts whose file URLs may be fetched besides Microsoft's Bot Connector and
+   * SharePoint hosts, which are always allowed, or `"*"` for any host.
    */
   readonly allowedHosts?: readonly string[] | "*";
-  /** Enable inbound attachment ingestion. Off unless explicitly `true`. */
+  /** Set to `false` to drop inbound attachments. On by default. */
   readonly enabled?: boolean;
   /** Size and type limits applied to accepted attachments. */
   readonly uploadPolicy?: UploadPolicyInput;
@@ -39,12 +69,12 @@ export interface TeamsFilesPolicy {
 export function normalizeTeamsFilesPolicy(config: TeamsFilesConfig | undefined): TeamsFilesPolicy {
   return {
     allowedHosts: config?.allowedHosts ?? [],
-    enabled: config?.enabled === true,
+    enabled: config?.enabled !== false,
     uploadPolicy: mergeUploadPolicy(config?.uploadPolicy),
   };
 }
 
-/** Collects Teams attachment file parts when file support is explicitly enabled. */
+/** Collects Teams attachment file parts unless file support is disabled. */
 export function collectTeamsFileParts(
   attachments: readonly TeamsAttachment[],
   policy: TeamsFilesPolicy,
@@ -86,18 +116,70 @@ export function buildTeamsTurnMessage(
  */
 export function createTeamsFetchFile(
   policy: TeamsFilesPolicy,
+  api: TeamsApiOptions = {},
 ): (url: string) => Promise<FetchFileResult | null> {
   return async (url) => {
     if (!policy.enabled || !isAllowedUrl(url, policy.allowedHosts)) return null;
-    const response = await fetch(url);
+    const { response, finalUrl } = await fetchTeamsFile(url, policy.allowedHosts, api);
     if (!response.ok) {
-      throw new Error(`Teams file fetch returned HTTP ${response.status} for ${url}.`);
+      throw attachmentError(
+        `Teams file fetch returned HTTP ${response.status} for host ${finalUrl.hostname}.`,
+      );
     }
     return {
-      bytes: Buffer.from(await response.arrayBuffer()),
+      bytes: await readLimitedBytes(response, maxBytesOf(policy.uploadPolicy), "teams"),
       mediaType: response.headers.get("content-type") ?? undefined,
     };
   };
+}
+
+async function fetchTeamsFile(
+  url: string,
+  allowedHosts: readonly string[] | "*",
+  api: TeamsApiOptions,
+): Promise<{ readonly finalUrl: URL; readonly response: Response }> {
+  const apiFetch = api.fetch ?? fetch;
+  let currentUrl = new URL(url);
+  let connectorToken: string | undefined;
+
+  for (let redirectCount = 0; redirectCount <= MAX_FILE_REDIRECTS; redirectCount += 1) {
+    const isBotConnectorUrl =
+      currentUrl.port === "" && BOT_CONNECTOR_HOSTS.has(currentUrl.hostname);
+    const headers = new Headers();
+    if (isBotConnectorUrl) {
+      connectorToken ??= await resolveTeamsAccessToken(api);
+      headers.set("authorization", `Bearer ${connectorToken}`);
+    }
+    const response = await apiFetch(currentUrl, {
+      headers,
+      redirect: "manual",
+    });
+    if (!REDIRECT_STATUSES.has(response.status)) {
+      return { finalUrl: currentUrl, response };
+    }
+    if (redirectCount === MAX_FILE_REDIRECTS) {
+      throw attachmentError(`Teams file fetch exceeded ${MAX_FILE_REDIRECTS} redirects.`);
+    }
+    const location = response.headers.get("location");
+    if (location === null) {
+      throw attachmentError(
+        `Teams file fetch redirect from host ${currentUrl.hostname} had no location.`,
+      );
+    }
+    const nextUrl = new URL(location, currentUrl);
+    if (!isAllowedUrl(nextUrl.href, allowedHosts)) {
+      throw attachmentError(
+        `Teams file fetch redirect to host ${nextUrl.hostname} is not allowed.`,
+      );
+    }
+    currentUrl = nextUrl;
+  }
+
+  throw attachmentError(`Teams file fetch exceeded ${MAX_FILE_REDIRECTS} redirects.`);
+}
+
+function attachmentError(message: string): EveAttachmentError {
+  return new EveAttachmentError({ adapterKind: "teams", kind: "resolver-threw", message });
 }
 
 function toTeamsFilePart(
@@ -139,18 +221,31 @@ function inferMediaType(attachment: TeamsAttachment): string {
       isObject(attachment.content) && typeof attachment.content.fileType === "string"
         ? attachment.content.fileType
         : undefined;
-    if (fileType === "txt") return "text/plain";
+    const mediaType =
+      fileType === undefined ? undefined : FILE_TYPE_MEDIA_TYPES[fileType.toLowerCase()];
+    return mediaType ?? "application/octet-stream";
   }
   return attachment.contentType || "application/octet-stream";
 }
 
 function isAllowedUrl(url: string, allowedHosts: readonly string[] | "*"): boolean {
-  if (allowedHosts === "*") return true;
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
     return false;
   }
-  return allowedHosts.some((host) => parsed.host === host || parsed.hostname === host);
+  if (parsed.protocol !== "https:") return false;
+  if (allowedHosts === "*") return true;
+  if (parsed.port === "" && isMicrosoftFileHost(parsed.hostname)) return true;
+  return allowedHosts.some((host) =>
+    host.includes(":") ? parsed.host === host : parsed.port === "" && parsed.hostname === host,
+  );
+}
+
+function isMicrosoftFileHost(hostname: string): boolean {
+  return (
+    BOT_CONNECTOR_HOSTS.has(hostname) ||
+    SHAREPOINT_HOST_SUFFIXES.some((suffix) => hostname.endsWith(suffix))
+  );
 }

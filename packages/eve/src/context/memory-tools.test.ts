@@ -1,3 +1,6 @@
+import type { ModelMessage } from "ai";
+import { z } from "#compiled/zod/index.js";
+import { isToolSchema } from "#tools/schema.js";
 import { describe, expect, it } from "vitest";
 
 import { buildDynamicTools } from "#context/build-dynamic-tools.js";
@@ -6,11 +9,19 @@ import {
   dispatchDynamicToolEvent,
   rebindMissingCompiledDynamicToolCallbacks,
 } from "#context/dynamic-tool-lifecycle.js";
-import { AuthKey, SessionIdKey, SessionKey, TurnMemoryLocksKey } from "#context/keys.js";
+import {
+  AuthKey,
+  SessionIdKey,
+  SessionKey,
+  StaticModelReferenceKey,
+  TurnDynamicToolMetadataKey,
+  TurnMemoryLocksKey,
+} from "#context/keys.js";
 import { createMemoryToolDynamicDefinition } from "#context/memory-tools.js";
 import { resolveApprovalPolicy } from "#approval/definition.js";
 import { defineTool } from "#tools/definition.js";
-import { defineMemory } from "#public/memory/index.js";
+import { clearDurableDynamicCallbacks } from "#tools/durable-callbacks.js";
+import { defineMemory, type MemoryToolsContext } from "#public/memory/index.js";
 import { always } from "#public/tools/approval/index.js";
 import type { ResolvedDynamicToolResolver } from "#runtime/types.js";
 import { createMemoryLock } from "#shared/memory-state.js";
@@ -26,6 +37,7 @@ function createContext(scope: string) {
     principalType: "user",
   };
   const ctx = new ContextContainer();
+  ctx.set(StaticModelReferenceKey, null);
   ctx.set(AuthKey, auth);
   ctx.set(SessionIdKey, "session_1");
   ctx.set(SessionKey, {
@@ -45,19 +57,27 @@ function createContext(scope: string) {
   return ctx;
 }
 
-function resolver(version: () => number): ResolvedDynamicToolResolver {
+function resolver(
+  version: () => number,
+  onTools?: (context: MemoryToolsContext) => void,
+): ResolvedDynamicToolResolver {
   const definition = defineMemory({
     description: "Manage the profile.",
     provider: {
       recall: { "turn.started": async () => null },
-      tools: async (context) => ({
-        save: defineTool({
-          approval: always(),
-          description: "Save a field.",
-          execute: async () => `${version()}:${String(context.memory.scope.value)}`,
-          inputSchema: {},
-        }),
-      }),
+      tools: async (context) => {
+        onTools?.(context);
+        return {
+          save: defineTool({
+            approval: always(),
+            description: "Save a field.",
+            execute: async () => `${version()}:${String(context.memory.scope.value)}`,
+            inputSchema: z.object({
+              scope: z.string().refine((value) => value === context.memory.scope.value),
+            }),
+          }),
+        };
+      },
     },
     scope: "unused",
   });
@@ -95,11 +115,7 @@ describe("memory provider tools", () => {
       name: "profile__save",
     });
 
-    const registry = Reflect.get(globalThis, Symbol.for("eve:dynamic-tool-callbacks")) as Map<
-      string,
-      Map<string, unknown>
-    >;
-    registry.get("profile__save")?.clear();
+    clearDurableDynamicCallbacks(ctx.require(SessionIdKey));
     deployedVersion = 2;
     ctx.set(TurnMemoryLocksKey, createContext("user_2").require(TurnMemoryLocksKey));
 
@@ -130,6 +146,67 @@ describe("memory provider tools", () => {
       async () => await replayed.execute!({}, { messages: [], toolCallId: "call_1" }),
     );
     expect(output).toBe("2:user_1");
+    if (!isToolSchema(replayed.inputSchema)) throw new Error("Expected live schema");
+    expect(await replayed.inputSchema["~standard"].validate({ scope: "user_2" })).toHaveProperty(
+      "issues",
+    );
+    expect(await replayed.inputSchema["~standard"].validate({ scope: "user_1" })).toEqual({
+      value: { scope: "user_1" },
+    });
+  });
+
+  it("rebinds after a restart with live history and keeps it out of the durable closure", async () => {
+    const ctx = createContext("user_1");
+    const seen: (readonly unknown[])[] = [];
+    const compiledResolver = resolver(
+      () => 1,
+      (context) => seen.push(context.messages),
+    );
+    await contextStorage.run(
+      ctx,
+      async () =>
+        await dispatchDynamicToolEvent({
+          ctx,
+          event,
+          messages: [{ content: "hello", role: "user" }],
+          resolvers: [compiledResolver],
+        }),
+    );
+    clearDurableDynamicCallbacks(ctx.require(SessionIdKey));
+
+    // A fresh process resumes mid-turn: history now carries this turn's tool
+    // results, which are durable values rather than plain JSON.
+    const history: ModelMessage[] = [
+      { content: "hello", role: "user" },
+      {
+        content: [
+          {
+            output: { type: "json", value: { createdAt: new Date(0) } as never },
+            toolCallId: "call_0",
+            toolName: "lookup",
+            type: "tool-result",
+          },
+        ],
+        role: "tool",
+      },
+    ];
+    await rebindMissingCompiledDynamicToolCallbacks({
+      ctx,
+      event,
+      messages: history,
+      resolvers: [compiledResolver],
+    });
+    seen.length = 0;
+
+    const [replayed] = buildDynamicTools(ctx);
+    const output = await contextStorage.run(
+      ctx,
+      async () => await replayed?.execute?.({}, { messages: [], toolCallId: "call_1" }),
+    );
+    expect(output).toBe("1:user_1");
+    expect(seen).toEqual([history]);
+    const [metadata] = ctx.require(TurnDynamicToolMetadataKey);
+    expect(JSON.stringify(metadata)).not.toContain("hello");
   });
 
   it("omits tools when the provider has no tool factory", async () => {
@@ -146,6 +223,7 @@ describe("memory provider tools", () => {
       async () =>
         await dynamic.events["turn.started"]?.(event, {
           channel: {},
+          model: null,
           messages: [],
           session: { auth: { current: null, initiator: null }, id: "session_1" },
         }),

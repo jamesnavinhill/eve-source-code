@@ -1,6 +1,8 @@
 import type { FilePart, TextPart, UserContent } from "ai";
 
 import type { FetchFileResult } from "#channel/adapter.js";
+import { EveAttachmentError } from "#internal/attachments/errors.js";
+import { maxBytesOf, readLimitedBytes } from "#internal/attachments/limited-read.js";
 import { createLogger } from "#internal/logging.js";
 import {
   downloadTelegramFile,
@@ -86,12 +88,18 @@ export function createTelegramFetchFile(input: {
       filePath: file.filePath,
     });
     if (!response.ok) {
-      throw new Error(`Telegram file fetch returned HTTP ${response.status} for ${url}.`);
+      throw new EveAttachmentError({
+        adapterKind: "telegram",
+        kind: "resolver-threw",
+        message: `Telegram file fetch returned HTTP ${response.status}.`,
+      });
     }
 
-    const bytes = Buffer.from(await response.arrayBuffer());
+    const bytes = await readLimitedBytes(response, maxBytesOf(input.policy), "telegram");
+    // Telegram's file endpoint serves everything as `application/octet-stream`,
+    // so the type the message declared is the only real one (#1217).
     const mediaType =
-      response.headers.get("content-type") ?? ref.mediaType ?? "application/octet-stream";
+      ref.mediaType ?? response.headers.get("content-type") ?? "application/octet-stream";
     const result: FetchFileResult = {
       bytes,
       filename: ref.filename,
@@ -108,7 +116,11 @@ export function createTelegramFetchFile(input: {
       input.policy,
     );
     if (violation !== null) {
-      throw new Error(`Telegram file rejected — ${formatUploadPolicyViolation(violation)}`);
+      throw new EveAttachmentError({
+        adapterKind: "telegram",
+        kind: "resolver-threw",
+        message: `Telegram file rejected — ${formatUploadPolicyViolation(violation)}`,
+      });
     }
     return result;
   };

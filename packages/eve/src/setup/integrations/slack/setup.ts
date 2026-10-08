@@ -10,10 +10,9 @@ import {
   provisionSlackbot,
   reconcileSlackUid,
   type ProvisionSlackbotResult,
-  type SlackConnectorRef,
   type SlackConnectorSelection,
 } from "#setup/slackbot.js";
-import { slackMessageDeepLink } from "#setup/slack-connect.js";
+import { slackMessageDeepLink, type SlackConnectorRef } from "#setup/slack-connect.js";
 import { WizardCancelledError } from "#setup/step.js";
 
 import { installScaffoldDependencies, reportOverwrittenFiles } from "../shared/scaffold.js";
@@ -159,7 +158,7 @@ export async function prepareSlackSetup(
   if (project.projectId.length === 0) throw new Error(SLACK_REQUIRES_VERCEL);
   const lookup = await deps.inspectConnectors(
     context.presenter.log,
-    context.appRoot,
+    context.projectRoot,
     slug,
     context.signal,
   );
@@ -178,6 +177,7 @@ export async function applySlackSetup(
   if (plan.credentials === "environment") {
     const result = await deps.ensureChannel({
       projectRoot: context.appRoot,
+      environmentRoot: context.projectRoot,
       kind: "slack",
       slackConnectorSlug: plan.slug,
       slackCredentials: "environment",
@@ -194,7 +194,7 @@ export async function applySlackSetup(
   }
   const result = await deps.provisionSlackbot(
     context.presenter.log,
-    context.appRoot,
+    context.projectRoot,
     plan.slug,
     undefined,
     {
@@ -220,7 +220,7 @@ export async function applySlackSetup(
   if (channel.action === "skipped") {
     const ready = await deps.reconcileSlackUid(
       context.presenter.log,
-      context.appRoot,
+      context.projectRoot,
       result,
       `slack/${plan.slug}`,
     );
@@ -230,7 +230,7 @@ export async function applySlackSetup(
   await installScaffoldDependencies({
     changed: channel.packageJsonUpdated.length > 0,
     log: context.presenter.log,
-    projectPath: context.appRoot,
+    projectPath: context.projectRoot,
     signal: context.signal,
   });
   return {

@@ -1,9 +1,17 @@
 /** Environment flag set for processes that belong to an `eve dev` session. */
 export const EVE_DEV_ENV_FLAG = "EVE_DEV";
 
+type InstrumentationEnvironment = "development" | "preview" | "production";
+
 /** Reports whether this process belongs to an `eve dev` session. */
 export function isEveDevEnvironment(): boolean {
   return process.env[EVE_DEV_ENV_FLAG] === "1";
+}
+
+/** Resolves the deployment environment used by setup hooks and trace policies. */
+export function resolveInstrumentationEnvironment(): InstrumentationEnvironment {
+  if (isEveDevEnvironment() || process.env.VERCEL_ENV === "development") return "development";
+  return process.env.VERCEL_ENV === "preview" ? "preview" : "production";
 }
 
 /** Environment flag set for a server `eve eval` started to run against. */
@@ -18,7 +26,7 @@ export const EVE_EVALUATION_RUN_ID_ENV = "EVE_EVALUATION_RUN_ID";
  * False for a server that `eve eval --url` merely points at: that process was
  * started to serve ordinary traffic and cannot know an eval is among it.
  */
-export function isEveEvaluationEnvironment(): boolean {
+function isEveEvaluationEnvironment(): boolean {
   return process.env[EVE_EVALUATION_ENV_FLAG] === "1";
 }
 
